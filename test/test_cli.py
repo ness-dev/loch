@@ -11,6 +11,7 @@ from test_claude import SECRET, write_moved_session, write_session
 from loch.bundle import unpack_bundle
 from loch.claude import session_dir_for, transcript_cwds, transcript_path_for
 from loch.cli import main
+from loch.format import read_derived
 
 
 def invoke(
@@ -1047,3 +1048,68 @@ def test_json_help_is_a_document_rather_than_the_usage_block(
     )
     assert (document["command"], document["ok"], code) == ("save", True, None)
     assert "--store" in document["usage"]
+
+
+def test_ingest_writes_a_verified_derived_file_per_session(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    out_dir = tmp_path / "derived"
+    path = Path(transcript_path_for(str(project), "abc", str(home)))
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "u-1",
+                "parentUuid": None,
+                "sessionId": "abc",
+                "cwd": str(project.resolve()),
+                "message": {"role": "user", "content": "hello"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    document, err, code = invoke_json(
+        monkeypatch,
+        capsys,
+        home,
+        "ingest",
+        "--json",
+        "--cwd",
+        str(project),
+        "--author",
+        "alice",
+        "--out",
+        str(out_dir),
+    )
+
+    assert (code, err) == (None, "")
+    assert document["converter"] == {"id": "claude-code", "version": 1}
+    [entry] = document["sessions"]
+    assert entry["turns"] == 1
+    derived = read_derived(Path(entry["path"]).read_text(encoding="utf-8").split("\n"))
+    assert derived.header["author"] == {"kind": "human", "id": "alice"}
+    assert entry["heads"]["current"] == derived.turns[0].id
+
+
+def test_ingest_fails_when_nothing_matches(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    document, _, code = invoke_json(
+        monkeypatch,
+        capsys,
+        tmp_path / "home",
+        "ingest",
+        "--json",
+        "--cwd",
+        str(tmp_path),
+        "--out",
+        str(tmp_path / "derived"),
+    )
+
+    assert (code, document["code"]) == (1, "no-sessions")

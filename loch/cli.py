@@ -31,6 +31,7 @@ from .claude import (
     resolve_cwd,
     transcript_path_for,
 )
+from .format import pack_derived
 from .git import current_branch
 from .index import (
     BRANCH,
@@ -44,6 +45,7 @@ from .index import (
     reindex,
     value_prefix,
 )
+from .ingest import CONVERTER, Origin, derived_name, ingest
 from .output import JSON_FLAG, CommandError, Result, emit, emit_error
 from .redact import RedactionError, redact, summarize
 from .rewrite import (
@@ -55,6 +57,8 @@ from .rewrite import (
 )
 from .store import MissingDependency, MissingObject, create_store, resolve_store_uri
 
+DEFAULT_DERIVED = os.path.join(str(Path.home()), ".loch", "derived")
+
 USAGE = """loch — save and restore agent coding sessions across machines
 
 Usage:
@@ -64,6 +68,8 @@ Usage:
   loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
   loch delete  <ref> [--store <uri>]
   loch reindex [--store <uri>]
+  loch ingest  [--cwd <path>] [--branch <name>] [--session <id>] [--author <id>]
+               [--out <dir>]
   loch --version
 
 Every command takes --json, which replaces the text below with one machine-
@@ -77,6 +83,8 @@ Environment:
   LOCH_STORE        default store URI
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override
+
+Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 """
 
 
@@ -590,6 +598,58 @@ def command_reindex(argv: list[str]) -> Result:
     )
 
 
+def command_ingest(argv: list[str]) -> Result:
+    parser = _parser("ingest")
+    parser.add_argument("--cwd")
+    parser.add_argument("--branch")
+    parser.add_argument("--session")
+    parser.add_argument("--author")
+    parser.add_argument("--out")
+    args = parser.parse_args(argv)
+
+    cwd, sessions = collect(args.cwd, args.branch, args.session)
+    if not sessions:
+        fail("no-sessions", f"no {AGENT} sessions found for {cwd}")
+
+    out = args.out if args.out is not None else DEFAULT_DERIVED
+    os.makedirs(out, exist_ok=True)
+    home = home_dir()
+
+    results: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for meta in sessions:
+        derived = ingest(
+            meta.path, Origin(meta.cwd, home, meta.session_id), args.author
+        )
+        path = os.path.join(out, derived_name(derived))
+        Path(path).write_bytes(pack_derived(derived))
+        results.append(
+            {
+                "sessionId": meta.session_id,
+                "source": derived.header["source"]["id"],
+                "path": path,
+                "turns": len(derived.turns),
+                "heads": derived.heads,
+            }
+        )
+        leaves = len(derived.heads["leaves"])
+        lines.append(
+            f"  {meta.session_id}  {len(derived.turns)} turns  {leaves} head(s)\n"
+        )
+
+    text = "".join(lines) + f"\ningested {len(sessions)} session(s) into {out}\n"
+    return Result(
+        command="ingest",
+        payload={
+            "cwd": cwd,
+            "out": out,
+            "converter": CONVERTER,
+            "sessions": results,
+        },
+        text=text,
+    )
+
+
 def command_help(argv: list[str]) -> Result:
     return Result(command="help", payload={"usage": USAGE}, text=USAGE)
 
@@ -625,6 +685,7 @@ COMMANDS: dict[str, Callable[[list[str]], Result]] = {
     "restore": command_restore,
     "delete": command_delete,
     "reindex": command_reindex,
+    "ingest": command_ingest,
     "help": command_help,
     "version": command_version,
 }

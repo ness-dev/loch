@@ -92,7 +92,7 @@ def _records(raw: str) -> Iterator[dict[str, Any]]:
 def transcript_cwds(raw: str) -> dict[str, int]:
     """Every cwd a transcript's records name, with how many name it, in order
     of first appearance. Only the top-level field counts: `"cwd"` also occurs
-    inside tool inputs and results — lochy's own --json output among them —
+    inside tool inputs and results — loch's own --json output among them —
     where it names some other process's directory."""
     counts: dict[str, int] = {}
     for record in _records(raw):

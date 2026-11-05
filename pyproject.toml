@@ -1,5 +1,5 @@
 [project]
-name = "lochy"
+name = "loch"
 version = "0.1.0"
 description = "Save and restore agent coding sessions across machines"
 authors = [{ name = "Mike Lyons", email = "mdl0394@gmail.com" }]
@@ -14,14 +14,14 @@ dependencies = []
 s3 = ["boto3 (>=1.37.31,<2.0.0)"]
 
 [project.scripts]
-lochy = "lochy.cli:main"
+loch = "loch.cli:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-packages = [{ include = "lochy" }]
+packages = [{ include = "loch" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.2"

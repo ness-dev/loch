@@ -8,9 +8,9 @@ from typing import Any
 import pytest
 from test_claude import SECRET, write_moved_session, write_session
 
-from lochy.bundle import unpack_bundle
-from lochy.claude import session_dir_for, transcript_cwds, transcript_path_for
-from lochy.cli import main
+from loch.bundle import unpack_bundle
+from loch.claude import session_dir_for, transcript_cwds, transcript_path_for
+from loch.cli import main
 
 
 def invoke(
@@ -20,7 +20,7 @@ def invoke(
     *argv: str,
 ) -> tuple[str, str, int | None]:
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr("sys.argv", ["lochy", *argv])
+    monkeypatch.setattr("sys.argv", ["loch", *argv])
     code: int | None = None
     try:
         main()
@@ -49,17 +49,17 @@ def test_help_is_printed_without_a_command(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     out, _, code = invoke(monkeypatch, capsys, tmp_path)
-    assert out.startswith("lochy — save and restore")
+    assert out.startswith("loch — save and restore")
     assert code is None
 
 
 def test_version_is_reported_in_both_renderings(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    installed = importlib.metadata.version("lochy")
+    installed = importlib.metadata.version("loch")
 
     out, _, code = invoke(monkeypatch, capsys, tmp_path, "--version")
-    assert (out, code) == (f"lochy {installed}\n", None)
+    assert (out, code) == (f"loch {installed}\n", None)
 
     document, _, code = invoke_json(
         monkeypatch, capsys, tmp_path, "--version", "--json"
@@ -83,7 +83,7 @@ def test_unknown_command_fails(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     _, err, code = invoke(monkeypatch, capsys, tmp_path, "bogus")
-    assert err == "lochy: unknown command 'bogus' (try: lochy help)\n"
+    assert err == "loch: unknown command 'bogus' (try: loch help)\n"
     assert code == 1
 
 
@@ -235,7 +235,7 @@ def test_restore_skips_an_existing_session_unless_forced(
         str(store),
     )
     assert "skipped abc (already exists; --force to overwrite)" in err
-    assert err.endswith("lochy: nothing restored\n")
+    assert err.endswith("loch: nothing restored\n")
     assert code == 1
 
     out, _, _ = invoke(
@@ -301,7 +301,7 @@ def test_save_fails_when_nothing_matches(
         "--store",
         str(tmp_path / "store"),
     )
-    assert err.startswith("lochy: no claude-code sessions found for")
+    assert err.startswith("loch: no claude-code sessions found for")
     assert code == 1
 
 
@@ -309,7 +309,7 @@ def test_restore_requires_a_ref(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     _, err, code = invoke(monkeypatch, capsys, tmp_path, "restore")
-    assert err == "lochy: restore requires a bundle ref\n"
+    assert err == "loch: restore requires a bundle ref\n"
     assert code == 1
 
 
@@ -319,7 +319,7 @@ def test_restore_reports_an_unreadable_ref(
     _, err, code = invoke(
         monkeypatch, capsys, tmp_path, "restore", "deadbeef", "--store", str(tmp_path)
     )
-    assert err.startswith("lochy: could not read deadbeef from")
+    assert err.startswith("loch: could not read deadbeef from")
     assert code == 1
 
 
@@ -386,7 +386,7 @@ def test_list_remote_defaults_to_the_branch_you_are_on(
     home = tmp_path / "home"
     store = tmp_path / "store"
     ref = save_two_branches(monkeypatch, capsys, home, tmp_path / "proj", store)
-    monkeypatch.setattr("lochy.cli.current_branch", lambda cwd: "feature/foo")
+    monkeypatch.setattr("loch.cli.current_branch", lambda cwd: "feature/foo")
 
     out, _, _ = invoke(
         monkeypatch, capsys, home, "list", "--remote", "--store", str(store)
@@ -431,7 +431,7 @@ def test_delete_removes_the_bundle_and_its_entries(
     _, err, code = invoke(
         monkeypatch, capsys, home, "restore", ref, "--store", str(store)
     )
-    assert err.startswith(f"lochy: could not read {ref} from")
+    assert err.startswith(f"loch: could not read {ref} from")
     assert code == 1
 
 
@@ -441,7 +441,7 @@ def test_delete_reports_a_ref_that_is_not_there(
     _, err, code = invoke(
         monkeypatch, capsys, tmp_path, "delete", "deadbeef", "--store", str(tmp_path)
     )
-    assert err.startswith("lochy: could not delete deadbeef from")
+    assert err.startswith("loch: could not delete deadbeef from")
     assert code == 1
 
 
@@ -974,14 +974,14 @@ def test_json_separates_an_uninstalled_sdk_from_a_store_that_did_not_answer(
         "s3://sessions/prefix",
     )
     assert (document["code"], code) == ("s3-extra-missing", 1)
-    assert "lochy[s3]" in document["error"]
+    assert "loch[s3]" in document["error"]
 
     # With the SDK present, a store that doesn't answer is still that.
     def refuse(self: Any) -> None:
         raise OSError("connection refused")
 
     monkeypatch.delitem(sys.modules, "boto3")
-    monkeypatch.setattr("lochy.store.S3Store._client", refuse)
+    monkeypatch.setattr("loch.store.S3Store._client", refuse)
     document, _, code = invoke_json(
         monkeypatch,
         capsys,
@@ -1040,7 +1040,7 @@ def test_json_help_is_a_document_rather_than_the_usage_block(
 ) -> None:
     document, _, code = invoke_json(monkeypatch, capsys, tmp_path, "--json")
     assert (document["command"], document["ok"], code) == ("help", True, None)
-    assert document["usage"].startswith("lochy — save and restore")
+    assert document["usage"].startswith("loch — save and restore")
 
     document, _, code = invoke_json(
         monkeypatch, capsys, tmp_path, "save", "--json", "--help"

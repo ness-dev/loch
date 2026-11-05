@@ -6,7 +6,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from lochy.store import (
+from loch.store import (
     DEFAULT_STORE,
     FileStore,
     MissingDependency,
@@ -22,8 +22,8 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.delenv("LOCHY_S3_ENDPOINT", raising=False)
-    monkeypatch.delenv("LOCHY_S3_REGION", raising=False)
+    monkeypatch.delenv("LOCH_S3_ENDPOINT", raising=False)
+    monkeypatch.delenv("LOCH_S3_REGION", raising=False)
 
 
 def test_file_store_round_trips(tmp_path: Path) -> None:
@@ -96,9 +96,9 @@ def test_create_store_rejects_a_bucketless_s3_uri() -> None:
 def test_resolve_store_uri_prefers_explicit_then_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("LOCHY_STORE", raising=False)
+    monkeypatch.delenv("LOCH_STORE", raising=False)
     assert resolve_store_uri() == DEFAULT_STORE
-    monkeypatch.setenv("LOCHY_STORE", "s3://from-env/x")
+    monkeypatch.setenv("LOCH_STORE", "s3://from-env/x")
     assert resolve_store_uri() == "s3://from-env/x"
     assert resolve_store_uri("/explicit") == "/explicit"
 
@@ -139,7 +139,7 @@ def test_s3_store_reports_an_uninstalled_sdk_as_such(
         lambda: S3Store("sessions", "bundles").list(""),
         lambda: S3Store("sessions", "bundles").delete("abc.loch"),
     ):
-        with pytest.raises(MissingDependency, match=r"lochy\[s3\]"):
+        with pytest.raises(MissingDependency, match=r"loch\[s3\]"):
             call()
 
 
@@ -198,7 +198,7 @@ def test_s3_store_lists_past_the_first_page(aws_credentials: None) -> None:
 def test_s3_store_honours_the_region_override(
     aws_credentials: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("LOCHY_S3_REGION", "us-east-2")
+    monkeypatch.setenv("LOCH_S3_REGION", "us-east-2")
     boto3.client("s3", region_name="us-east-2").create_bucket(
         Bucket="sessions",
         CreateBucketConfiguration={"LocationConstraint": "us-east-2"},

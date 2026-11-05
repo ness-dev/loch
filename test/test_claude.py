@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from lochy.claude import (
+from loch.claude import (
     SUMMARY_LIMIT,
     encode_cwd,
     encode_path,
@@ -15,7 +15,7 @@ from lochy.claude import (
     transcript_cwds,
     transcript_path_for,
 )
-from lochy.redact import Redaction, RedactionError
+from loch.redact import Redaction, RedactionError
 
 SECRET = "ghp_" + "a1B2c3D4e5" * 4
 
@@ -119,7 +119,7 @@ def test_a_summary_that_will_not_come_clean_is_dropped_whole(
     def refuse(text: str) -> Redaction:
         raise RedactionError("still matching")
 
-    monkeypatch.setattr("lochy.claude.redact", refuse)
+    monkeypatch.setattr("loch.claude.redact", refuse)
     path = write_session(tmp_path, "/Users/mike/proj", "abc", summary="anything")
 
     meta = read_session_meta(str(path))
@@ -231,7 +231,7 @@ def test_falls_back_to_the_first_cwd_when_the_directory_matches_nothing(
 
 
 def test_transcript_cwds_counts_only_the_top_level_field() -> None:
-    """`"cwd"` also occurs inside tool inputs and results — lochy's own --json
+    """`"cwd"` also occurs inside tool inputs and results — loch's own --json
     output among them — where it names some other process's directory."""
     raw = "\n".join(
         [

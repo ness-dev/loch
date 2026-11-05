@@ -4,7 +4,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from lochy.bundle import (
+from loch.bundle import (
     BUNDLE_VERSION,
     Bundle,
     BundleOrigin,
@@ -12,7 +12,7 @@ from lochy.bundle import (
     bundle_ref,
     pack_bundle,
 )
-from lochy.index import (
+from loch.index import (
     BRANCH,
     bundle_key,
     decode_segment,
@@ -27,7 +27,7 @@ from lochy.index import (
     reindex,
     value_prefix,
 )
-from lochy.store import FileStore, MissingObject, S3Store
+from loch.store import FileStore, MissingObject, S3Store
 
 
 def session(session_id: str, branch: str | None, cwd: str = "/repo") -> BundleSession:
@@ -213,8 +213,8 @@ def test_an_encoded_branch_survives_a_round_trip_through_s3(
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.delenv("LOCHY_S3_ENDPOINT", raising=False)
-    monkeypatch.delenv("LOCHY_S3_REGION", raising=False)
+    monkeypatch.delenv("LOCH_S3_ENDPOINT", raising=False)
+    monkeypatch.delenv("LOCH_S3_REGION", raising=False)
     boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="sessions")
 
     store = S3Store("sessions", "prefix")

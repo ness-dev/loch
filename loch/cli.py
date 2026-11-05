@@ -55,16 +55,16 @@ from .rewrite import (
 )
 from .store import MissingDependency, MissingObject, create_store, resolve_store_uri
 
-USAGE = """lochy — save and restore agent coding sessions across machines
+USAGE = """loch — save and restore agent coding sessions across machines
 
 Usage:
-  lochy list    [--cwd <path>] [--branch <name>]
-  lochy list    --remote [--branch <name>] [--all] [--store <uri>]
-  lochy save    [--cwd <path>] [--branch <name>] [--session <id>] [--store <uri>]
-  lochy restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
-  lochy delete  <ref> [--store <uri>]
-  lochy reindex [--store <uri>]
-  lochy --version
+  loch list    [--cwd <path>] [--branch <name>]
+  loch list    --remote [--branch <name>] [--all] [--store <uri>]
+  loch save    [--cwd <path>] [--branch <name>] [--session <id>] [--store <uri>]
+  loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
+  loch delete  <ref> [--store <uri>]
+  loch reindex [--store <uri>]
+  loch --version
 
 Every command takes --json, which replaces the text below with one machine-
 readable document on stdout.
@@ -74,9 +74,9 @@ Stores:
   s3://bucket/prefix  any S3-compatible endpoint
 
 Environment:
-  LOCHY_STORE        default store URI
-  LOCHY_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
-  LOCHY_S3_REGION    region override
+  LOCH_STORE        default store URI
+  LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
+  LOCH_S3_REGION    region override
 """
 
 
@@ -162,7 +162,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def _parser(command: str) -> argparse.ArgumentParser:
-    parser = _Parser(prog=f"lochy {command}")
+    parser = _Parser(prog=f"loch {command}")
     # Registered so the flag parses after the subcommand; main() reads the mode
     # off argv itself, because a failure before or during parsing has to render
     # in the mode the caller asked for.
@@ -600,7 +600,7 @@ def installed_version() -> str:
     that was never installed has no metadata to read, and pyproject can't be
     parsed for it either — tomllib arrived in 3.11 and the floor is 3.10."""
     try:
-        return importlib.metadata.version("lochy")
+        return importlib.metadata.version("loch")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
 
@@ -608,7 +608,7 @@ def installed_version() -> str:
 def command_version(argv: list[str]) -> Result:
     version = installed_version()
     return Result(
-        command="version", payload={"version": version}, text=f"lochy {version}\n"
+        command="version", payload={"version": version}, text=f"loch {version}\n"
     )
 
 
@@ -648,7 +648,7 @@ def main() -> None:
     try:
         handler = COMMANDS.get(command)
         if handler is None:
-            fail("unknown-command", f"unknown command '{command}' (try: lochy help)")
+            fail("unknown-command", f"unknown command '{command}' (try: loch help)")
         result = handler(argv[1:])
     except HelpRequested as help_text:
         result = Result(command, {"usage": help_text.text}, text=help_text.text)

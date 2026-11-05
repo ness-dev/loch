@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from lochy.output import SCHEMA, CommandError, Result, document, emit, emit_error
+from loch.output import SCHEMA, CommandError, Result, document, emit, emit_error
 
 
 def test_a_success_envelope_carries_no_error_fields() -> None:
@@ -58,4 +58,4 @@ def test_an_error_exits_nonzero_in_both_modes(
     out, err = capsys.readouterr()
     assert failure.value.code == 2
     assert out == ""
-    assert err == "lochy: bad flag\n"
+    assert err == "loch: bad flag\n"

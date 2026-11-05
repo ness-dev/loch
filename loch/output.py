@@ -75,7 +75,7 @@ def emit_error(command: str, error: CommandError, as_json: bool) -> NoReturn:
     else:
         for warning in error.warnings:
             sys.stderr.write(warning)
-        sys.stderr.write(error.prose if error.prose else f"lochy: {error.message}\n")
+        sys.stderr.write(error.prose if error.prose else f"loch: {error.message}\n")
     raise SystemExit(error.exit_status)
 
 

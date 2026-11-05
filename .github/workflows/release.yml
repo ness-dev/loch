@@ -20,7 +20,7 @@ jobs:
       # resolves to nothing — it has to be a full version.
       - uses: astral-sh/setup-uv@v10.0.1
 
-      # A mismatch would publish v0.2.0 as an asset named lochy-0.1.0, and the
+      # A mismatch would publish v0.2.0 as an asset named loch-0.1.0, and the
       # install path is a pinned asset URL, so it is not something to discover
       # afterwards.
       - name: Check the tag against the packaged version
@@ -39,7 +39,7 @@ jobs:
         run: |
           python3 -m venv /tmp/smoke
           /tmp/smoke/bin/pip install --quiet dist/*.whl
-          test "$(/tmp/smoke/bin/lochy --version)" = "lochy ${GITHUB_REF_NAME#v}"
+          test "$(/tmp/smoke/bin/loch --version)" = "loch ${GITHUB_REF_NAME#v}"
 
       # Both artifacts: the wheel is what `uv tool install` points at, the
       # sdist is what anyone building from source needs.

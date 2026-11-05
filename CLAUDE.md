@@ -648,6 +648,16 @@ CI and no release, so the first tag push is also the first execution of the
 release path. No release exists yet, so the wheel URL in the README points at
 a `v0.1.0` that has to be cut before it resolves.
 
+The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
+`LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are
+simply no longer read. That was chosen because nothing had been released and
+no consumer set the old variables — but the failure it leaves is the silent
+kind, so it is worth knowing about: a stale `LOCHY_STORE=s3://...` makes
+`save` succeed into the local default with `ok: true`, and an unmoved
+`~/.lochy` makes `list --remote` an empty, healthy-looking answer. If a
+shim is ever wanted, the shape is to read `LOCH_*` first, fall back to the
+old name, and warn on stderr in text mode only.
+
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the
 obvious next one, and the layout takes it without a migration), any git

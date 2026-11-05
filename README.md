@@ -152,6 +152,11 @@ itself for `list`/`reindex` and `s3:DeleteObject` for `delete`.
 | `LOCH_S3_ENDPOINT` | custom endpoint for R2, MinIO, Backblaze, ... |
 | `LOCH_S3_REGION` | region override |
 
+These were `LOCHY_*` before the rename, and the default store was
+`~/.lochy/store`. The old names are not read, so an old variable is silently
+ignored rather than rejected — rename it, and `mv ~/.lochy ~/.loch` to keep
+existing bundles visible.
+
 Credentials come from the standard AWS chain, so `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`, a shared profile, or an instance role all work.
 

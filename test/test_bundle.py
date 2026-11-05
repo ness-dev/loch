@@ -1,6 +1,6 @@
 import pytest
 
-from lochy.bundle import (
+from loch.bundle import (
     Bundle,
     BundleOrigin,
     BundleSession,

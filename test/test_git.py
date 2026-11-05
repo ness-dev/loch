@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from lochy.git import current_branch
+from loch.git import current_branch
 
 
 def test_current_branch_reads_the_checkout(tmp_path: Path) -> None:

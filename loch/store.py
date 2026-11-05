@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlparse
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
 
-DEFAULT_STORE = os.path.join(str(Path.home()), ".lochy", "store")
+DEFAULT_STORE = os.path.join(str(Path.home()), ".loch", "store")
 
 
 class MissingObject(Exception):
@@ -101,11 +101,11 @@ class S3Store(Store):
         except ImportError as error:
             raise MissingDependency(
                 "the S3 backend needs boto3, which this install doesn't have "
-                "(reinstall as lochy[s3])"
+                "(reinstall as loch[s3])"
             ) from error
 
-        endpoint = os.environ.get("LOCHY_S3_ENDPOINT")
-        region = os.environ.get("LOCHY_S3_REGION")
+        endpoint = os.environ.get("LOCH_S3_ENDPOINT")
+        region = os.environ.get("LOCH_S3_REGION")
         return boto3.client(
             "s3",
             endpoint_url=endpoint,
@@ -175,4 +175,4 @@ def create_store(uri: str) -> Store:
 def resolve_store_uri(explicit: str | None = None) -> str:
     if explicit is not None:
         return explicit
-    return os.environ.get("LOCHY_STORE", DEFAULT_STORE)
+    return os.environ.get("LOCH_STORE", DEFAULT_STORE)

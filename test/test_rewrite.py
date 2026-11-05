@@ -1,6 +1,6 @@
 import json
 
-from lochy.rewrite import (
+from loch.rewrite import (
     ForeignCwd,
     RewriteSpec,
     foreign_cwds,
@@ -216,7 +216,7 @@ def test_foreign_cwds_keys_on_the_origin_rather_than_a_reversal() -> None:
 
 
 def test_foreign_cwds_ignores_a_cwd_nested_in_tool_output() -> None:
-    """`"cwd"` also appears inside tool results — lochy's own --json output
+    """`"cwd"` also appears inside tool results — loch's own --json output
     among them — where it names some other process's directory. Counting those
     would fire on a restore that was entirely correct."""
     raw = dumps(

@@ -1,11 +1,11 @@
-# lochy — repo overview for Claude
+# loch — repo overview for Claude
 
 ## What this is
 
 A standalone CLI that makes agent coding sessions portable between
 machines. Agent CLIs store transcripts in machine-local directories keyed
 by the working directory they ran in, which strands a session on the
-laptop that produced it. `lochy` packs those transcripts into a
+laptop that produced it. `loch` packs those transcripts into a
 content-addressed bundle, stores it anywhere S3-compatible, and unpacks
 it elsewhere with paths rewritten so the session actually resumes.
 
@@ -105,7 +105,7 @@ public API. Re-verify if something breaks.
   disambiguator**, and the only one available — no field marks which cwd
   is current.
 - `"cwd"` also appears *inside* tool inputs and results, naming some
-  other process's directory. lochy's own `--json` output is one such
+  other process's directory. loch's own `--json` output is one such
   source, so anything counting cwds has to parse each record and read the
   top-level field, not grep the text.
 - Scale reference: 750MB across 428 project dirs on one active machine;
@@ -129,7 +129,7 @@ public API. Re-verify if something breaks.
 Python 3.10 through 3.13, Poetry, boto3 behind an extra.
 
 ```
-lochy/
+loch/
 ├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex
 ├── claude.py    # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.py    # bundle format, gzip, content-addressed ref
@@ -295,7 +295,7 @@ given and neither is inferred.
 
 **Leaving foreign cwds unrewritten is possible — it is just not better.**
 The obvious objection, that it needs knowing which subtrees exist on the
-destination, does not apply: lochy has the exact set of candidate cwds
+destination, does not apply: loch has the exact set of candidate cwds
 already, having computed them to choose one, and those specific strings
 are known to be session working directories rather than dotfile or config
 references. So the rule "the home pair declines a value exactly equal to
@@ -325,7 +325,7 @@ single-pass guarantee depends on a nested path matching before the
 shorter prefix that contains it, and caller order is arbitrary. This is
 a "keep doing that" note, not a change.
 
-What makes it safe is that **the caller states the mapping; lochy never
+What makes it safe is that **the caller states the mapping; loch never
 infers it.** The first consumer (Harness "send worktree to remote") can
 name all four paths without a guess: the origin worktree is what the
 user selected, the origin repo root comes from
@@ -406,7 +406,7 @@ produce the same ref.
 
 ## The JSON contract
 
-`lochy` is meant to be embedded in other tools — Harness is the first — and
+`loch` is meant to be embedded in other tools — Harness is the first — and
 a caller that scrapes prose breaks the moment someone rewords a sentence.
 So every command takes `--json`, accepted either before or after the
 subcommand, and answers with exactly one document on stdout:
@@ -523,14 +523,14 @@ is pinned to the floor rather than following the running interpreter, so a
 **boto3 is an optional `[s3]` extra.** What makes that safe is the lazy import
 in `S3Store._client`: the `file://` backend loads nothing third-party at
 runtime, so the SDK was only ever an install-time cost — 8 packages and 27MB,
-of which botocore alone is 24MB against lochy's own 172KB. A default install
+of which botocore alone is 24MB against loch's own 172KB. A default install
 is one package and 184KB. Keep the import inside the method, and keep any new
 `botocore` import *after* the `_client()` call that would have failed first,
 or the SDK's absence surfaces as a bare `ImportError` and gets mislabelled
 `store-unreachable`. The dev group still carries boto3, moto and the stubs, so
 the S3 backend stays fully covered by the suite.
 
-**`lochy --version` reads package metadata**, so pyproject is the only place
+**`loch --version` reads package metadata**, so pyproject is the only place
 the number is set. `importlib.metadata` raises `PackageNotFoundError` in a
 source checkout that was never installed, which reports `"unknown"` — pyproject
 can't be read as a fallback, since `tomllib` arrived in 3.11 and the floor is
@@ -581,7 +581,7 @@ records were on `feat/send-worktree-to-remote`. Branch and version are
 now read from records carrying the *chosen* cwd. This is worth its own
 release note rather than folding into the cwd fix, because the blast
 radius is different: a consumer that carries the branch itself sees a
-healthy-looking transfer while the lochy entry sits under a name nobody
+healthy-looking transfer while the loch entry sits under a name nobody
 would look for it on, and every already-saved bundle from a moved session
 is filed wrong until re-saved or reindexed.
 
@@ -612,7 +612,7 @@ coverage now, which is more than it had, but mocks agree with your
 assumptions by construction. A live run failed on `Access Denied` (the
 IAM user lacked `s3:PutObject`); the region mismatch that precedes that
 failure surfaces as "The bucket you are attempting to access must be
-addressed using the specified endpoint," so set `LOCHY_S3_REGION`
+addressed using the specified endpoint," so set `LOCH_S3_REGION`
 when the bucket's region differs from the AWS config default.
 
 Listing and deleting need IAM actions the bucket policy may not grant
@@ -647,6 +647,16 @@ workflow has ever run**, though — they were written against a repo with no
 CI and no release, so the first tag push is also the first execution of the
 release path. No release exists yet, so the wheel URL in the README points at
 a `v0.1.0` that has to be cut before it resolves.
+
+The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
+`LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are
+simply no longer read. That was chosen because nothing had been released and
+no consumer set the old variables — but the failure it leaves is the silent
+kind, so it is worth knowing about: a stale `LOCHY_STORE=s3://...` makes
+`save` succeed into the local default with `ok: true`, and an unmoved
+`~/.lochy` makes `list --remote` an empty, healthy-looking answer. If a
+shim is ever wanted, the shape is to read `LOCH_*` first, fall back to the
+old name, and warn on stderr in text mode only.
 
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the

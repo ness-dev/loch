@@ -1,4 +1,4 @@
-# lochy
+# loch
 
 Save and restore agent coding sessions across machines.
 
@@ -7,7 +7,7 @@ working directory they ran in. That makes a session effectively stuck to the
 laptop that produced it — you can't hand a teammate the conversation that
 produced a branch, and you can't pick one up on another machine.
 
-`lochy` packs those transcripts into a portable, content-addressed
+`loch` packs those transcripts into a portable, content-addressed
 bundle, stores it anywhere S3-compatible, and unpacks it on another machine
 with the paths rewritten so the session actually resumes.
 
@@ -16,14 +16,14 @@ Currently supports Claude Code.
 ## Install
 
 ```sh
-uv tool install https://github.com/ness-dev/lochy/releases/download/v0.1.0/lochy-0.1.0-py3-none-any.whl
-lochy --version
+uv tool install https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-py3-none-any.whl
+loch --version
 ```
 
 The wheel is `py3-none-any`, and [uv](https://docs.astral.sh/uv/) is a static
 binary that brings its own CPython, so this needs no Python on the machine and
 no PyPI account behind it. Releases are attached to
-[GitHub releases](https://github.com/ness-dev/lochy/releases) as a wheel
+[GitHub releases](https://github.com/ness-dev/loch/releases) as a wheel
 and an sdist.
 
 Python 3.10 or newer if you'd rather install it yourself — `pipx install`,
@@ -34,7 +34,7 @@ in. The backend imports boto3 lazily, so a `file://` store never loads it and
 paying 27MB for a dependency most installs never reach isn't worth it:
 
 ```sh
-uv tool install "lochy[s3] @ https://github.com/ness-dev/lochy/releases/download/v0.1.0/lochy-0.1.0-py3-none-any.whl"
+uv tool install "loch[s3] @ https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-py3-none-any.whl"
 ```
 
 Without it, an `s3://` store fails with `code: "s3-extra-missing"` rather than
@@ -44,7 +44,7 @@ For development:
 
 ```sh
 poetry install       # brings boto3, so the S3 backend is covered by the tests
-poetry run lochy --help
+poetry run loch --help
 poetry run pytest
 ```
 
@@ -52,27 +52,27 @@ poetry run pytest
 
 ```sh
 # what's on this machine for the current repo?
-lochy list
-lochy list --branch feature/checkout-flow
+loch list
+loch list --branch feature/checkout-flow
 
 # pack them up and push to a store
-lochy save --branch feature/checkout-flow --store s3://my-bucket/sessions
+loch save --branch feature/checkout-flow --store s3://my-bucket/sessions
 # -> packed e71cdcb1... [feature/checkout-flow] — redacted 2 secrets
 # -> ref 10482276de745032...
 
 # on another machine: what's been saved for the branch I'm on?
-lochy list --remote --store s3://my-bucket/sessions
-lochy list --remote --branch feature/checkout-flow
-lochy list --all            # every branch in the store
+loch list --remote --store s3://my-bucket/sessions
+loch list --remote --branch feature/checkout-flow
+loch list --all            # every branch in the store
 
-lochy restore 10482276de745032... --store s3://my-bucket/sessions
+loch restore 10482276de745032... --store s3://my-bucket/sessions
 # -> cd /path/to/repo && claude --resume e71cdcb1-7c2c-410b-8c73-91cdf0cba4b8
 
 # a transcript that shouldn't be there any more
-lochy delete 10482276de745032...
+loch delete 10482276de745032...
 
 # rebuild the index from the bundles, if a save was interrupted
-lochy reindex
+loch reindex
 ```
 
 `save` bundles every session matching the filter, so a branch with several
@@ -84,22 +84,22 @@ Every command takes `--json`, before or after the subcommand, and prints one
 document on stdout instead of the text above:
 
 ```sh
-lochy save --json --branch feature/checkout-flow --store /tmp/outbound
+loch save --json --branch feature/checkout-flow --store /tmp/outbound
 # {"schema":1,"ok":true,"command":"save","ref":"10482276...","bytes":4712,
 #  "redacted":2,"sessions":[{"sessionId":"e71cdcb1-...","branch":"feature/checkout-flow",
 #  "redactions":{"aws-access-key":1,"jwt":1}}],"indexed":[...]}
 
-ref=$(lochy save --json --store /tmp/outbound | jq -r .ref)
-lochy restore --json "$ref" --into /path/to/repo --store /tmp/outbound
+ref=$(loch save --json --store /tmp/outbound | jq -r .ref)
+loch restore --json "$ref" --into /path/to/repo --store /tmp/outbound
 
-lochy --version --json
+loch --version --json
 # {"schema":1,"ok":true,"command":"version","version":"0.1.0"}
 ```
 
 Failures are documents too, on stdout, so one stream carries both outcomes:
 
 ```sh
-lochy restore --json deadbeef --store /tmp/outbound; echo "exit $?"
+loch restore --json deadbeef --store /tmp/outbound; echo "exit $?"
 # {"schema":1,"ok":false,"command":"restore","code":"bundle-not-found",
 #  "error":"could not read deadbeef from /tmp/outbound: ..."}
 # exit 1
@@ -125,9 +125,9 @@ bundles/<ref>.loch                 the bundle, named by the hash of its bytes
 index/branch/<branch>/<ref>        a small entry per branch the bundle touches
 ```
 
-`lochy list --remote` reads only the index, so listing a branch never
+`loch list --remote` reads only the index, so listing a branch never
 downloads a bundle. Entries are derived from the bundles and hold nothing
-that isn't already in them — `lochy reindex` rebuilds the whole index by
+that isn't already in them — `loch reindex` rebuilds the whole index by
 scanning `bundles/`, and drops entries no bundle backs.
 
 Branch names are percent-encoded, so `feature/foo` stays one path segment
@@ -148,9 +148,14 @@ itself for `list`/`reindex` and `s3:DeleteObject` for `delete`.
 
 | Variable | Purpose |
 | --- | --- |
-| `LOCHY_STORE` | default store URI (else `~/.lochy/store`) |
-| `LOCHY_S3_ENDPOINT` | custom endpoint for R2, MinIO, Backblaze, ... |
-| `LOCHY_S3_REGION` | region override |
+| `LOCH_STORE` | default store URI (else `~/.loch/store`) |
+| `LOCH_S3_ENDPOINT` | custom endpoint for R2, MinIO, Backblaze, ... |
+| `LOCH_S3_REGION` | region override |
+
+These were `LOCHY_*` before the rename, and the default store was
+`~/.lochy/store`. The old names are not read, so an old variable is silently
+ignored rather than rejected — rename it, and `mv ~/.lochy ~/.loch` to keep
+existing bundles visible.
 
 Credentials come from the standard AWS chain, so `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`, a shared profile, or an instance role all work.

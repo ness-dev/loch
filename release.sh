@@ -42,7 +42,7 @@ path.write_text(new)
 PY
 grep -q "^version = \"$version\"$" pyproject.toml || die "version bump did not apply"
 
-# Not asserting `lochy --version` here: it reads installed package metadata,
+# Not asserting `loch --version` here: it reads installed package metadata,
 # which still holds the old number until the bumped project is reinstalled.
 # The release workflow smoke-tests it against a freshly built wheel instead.
 echo "==> verifying"
@@ -75,5 +75,5 @@ cat <<EOF
 
 released $tag
   watch:   https://github.com/$slug/actions
-  install: uv tool install https://github.com/$slug/releases/download/$tag/lochy-$version-py3-none-any.whl
+  install: uv tool install https://github.com/$slug/releases/download/$tag/loch-$version-py3-none-any.whl
 EOF

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from lochy.redact import RULES, RedactionError, Rule, redact, scan, summarize
+from loch.redact import RULES, RedactionError, Rule, redact, scan, summarize
 
 # Structurally valid, obviously synthetic. Nothing here is or was a credential.
 FAKE = {

@@ -247,7 +247,7 @@ Two object kinds, stored apart:
 | envelope | turn cores, heads, signatures, pins | anywhere, including git. Immutable and small, and holds no transcript text. |
 | content | content objects, raw source blobs | a store objects can be **deleted** from |
 
-lochy chose S3 over git because a leaked secret in git can't be deleted. That
+The bundle store chose S3 over git because a leaked secret in git can't be deleted. That
 reasoning still holds for content and doesn't apply to envelopes. Deleting
 content leaves a tombstone; the graph above it still verifies. Sharing a
 conversation without some of its content is the same operation as deleting
@@ -352,7 +352,7 @@ the core, so a turn can gain signatures without changing identity.
 13. **Pin capture.** Historical transcripts record a branch, never a commit.
     Capture pins live (a hook in the driving tool), infer them from
     `git commit` tool output, or both? And `refs/loch/pins/*` vs git notes.
-14. **Envelopes in git** go against lochy's "not git-backed" decision only
+14. **Envelopes in git** go against the bundle store.s "not git-backed" decision only
     in part: envelopes hold kinds, authors, hashes and structure, not text.
     Is structure alone sensitive enough to rule git out too?
 15. **Conversation identity.** Heads name leaves, but what names "the

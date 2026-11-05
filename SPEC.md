@@ -35,14 +35,22 @@ tools        (Ness, review UIs, sync, merge)                ← read loch only
 
 ## 3. Encoding and ids
 
-- **Canonical JSON:** UTF-8, keys sorted, separators `,` and `:` with no
-  whitespace, non-ASCII written literally, NaN and Infinity rejected. Lone
-  surrogates are encoded with `surrogatepass` rather than refused, since real
-  transcripts contain them.
+- **Canonical JSON** is RFC 8785 (JCS), so a second implementation in any
+  language reproduces an id byte for byte:
+  - UTF-8 output
+  - object keys sorted by UTF-16 code units
+  - no whitespace
+  - strings escaped as ECMAScript's `JSON.stringify` escapes them, including
+    a lone surrogate as `\udXXX`, which real transcripts contain
+  - floats printed by ECMAScript's Number-to-String (`1e+21`, `1e-7`,
+    `0.00001`, `100`)
+  - NaN and Infinity rejected
+
+  **One departure:** integers print exactly at any size. JCS treats every
+  number as a double, which would silently round a large integer inside a
+  tool result.
 - **Ids:** `sha256:` followed by 64 lowercase hex digits, the SHA-256 of the
   canonical JSON. The prefix names the algorithm so a future one can coexist.
-- **Numbers:** floats use the shortest round-trip form, which matches RFC 8785
-  for every value without an exponent (§13.4).
 
 ## 4. The turn
 
@@ -62,8 +70,8 @@ A turn is one node in the conversation graph. Its id is the hash of its
 | field | meaning |
 | --- | --- |
 | `loch` | Format major version. A change to the core's meaning bumps it. |
-| `kind` | `message`, `tool-result`, `context`, `event`, `compaction`, and reserved for native turns, `approval` and `note`. |
-| `author` | `{"kind": "human" \| "agent" \| "tool" \| "system", ...}`. A human may carry `id`; agent, tool and system authors carry `agent` (e.g. `claude-code`). Absent fields are omitted, never `null`. |
+| `kind` | `message`, `tool-result`, `context`, `compaction`, and reserved for native turns, `approval` and `note`. |
+| `author` | `{"kind": "human" \| "agent" \| "tool" \| "system", ...}`. A human may carry `id`, normally `ssh:SHA256:<fingerprint>` (§13). Agent, tool and system authors carry `agent` (e.g. `claude-code`). Absent fields are omitted, never `null`. |
 | `parents` | Ordered list of parent turn ids. Empty means a root; two or more means a merge. |
 | `content` | The id of the content object, never the content itself. |
 
@@ -103,7 +111,8 @@ derived file hasn't lost anything.
 Per-turn metadata that is not identity: `line` and `uuid` of the source
 record, `alsoUuids` (other records that collapsed into this turn),
 `timestamp`, `messageId`, `model`, `gitBranch`, `version`, `cwd`
-(normalized), `record` (the source record type), `subtype`, `danglingParent`.
+(normalized), `record` (the source record type), `subtype`, `danglingParent`,
+and `events`: agent bookkeeping that followed this turn (§8).
 Facts may differ between two derivations of the same turn.
 
 ## 5. Normalization
@@ -140,7 +149,7 @@ The origin values themselves appear only in the derived file's header.
   Claude Code's `last-prompt.leafUuid` does; otherwise it is the last record.
 
 Named branches are local refs over turn ids, like git branch names, and are
-outside the derived file (§13.15).
+outside the derived file (§13, conversation identity).
 
 ## 7. Derived file
 
@@ -187,7 +196,7 @@ byte-identical.
 everything under `<session-id>/`: subagent transcripts in `subagents/` and
 spilled tool output in `tool-results/`. The manifest hashes all of it as
 `transcript.jsonl` and `sidecar/<relative path>`. In v1 only the transcript is
-converted to turns (§13.9).
+converted to turns (§13, subagents).
 
 **One chain record is one turn.** A chain record is any record with a
 `uuid`. Its parent is the turn of its `parentUuid`. Consequences measured
@@ -214,7 +223,7 @@ against a real corpus of 3,810 sessions:
 | other `user` | `message` | the ingesting human |
 | `attachment` | `context` | system |
 | `system`, `compact_boundary` subtype | `compaction` | system |
-| other `system` | `event` | system |
+| other `system` (hook summaries, turn durations, API retries) | not a turn: folded into the preceding turn's `facts.events` | — |
 | records without `uuid` (titles, cost, mode, queue, api-request, …) | not turns | — |
 
 - **User and assistant content** is converted per §4.
@@ -225,8 +234,14 @@ against a real corpus of 3,810 sessions:
   envelope fields (uuid, parents, session, timestamp, cwd, branch, version,
   entrypoint, userType, slug, isSidechain, agentId, requestId, promptId),
   wrapped as `x-claude-code:attachment` or `x-claude-code:system`.
+- **Folded events.** An event's uuid resolves to the turn it follows, so the
+  record after it links straight past. Ids are therefore the same whether or
+  not Claude Code wrote the event. An event with no turn before it goes into
+  the header's `session.events`.
 
-**Human author.** Given at ingest (`--author`). When absent, human turns are
+**Human author.** Given at ingest. `--author-key <key.pub>` gives
+`ssh:SHA256:<fingerprint>`, the same string `ssh-keygen -l` prints, and
+`--author <id>` takes any string. When neither is given, human turns are
 unattributed (`{"kind": "human"}`). It is never guessed from git config or
 the environment, because it is part of every id.
 
@@ -236,7 +251,7 @@ the environment, because it is part of every id.
 - Every derived file reads back verified and byte-identical.
 - Turn ids and heads are unchanged after a `restore`-style rewrite to another
   home, cwd and session id. The one exception is a transcript whose content
-  already names the destination paths (§13.8).
+  already names the destination paths (§14.2).
 
 ## 9. Storage: envelope and content (not yet implemented)
 
@@ -293,72 +308,55 @@ the core, so a turn can gain signatures without changing identity.
 
 ## 12. Evolving
 
-- **Converter version** bumps when derived output changes. Re-derive old
-  files.
-- **Format major version** (`loch`) bumps when the core changes meaning, and
-  is the only change that changes ids.
-- **Adding a block type, fact or header field** is not a version change.
-  Readers ignore what they don't know.
-- **A converter fix that changes core bytes changes ids.** Policy in §13.1.
+- **Until the first conversation is shared, everything here is draft.** Ids
+  may change from one commit to the next, and nothing needs migrating,
+  because nothing exists outside one machine and every derived file can be
+  regenerated.
+- **After that:**
+  - The **converter version** bumps whenever derived output changes. Old
+    derived files are re-derived, never migrated.
+  - A converter change that alters **core bytes**, and so ids, also bumps
+    the **format major version** (`loch`). It ships a `supersedes` map from
+    old ids to new, so anyone holding the old ids can follow them.
+  - **Adding** a block type, fact or header field is not a version change.
+    Readers ignore what they don't know.
 
-## 13. Open questions
+## 13. Decisions
 
-1. **Converter fixes vs stable ids.** Fixing how a record normalizes changes
-   its turn id and every descendant's. Options:
-   - freeze core-affecting converter behaviour per format major
-   - emit `supersedes` records mapping old ids to new
-   - accept churn until anything is shared
+These were open in the first draft. Each is settled, with the reason.
 
-   Nothing is shared yet, so this is cheap to decide now and expensive later.
-2. **Human identity.** What is an author `id`: email, SSH or GPG key
-   fingerprint, a DID? Because the author is in the core, two people
-   ingesting the same raw source with different `--author` get different
-   ids. Is the ingester really the author of a Claude transcript's human
-   turns?
-3. **Tombstones aren't fully private.** A low-entropy content object ("yes",
-   "lgtm") can be confirmed from its hash after deletion. Option: a salt
-   inside the content object, derived deterministically per source so
-   re-ingest stays idempotent.
-4. **Floats.** Python's repr diverges from RFC 8785 for exponent forms
-   (`1e+21` vs `1e21`). A second implementation in another language must
-   match bit for bit. Adopt RFC 8785 exactly?
-5. **Turn granularity.** One turn per record is faithful and keeps Claude's
-   tree, but merge and review probably want message-level units. Should
-   message-level grouping be a derived view, which is the v1 answer, or the
-   identity unit?
-6. **Should `context` and `event` turns be in the graph at all?** Hook
-   summaries, attachments and reminders are Claude Code internals that shape
-   the model's context. Today they are hashed turns (about 26% of all turns)
-   carrying `x-claude-code:*` payloads, so their identity depends on Claude
-   Code's internal record shapes.
-7. **Sessions that moved directories.** Only the final cwd becomes
-   `{{loch:root}}`. Earlier cwds normalize under `{{loch:home}}`, so a copy
-   that moves the two directories differently won't match. Numbered roots?
-8. **Content that names the destination.** A transcript that already
-   contains the path it is later restored to is indistinguishable from a
-   rewritten one. It happened once in 3,810 sessions, and that session was
-   the one that built this test.
-9. **Subagents.** Sidechain transcripts are hashed in the source but not
-   converted. Natural shape: a child graph whose root's parent is the
-   `tool-call` turn that spawned it.
-10. **Spilled tool output** (`tool-results/`) is referenced by path from
-    content. Inline it, or reference its source blob by hash?
-11. **Images** are inline base64 inside content. Separate blob objects would
-    dedupe and could be deleted independently.
-12. **Raw snapshots.** Claude appends to live files, so "immutable raw source"
-    means snapshotting at ingest. Should `ingest` write `raw/<hex>` to a
-    store? Appending a session and re-ingesting keeps every earlier turn id
-    (tested), so incremental ingest is safe.
-13. **Pin capture.** Historical transcripts record a branch, never a commit.
-    Capture pins live (a hook in the driving tool), infer them from
-    `git commit` tool output, or both? And `refs/loch/pins/*` vs git notes.
-14. **Envelopes in git** go against the bundle store.s "not git-backed" decision only
-    in part: envelopes hold kinds, authors, hashes and structure, not text.
-    Is structure alone sensitive enough to rule git out too?
-15. **Conversation identity.** Heads name leaves, but what names "the
-    conversation" across forks and machines — the root turn id, a
-    conversation object, or nothing?
-16. **Resume from a derived-only share.** Thinking signatures and
-    `toolUseResult` stay in the raw source, so the emitter (loch → Claude
-    Code) can resume natively only with the raw source at hand. Otherwise it
-    synthesizes context.
+| question | answer | why |
+| --- | --- | --- |
+| Number encoding | RFC 8785, with exact integers (§3) | A second implementation must reproduce ids byte for byte. |
+| Converter fixes vs stable ids | Free churn until first share, then version bump plus `supersedes` (§12) | Costs nothing now, and keeps ids followable later. |
+| Turn granularity | One turn per agent record. Grouping into whole replies is a view built from `facts.messageId`. | The only option that keeps the agent's own tree, rewind branches included. |
+| Agent bookkeeping in the graph | `context` stays a turn. `event` is folded into facts (§8). | Context shaped what the model saw. Events are an agent's internal records, and as turns they made about 2% of turns, and every id after them, depend on its internal shapes. |
+| Human identity | `ssh:SHA256:<fingerprint>` | Same as git's SSH signing: no new infrastructure, can be checked against keys people already publish, and the same key can sign turns later. |
+| Who authors a transcript's human turns | Whoever ingests it | In practice the person who ran the session. Everyone else receives their derived file and doesn't re-ingest it. |
+| Conversation identity | Its root turn id | Forks share the root, so they stay recognizably the same conversation. A merge has several. Heads are local names, like git branches. |
+| Sessions that moved directories | Numbered roots (`{{loch:root:1}}`, …) for every cwd the session held, in order of first appearance | The current single root lets a copy that moves only one directory change ids. Not yet built. |
+| Subagents | A child graph whose root's parent is the `tool-call` turn that spawned it | Keeps a subagent's turns reachable from the conversation that asked for them. Not yet built. |
+| Spilled tool output and images | Separate content objects referenced by hash, rather than inline | They dedupe, and can be deleted on their own. Not yet built. |
+| Raw snapshots | `ingest` writes the raw source to `raw/<hex>` in a store | Claude Code appends to live files. Re-ingesting a grown session keeps every earlier turn id (tested), so snapshots can be incremental. Not yet built. |
+| Pin capture | Live, from the driving tool. Old transcripts get none and are not guessed. | A pin inferred from tool output that turns out wrong is worse than no pin. |
+| Envelopes in git | Yes | They carry structure and hashes, never text. Deletability applies to content (§9). |
+| Resume from a derived-only share | The emitter synthesizes context | Thinking signatures and `toolUseResult` exist only in the raw source. With it at hand, the emitter resumes natively. |
+
+## 14. Open
+
+1. **Salting content hashes.** A deleted low-entropy content object ("yes",
+   "lgtm", "run the tests") can be confirmed by anyone holding its envelope:
+   hash the guess and compare. Chaining doesn't help, because content is
+   hashed on its own so it can be deleted on its own, and the guesser can
+   see the parents anyway. A salt stored inside the content object goes when
+   the content goes, which closes the hole. To keep re-ingest idempotent the
+   salt must be deterministic, so it would be
+   `HMAC(owner secret, source id + record position)`.
+
+   The cost: re-deriving the same ids then needs the owner's secret, so
+   losing it means the next converter upgrade changes ids. Awaiting a
+   decision.
+2. **Content that names the destination.** A known limit rather than a
+   question. A transcript that already contains the path it is later
+   restored to can't be told apart from a rewritten one. It happened once in
+   3,810 sessions, in the session that built this test.

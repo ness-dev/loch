@@ -43,7 +43,7 @@ travel with the code they produced.
   transcript stays the thing that has to survive.
 - **Not git-backed storage for content.** See below. Turn envelopes (which
   hold hashes and structure, never transcript text) are a different
-  question — SPEC.md §9 and §13.14.
+  question — SPEC.md §9 and §13.
 
 ## Design decisions and their reasoning
 
@@ -169,7 +169,7 @@ copy rewritten by one set of pairs normalizes back through the same set — so
 a change to the guards changes both behaviours at once, which is the point.
 `test_corpus.py` is the check that it still holds on real data: 3809 of 3810
 sessions keep every turn id across a simulated move, and the one that doesn't
-is a transcript that already contains the destination paths (SPEC.md §13.8).
+is a transcript that already contains the destination paths (SPEC.md §14.2).
 
 The turn core holds the content's *hash*, not the content, so deleting
 content never invalidates an id. Anything that makes a turn's id depend on
@@ -484,6 +484,7 @@ never a code. The set today:
 | `s3-extra-missing` | an `s3://` store on an install without the `s3` extra |
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
+| `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -690,14 +691,22 @@ Claude Code.
 discoverable, but nothing resolves a prefix.
 
 **The loch format (SPEC.md) is v1 draft.** `loch ingest` converts every
-session in the local corpus (3810 sessions, 266k turns, ~18ms each) and the
-derived files read back verified and byte-identical; re-ingest is
-idempotent. What it doesn't do yet: write anything to a store (derived files
-go to `~/.loch/derived`, raw sources aren't snapshotted), convert subagent
-sidecars, capture git pins, or emit back to Claude Code JSONL. Nothing is
-shared in this format yet, so SPEC.md §13.1 — what a converter fix that
-changes ids should do — is still free to answer. The bundle format and
+session in the local corpus (3810 sessions, 266k turns) and the derived files
+read back verified and byte-identical; re-ingest is idempotent. The draft
+questions are settled in SPEC.md §13; the one still open is §14.1, salting
+content hashes. What it doesn't do yet: write anything to a store (derived
+files go to `~/.loch/derived`, raw sources aren't snapshotted), convert
+subagent sidecars, give each of a moved session's cwds its own root, capture
+git pins, or emit back to Claude Code JSONL. Until the first conversation is
+shared, ids may change between commits (SPEC.md §12). The bundle format and
 everything `save`/`restore` do are unchanged.
+
+`format.canonical` is RFC 8785 written out by hand rather than `json.dumps`,
+because Python's float repr and code-point key order both disagree with it.
+That costs speed: the corpus check went from about 3.5 to about 5.5 minutes.
+If it ever matters, the fast path is `json.dumps` for any value containing no
+float, no non-BMP key and no lone surrogate, which is nearly all of them, and checking the two
+agree is a one-line property test.
 
 ## Conventions
 

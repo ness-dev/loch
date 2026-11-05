@@ -45,7 +45,14 @@ from .index import (
     reindex,
     value_prefix,
 )
-from .ingest import CONVERTER, Origin, derived_name, ingest
+from .ingest import (
+    CONVERTER,
+    AuthorKeyError,
+    Origin,
+    derived_name,
+    ingest,
+    ssh_author_id,
+)
 from .output import JSON_FLAG, CommandError, Result, emit, emit_error
 from .redact import RedactionError, redact, summarize
 from .rewrite import (
@@ -68,7 +75,8 @@ Usage:
   loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
   loch delete  <ref> [--store <uri>]
   loch reindex [--store <uri>]
-  loch ingest  [--cwd <path>] [--branch <name>] [--session <id>] [--author <id>]
+  loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
+               [--author <id> | --author-key <key.pub>]
                [--out <dir>]
   loch --version
 
@@ -604,8 +612,18 @@ def command_ingest(argv: list[str]) -> Result:
     parser.add_argument("--branch")
     parser.add_argument("--session")
     parser.add_argument("--author")
+    parser.add_argument("--author-key")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
+
+    author = args.author
+    if args.author_key is not None:
+        if author is not None:
+            fail("usage", "pass --author or --author-key, not both")
+        try:
+            author = ssh_author_id(Path(args.author_key).read_text(encoding="utf-8"))
+        except (OSError, AuthorKeyError) as error:
+            fail("author-key-unreadable", f"{args.author_key}: {error}")
 
     cwd, sessions = collect(args.cwd, args.branch, args.session)
     if not sessions:
@@ -618,9 +636,7 @@ def command_ingest(argv: list[str]) -> Result:
     results: list[dict[str, Any]] = []
     lines: list[str] = []
     for meta in sessions:
-        derived = ingest(
-            meta.path, Origin(meta.cwd, home, meta.session_id), args.author
-        )
+        derived = ingest(meta.path, Origin(meta.cwd, home, meta.session_id), author)
         path = os.path.join(out, derived_name(derived))
         Path(path).write_bytes(pack_derived(derived))
         results.append(

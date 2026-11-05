@@ -1113,3 +1113,19 @@ def test_ingest_fails_when_nothing_matches(
     )
 
     assert (code, document["code"]) == (1, "no-sessions")
+
+
+def test_ingest_rejects_an_unreadable_author_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    document, _, code = invoke_json(
+        monkeypatch,
+        capsys,
+        tmp_path / "home",
+        "ingest",
+        "--json",
+        "--author-key",
+        str(tmp_path / "missing.pub"),
+    )
+
+    assert (code, document["code"]) == (1, "author-key-unreadable")

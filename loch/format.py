@@ -1,7 +1,9 @@
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 FORMAT_VERSION = 1
@@ -14,21 +16,100 @@ class FormatError(ValueError):
     read, or carries an id its own contents don't hash to."""
 
 
-def canonical(value: Any) -> bytes:
-    """The one encoding every id is computed over. Sorted keys and compact
-    separators make it independent of construction order. `surrogatepass`
-    because a transcript can hold a lone surrogate (a `\\ud83d` cut from its
-    pair), and refusing to hash it would drop a real record.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
-    Floats go through Python's shortest round-trip repr, which agrees with
-    RFC 8785 for every value that has no exponent. See SPEC.md."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8", "surrogatepass")
+
+def _string(text: str) -> str:
+    """JSON.stringify's escaping, which Python's matches except for a lone
+    surrogate: Python writes it raw, which isn't valid UTF-8, where
+    ECMAScript escapes it. Transcripts do hold them — a `\\ud83d` cut from its
+    pair by truncation — so they are escaped rather than refused."""
+    encoded = json.dumps(text, ensure_ascii=False)
+    if _LONE_SURROGATE.search(encoded):
+        encoded = _LONE_SURROGATE.sub(
+            lambda match: f"\\u{ord(match.group(0)):04x}", encoded
+        )
+    return encoded
+
+
+def _number(value: float) -> str:
+    """ECMAScript Number-to-String, as RFC 8785 requires. Python's repr finds
+    the same shortest round-trip digits but places the exponent differently
+    (`1e+16` and `1e-05` where ECMAScript writes `10000000000000000` and
+    `0.00001`), so only the digits are taken from it."""
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{value} has no JSON representation")
+    if value == 0:
+        return "0"
+    sign = "-" if value < 0 else ""
+    parts = Decimal(repr(abs(value))).normalize().as_tuple()
+    digits = "".join(str(digit) for digit in parts.digits)
+    exponent = parts.exponent
+    assert isinstance(exponent, int)
+    k = len(digits)
+    n = k + exponent
+    if k <= n <= 21:
+        return sign + digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return sign + digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return sign + "0." + "0" * -n + digits
+    mantissa = digits[0] + ("." + digits[1:] if k > 1 else "")
+    power = n - 1
+    return f"{sign}{mantissa}e{'+' if power >= 0 else '-'}{abs(power)}"
+
+
+def _utf16_order(key: str) -> bytes:
+    return key.encode("utf-16-be", "surrogatepass")
+
+
+def _encode(value: Any, out: list[str]) -> None:
+    if isinstance(value, str):
+        out.append(_string(value))
+    elif value is None:
+        out.append("null")
+    elif value is True:
+        out.append("true")
+    elif value is False:
+        out.append("false")
+    elif isinstance(value, int):
+        out.append(str(value))
+    elif isinstance(value, float):
+        out.append(_number(value))
+    elif isinstance(value, dict):
+        out.append("{")
+        for index, key in enumerate(sorted(value, key=_utf16_order)):
+            if not isinstance(key, str):
+                raise TypeError(f"object key {key!r} is not a string")
+            if index:
+                out.append(",")
+            out.append(_string(key))
+            out.append(":")
+            _encode(value[key], out)
+        out.append("}")
+    elif isinstance(value, (list, tuple)):
+        out.append("[")
+        for index, item in enumerate(value):
+            if index:
+                out.append(",")
+            _encode(item, out)
+        out.append("]")
+    else:
+        raise TypeError(f"{type(value).__name__} is not JSON")
+
+
+def canonical(value: Any) -> bytes:
+    """RFC 8785 (JSON Canonicalization Scheme): the one encoding every id is
+    computed over, so a second implementation in any language can reproduce
+    an id byte for byte. Keys sort by UTF-16 code units, numbers print as
+    ECMAScript does, and strings escape as JSON.stringify does.
+
+    One deliberate departure: an integer prints exactly, at any size. RFC
+    8785 treats every number as a double, which would silently round a
+    63-bit id inside a tool result; exact is what the transcript said."""
+    out: list[str] = []
+    _encode(value, out)
+    return "".join(out).encode("utf-8")
 
 
 def digest(value: Any) -> str:

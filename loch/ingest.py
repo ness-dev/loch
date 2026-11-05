@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import heapq
 import json
 import os
@@ -255,6 +257,33 @@ def _facts(
     return facts
 
 
+def _fold_event(
+    number: int,
+    record: dict[str, Any],
+    blocks: list[Any],
+    turn_of: dict[str, str],
+    turns: dict[str, Turn],
+    session: dict[str, Any],
+    text: Callable[[str], str],
+) -> None:
+    """Hook summaries, turn durations, API retries: Claude Code's own
+    bookkeeping, written into the parent chain but not part of what anyone
+    said. As turns they made a quarter of the graph's identity depend on
+    Claude Code's internal record shapes. Folded into the facts of the turn
+    they follow instead, and the event's uuid resolves to that turn, so a
+    record whose parent was the event links straight past it."""
+    event: dict[str, Any] = {"line": number, **normalize_value(blocks[0], text)}
+    if isinstance(record.get("timestamp"), str):
+        event["timestamp"] = record["timestamp"]
+    parent_uuid = _parent_uuid(record)
+    parent = turn_of.get(parent_uuid) if parent_uuid is not None else None
+    if parent is None:
+        session.setdefault("events", []).append(event)
+        return
+    turn_of[record["uuid"]] = parent
+    turns[parent].facts.setdefault("events", []).append(event)
+
+
 def convert(
     raw: str, origin: Origin, human: dict[str, Any]
 ) -> tuple[list[Turn], dict[str, Any], dict[str, Any]]:
@@ -284,12 +313,16 @@ def convert(
     turns: dict[str, Turn] = {}
     has_children: set[str] = set()
     last_turn: str | None = None
+    session: dict[str, Any] = {}
 
     for number, record in ordered:
         classified = classify(record)
         if classified is None:
             continue
         kind, author, blocks = classified
+        if kind == "event":
+            _fold_event(number, record, blocks, turn_of, turns, session, text)
+            continue
         if author.get("kind") == "human":
             author = human
         parent_uuid = _parent_uuid(record)
@@ -310,7 +343,6 @@ def convert(
             turns[turn.id] = turn
         has_children.update(parents)
 
-    session: dict[str, Any] = {}
     current = last_turn
     for _, record in records:
         record_type = record.get("type")
@@ -396,3 +428,23 @@ def derived_name(derived: Derived) -> str:
     source = derived.header["source"]["id"].split(":", 1)[1]
     converter = derived.header["converter"]
     return f"{source}.{converter['id']}-v{converter['version']}.jsonl"
+
+
+class AuthorKeyError(ValueError):
+    pass
+
+
+def ssh_author_id(public_key: str) -> str:
+    """`ssh:SHA256:<base64>` — the fingerprint `ssh-keygen -l` prints, so an
+    author id can be checked by eye against a key someone already publishes
+    (GitHub serves them at /<user>.keys), and the same key can later sign the
+    turns it authored."""
+    fields = public_key.split()
+    if len(fields) < 2:
+        raise AuthorKeyError("not an OpenSSH public key line")
+    try:
+        blob = base64.b64decode(fields[1], validate=True)
+    except ValueError as error:
+        raise AuthorKeyError(f"key body is not base64: {error}") from error
+    fingerprint = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return f"ssh:SHA256:{fingerprint.rstrip('=')}"

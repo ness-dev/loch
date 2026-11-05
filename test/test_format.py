@@ -29,10 +29,6 @@ def test_canonical_is_compact_and_keeps_non_ascii() -> None:
     assert canonical({"a": "é", "b": [1, 2]}) == '{"a":"é","b":[1,2]}'.encode()
 
 
-def test_canonical_hashes_a_lone_surrogate_rather_than_failing() -> None:
-    assert digest({"text": "\ud83d"}).startswith("sha256:")
-
-
 def test_canonical_refuses_nan() -> None:
     with pytest.raises(ValueError):
         canonical({"x": float("nan")})
@@ -128,3 +124,42 @@ def test_rejects_a_turn_before_its_parent() -> None:
 def test_rejects_an_unknown_format_version() -> None:
     with pytest.raises(FormatError, match="unsupported loch format 2"):
         read_derived(['{"type":"header","loch":2}'])
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1e21, "1e+21"),
+        (1e20, "100000000000000000000"),
+        (1e16, "10000000000000000"),
+        (0.00001, "0.00001"),
+        (1e-7, "1e-7"),
+        (1.5e-7, "1.5e-7"),
+        (100.0, "100"),
+        (-0.0, "0"),
+        (5e-324, "5e-324"),
+        (1.7976931348623157e308, "1.7976931348623157e+308"),
+        (333333333.3333333, "333333333.3333333"),
+        (-1.5, "-1.5"),
+    ],
+)
+def test_numbers_print_as_ecmascript_does(value: float, expected: str) -> None:
+    assert canonical(value) == expected.encode()
+
+
+def test_integers_stay_exact_beyond_double_precision() -> None:
+    assert canonical(2**70) == b"1180591620717411303424"
+
+
+def test_keys_sort_by_utf16_code_units() -> None:
+    assert canonical({"￿": 1, "\U0001f600": 2, "a": 3}) == (
+        '{"a":3,"\U0001f600":2,"￿":1}'.encode()
+    )
+
+
+def test_a_lone_surrogate_is_escaped() -> None:
+    assert canonical("x\ud83d") == b'"x\\ud83d"'
+
+
+def test_control_characters_escape_as_json_stringify_does() -> None:
+    assert canonical('a\x01"\\\n') == b'"a\\u0001\\"\\\\\\n"'

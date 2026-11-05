@@ -1,9 +1,24 @@
+import base64
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from loch.format import pack_derived, read_derived
-from loch.ingest import ESCAPE, HOME, ROOT, ROOT_SLUG, SESSION, Origin, convert, ingest
+from loch.ingest import (
+    ESCAPE,
+    HOME,
+    ROOT,
+    ROOT_SLUG,
+    SESSION,
+    AuthorKeyError,
+    Origin,
+    convert,
+    ingest,
+    ssh_author_id,
+)
 from loch.rewrite import RewriteSpec, rewrite_transcript
 
 HOME_DIR = "/Users/origin"
@@ -326,3 +341,63 @@ def test_appending_to_a_session_keeps_every_earlier_turn_id(tmp_path: Path) -> N
     after = convert(grown, ORIGIN, HUMAN)[0]
 
     assert [t.id for t in after[: len(before)]] == [t.id for t in before]
+
+
+def test_events_fold_into_the_turn_they_follow() -> None:
+    raw = jsonl(
+        user("u-01", None, "start"),
+        record("s-02", "u-01", "system", subtype="stop_hook_summary", hookCount=1),
+        assistant("a-03", "s-02", [{"type": "text", "text": "reply"}]),
+        {"type": "last-prompt", "leafUuid": "s-02", "sessionId": SESSION_ID},
+    )
+    turns, heads, _ = convert(raw, ORIGIN, HUMAN)
+
+    assert [t.core["kind"] for t in turns] == ["message", "message"]
+    assert turns[1].core["parents"] == [turns[0].id]
+    [event] = turns[0].facts["events"]
+    assert event["type"] == "x-claude-code:system"
+    assert event["system"] == {"subtype": "stop_hook_summary", "hookCount": 1}
+    assert heads["current"] == turns[0].id
+
+
+def test_events_do_not_change_the_ids_around_them() -> None:
+    plain = jsonl(
+        user("u-01", None, "start"),
+        assistant("a-03", "u-01", [{"type": "text", "text": "reply"}]),
+    )
+    with_event = jsonl(
+        user("u-01", None, "start"),
+        record("s-02", "u-01", "system", subtype="turn_duration", durationMs=5),
+        assistant("a-03", "s-02", [{"type": "text", "text": "reply"}]),
+    )
+
+    assert [t.id for t in convert(with_event, ORIGIN, HUMAN)[0]] == [
+        t.id for t in convert(plain, ORIGIN, HUMAN)[0]
+    ]
+
+
+def test_an_event_with_no_turn_before_it_is_kept_at_session_level() -> None:
+    raw = jsonl(
+        record("s-01", None, "system", subtype="informational", content="hi"),
+        user("u-02", "s-01", "start"),
+    )
+    turns, _, session = convert(raw, ORIGIN, HUMAN)
+
+    assert len(turns) == 1
+    assert session["events"][0]["system"]["subtype"] == "informational"
+
+
+def test_ssh_author_id_is_the_ssh_keygen_fingerprint_of_the_key_blob() -> None:
+    """ssh-keygen -l hashes the decoded key blob with SHA-256 and prints it as
+    unpadded base64; checked against ssh-keygen by hand on a real key."""
+    blob = b"\x00\x00\x00\x0bssh-ed25519" + bytes(range(32))
+    line = "ssh-ed25519 " + base64.b64encode(blob).decode() + " me@host"
+    expected = base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+    assert ssh_author_id(line) == f"ssh:SHA256:{expected}"
+    assert ssh_author_id(line.rsplit(" ", 1)[0]) == ssh_author_id(line)
+
+
+def test_ssh_author_id_rejects_something_that_is_not_a_key() -> None:
+    with pytest.raises(AuthorKeyError):
+        ssh_author_id("not-a-key")

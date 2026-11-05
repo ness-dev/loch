@@ -152,6 +152,10 @@ itself for `list`/`reindex` and `s3:DeleteObject` for `delete`.
 | `LOCH_S3_ENDPOINT` | custom endpoint for R2, MinIO, Backblaze, ... |
 | `LOCH_S3_REGION` | region override |
 
+`loch ingest` converts sessions into the loch conversation format (see
+[SPEC.md](SPEC.md)) and writes one derived file per session to
+`~/.loch/derived`, or `--out <dir>`.
+
 Credentials come from the standard AWS chain, so `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`, a shared profile, or an instance role all work.
 

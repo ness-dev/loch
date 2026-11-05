@@ -12,6 +12,13 @@ it elsewhere with paths rewritten so the session actually resumes.
 Currently supports Claude Code. Codex and Cursor are the intended next
 adapters.
 
+It is also becoming the **conversation format**: `loch ingest` turns a
+session into a content-addressed graph of turns that can be forked, shared
+and eventually merged between people. loch is the `git` of that world and an
+editor (Ness first) is the `vim`. The format is specified in `SPEC.md`, which
+is the one design document here on purpose: it is meant to be implementable
+by someone who never reads this file.
+
 ## Why it exists
 
 The driving use case is **PR review**: a reviewer should be able to pull
@@ -27,12 +34,16 @@ travel with the code they produced.
 
 - **Not a Harness feature.** Harness is one consumer among many. Anything
   that only makes sense inside Harness belongs in Harness.
-- **Not a normalized cross-agent schema.** Resume is same-agent only —
-  a Claude transcript can't be resumed by Codex, the tool-call schemas
-  differ. Native blobs round-trip; normalization would be lossy for the
-  one thing that matters. A normalized projection may come later for
-  review rendering, but it is not the source of truth.
-- **Not git-backed storage.** See below.
+- **Not a normalized source of truth.** Resume is same-agent only — a
+  Claude transcript can't be resumed by Codex, the tool-call schemas differ.
+  Native blobs round-trip; normalization would be lossy for the one thing
+  that matters. The loch format *is* a normalized projection, and that is
+  exactly its status: derived, stamped with the converter that made it,
+  regenerated from the raw source whenever the converter improves. The raw
+  transcript stays the thing that has to survive.
+- **Not git-backed storage for content.** See below. Turn envelopes (which
+  hold hashes and structure, never transcript text) are a different
+  question — SPEC.md §9 and §13.14.
 
 ## Design decisions and their reasoning
 
@@ -54,10 +65,14 @@ change the identity of a bundle.
 a reviewer wants one ref to pull. `save` filters by cwd/branch/session
 and packs everything matching.
 
-**Link at branch level, not per commit.** A reviewer asks "what produced
-this PR," not "what produced commit abc123." Commit-level pointers would
-drag in squash-merge, rebase, and `post-rewrite` handling for no benefit.
-(Nothing writes git pointers yet — this is the intended shape.)
+**Link at branch level, not per commit — for bundles.** A reviewer asks
+"what produced this PR," not "what produced commit abc123." Commit-level
+pointers would drag in squash-merge, rebase, and `post-rewrite` handling for
+no benefit. (Nothing writes git pointers yet — this is the intended shape.)
+The conversation graph is the exception: forking at a turn needs the disk
+state *at that turn*, so turns get per-commit pins kept alive by refs, which
+is precisely the squash/rebase problem this avoided, taken on deliberately
+(SPEC.md §10).
 
 **No single index object.** A shared `index.json` would need
 read-modify-write on every save, so two machines saving concurrently would
@@ -130,9 +145,11 @@ Python 3.10 through 3.13, Poetry, boto3 behind an extra.
 
 ```
 loch/
-├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex
+├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex/ingest
 ├── claude.py    # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.py    # bundle format, gzip, content-addressed ref
+├── format.py    # loch format: canonical JSON, turn and content ids, derived files
+├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
 ├── index.py     # store key layout, derived index entries, delete and reindex
 ├── git.py       # current branch of a checkout, for the list default
 ├── output.py    # result envelope, the two renderers, structured failures
@@ -140,8 +157,24 @@ loch/
 ├── rewrite.py   # path rewriting (the load-bearing logic)
 └── store.py     # Store interface + local-fs and S3-compatible backends
 test/
-└── test_*.py    # one module per source module
+├── test_corpus.py  # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
+└── test_*.py       # one module per source module
 ```
+
+`ingest.py` normalizes with `rewrite.py`'s machinery rather than its own:
+`compile_replacements` is the same single pass with the same guards, fed
+placeholder targets (`{{loch:root}}`, `{{loch:home}}`, …) instead of another
+machine's paths. That sharing is what makes a turn id survive `restore` — a
+copy rewritten by one set of pairs normalizes back through the same set — so
+a change to the guards changes both behaviours at once, which is the point.
+`test_corpus.py` is the check that it still holds on real data: 3809 of 3810
+sessions keep every turn id across a simulated move, and the one that doesn't
+is a transcript that already contains the destination paths (SPEC.md §13.8).
+
+The turn core holds the content's *hash*, not the content, so deleting
+content never invalidates an id. Anything that makes a turn's id depend on
+content directly breaks tombstones; anything that makes it depend on facts
+(timestamps, record uuids, model, cwd) breaks stability across copies.
 
 The store layout is:
 
@@ -655,6 +688,16 @@ integration (no notes, no PR-level pointers), and no adapters beyond
 Claude Code.
 `restore` still needs a full 64-character ref — the index makes refs
 discoverable, but nothing resolves a prefix.
+
+**The loch format (SPEC.md) is v1 draft.** `loch ingest` converts every
+session in the local corpus (3810 sessions, 266k turns, ~18ms each) and the
+derived files read back verified and byte-identical; re-ingest is
+idempotent. What it doesn't do yet: write anything to a store (derived files
+go to `~/.loch/derived`, raw sources aren't snapshotted), convert subagent
+sidecars, capture git pins, or emit back to Claude Code JSONL. Nothing is
+shared in this format yet, so SPEC.md §13.1 — what a converter fix that
+changes ids should do — is still free to answer. The bundle format and
+everything `save`/`restore` do are unchanged.
 
 ## Conventions
 

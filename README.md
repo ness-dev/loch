@@ -78,6 +78,28 @@ loch reindex
 `save` bundles every session matching the filter, so a branch with several
 sessions produces a single ref.
 
+## Blame a line back to its conversation
+
+```sh
+loch install          # once per repo: Claude Code hooks, committed in .claude/
+loch backfill         # link commits made before the hooks, where it can be exact
+
+loch blame loch/format.py
+#   102-112  6eb7b0d  Canonicalize per RFC 8785, fold agent events into facts
+#                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
+
+loch ask loch/format.py:105 "why not just json.dumps?"
+# forks that conversation right after the commit and resumes it in Claude Code
+```
+
+With the hooks installed, every commit an agent makes gets a git note on
+`refs/notes/loch` naming the session and tool call that made it, and every
+session's transcript is copied into the store when it stops — Claude Code
+deletes its own after 30 days. Notes hold no transcript text; share them with
+`git push origin refs/notes/loch`. `ask` never touches the original session:
+it writes a new one holding the conversation up to that commit, filed under
+the current checkout, so the follow-up sees today's code, not the commit's.
+
 ## Scripting it
 
 Every command takes `--json`, before or after the subcommand, and prints one
@@ -123,6 +145,8 @@ An empty result is `{"sessions": []}` with `ok: true`, not a failure, and
 ```
 bundles/<ref>.loch                 the bundle, named by the hash of its bytes
 index/branch/<branch>/<ref>        a small entry per branch the bundle touches
+transcripts/claude-code/<project>/<session>.jsonl
+                                   latest snapshot of a session, from the stop hook
 ```
 
 `loch list --remote` reads only the index, so listing a branch never

@@ -1,8 +1,10 @@
 import argparse
 import importlib.metadata
+import json
 import os
 import platform
 import re
+import shutil
 import socket
 import sys
 import time
@@ -63,6 +65,22 @@ from .rewrite import (
     rewrite_transcript,
 )
 from .store import MissingDependency, MissingObject, create_store, resolve_store_uri
+from .trace import (
+    NOTES_REF,
+    UNCOMMITTED,
+    Link,
+    Resolver,
+    TraceError,
+    backfill,
+    blame_hunks,
+    fork_at_call,
+    git,
+    hook_post_tool,
+    hook_pre_tool,
+    install_hooks,
+    repo_root,
+    snapshot_transcript,
+)
 
 DEFAULT_DERIVED = os.path.join(str(Path.home()), ".loch", "derived")
 
@@ -78,6 +96,11 @@ Usage:
   loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
+  loch install  [--local] [--command <loch>]
+  loch blame   <file> [--store <uri>]
+  loch ask     <commit | file:line> [<question>] [--no-launch] [--store <uri>]
+  loch backfill [--revision <rev>]   (default: every branch)
+  loch hook    pre-tool | post-tool | stop      (run by Claude Code)
   loch --version
 
 Every command takes --json, which replaces the text below with one machine-
@@ -93,6 +116,12 @@ Environment:
   LOCH_S3_REGION    region override
 
 Derived conversation files go to ~/.loch/derived unless --out says otherwise.
+
+`install` adds Claude Code hooks to a repository that note, on every commit an
+agent makes, the conversation and tool call that made it (git notes on
+refs/notes/loch), and snapshot each session's transcript into the store.
+`blame` shows which conversation wrote each line; `ask` forks that
+conversation at the commit and resumes it in Claude Code.
 """
 
 
@@ -666,6 +695,237 @@ def command_ingest(argv: list[str]) -> Result:
     )
 
 
+@contextmanager
+def trace_errors() -> Iterator[None]:
+    try:
+        yield
+    except TraceError as error:
+        fail(error.code, str(error))
+
+
+def command_hook(argv: list[str]) -> Result:
+    """Run by Claude Code with the event as JSON on stdin. It must never fail
+    the tool call it wraps, so every error is swallowed and nothing is
+    written: a hook that breaks commits gets uninstalled."""
+    name = argv[0] if argv else ""
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(event, dict):
+            event = {}
+        if name == "pre-tool":
+            hook_pre_tool(event)
+        elif name == "post-tool":
+            hook_post_tool(event)
+        elif name == "stop":
+            snapshot_transcript(event, create_store(resolve_store_uri()))
+    except Exception:
+        pass
+    return Result(command="hook")
+
+
+def command_install(argv: list[str]) -> Result:
+    parser = _parser("install")
+    parser.add_argument("--cwd")
+    parser.add_argument("--local", action="store_true")
+    parser.add_argument("--command")
+    args = parser.parse_args(argv)
+
+    with trace_errors():
+        root = repo_root(args.cwd or os.getcwd())
+    if args.command is not None:
+        command = args.command
+    elif args.local:
+        # A machine-specific path, which is why it only goes in the
+        # uncommitted settings file.
+        command = shutil.which("loch") or os.path.abspath(sys.argv[0])
+    else:
+        command = "loch"
+    name = "settings.local.json" if args.local else "settings.json"
+    settings = os.path.join(root, ".claude", name)
+    added = install_hooks(settings, command)
+    # Amend and rebase copy a commit's note to its replacement only when told
+    # to, and an amended commit is still the one the conversation made.
+    git(root, "config", "notes.rewriteRef", NOTES_REF)
+
+    text = (
+        f"installed loch hooks ({', '.join(added)}) in {settings}\n"
+        if added
+        else f"loch hooks already installed in {settings}\n"
+    )
+    text += (
+        "restart Claude Code sessions in this repository to pick them up\n"
+        f"share links with: git push <remote> {NOTES_REF}\n"
+    )
+    return Result(
+        command="install",
+        payload={"settings": settings, "command": command, "added": added},
+        text=text,
+    )
+
+
+def _store_or_none(uri: str | None) -> Any:
+    try:
+        return create_store(resolve_store_uri(uri))
+    except Exception:
+        return None
+
+
+def _link_text(link: Link | None) -> str:
+    if link is None:
+        return "no conversation recorded"
+    if link.transcript is None:
+        return f"session {link.session_id[:8]} (transcript not available)"
+    title = f' "{link.title}"' if link.title else ""
+    prompt = ""
+    if link.prompt:
+        flat = " ".join(link.prompt.split())
+        flat = flat if len(flat) <= 72 else flat[:71] + "…"
+        prompt = f' — asked: "{flat}"'
+
+    return f"session {link.session_id[:8]}{title}{prompt}"
+
+
+def command_blame(argv: list[str]) -> Result:
+    parser = _parser("blame")
+    parser.add_argument("file")
+    parser.add_argument("--store")
+    args = parser.parse_args(argv)
+
+    cwd = os.path.dirname(os.path.abspath(args.file)) or os.getcwd()
+    with trace_errors():
+        root = repo_root(cwd)
+        hunks = blame_hunks(root, os.path.relpath(os.path.abspath(args.file), root))
+    resolver = Resolver(root, _store_or_none(args.store))
+    links: dict[str, Link | None] = {}
+    for hunk in hunks:
+        if hunk.commit not in links and hunk.commit != UNCOMMITTED:
+            links[hunk.commit] = resolver.resolve(hunk.commit)
+
+    rows: list[dict[str, Any]] = []
+    lines = [f"{args.file}\n"]
+    for hunk in hunks:
+        link = links.get(hunk.commit)
+        rows.append(
+            {
+                "start": hunk.start,
+                "end": hunk.end,
+                "commit": None if hunk.commit == UNCOMMITTED else hunk.commit,
+                "summary": hunk.summary,
+                "conversation": link.payload() if link is not None else None,
+            }
+        )
+        span = f"{hunk.start}-{hunk.end}" if hunk.end > hunk.start else str(hunk.start)
+        if hunk.commit == UNCOMMITTED:
+            lines.append(f"  {span:>9}  uncommitted\n")
+            continue
+        lines.append(f"  {span:>9}  {hunk.commit[:7]}  {hunk.summary[:60]}\n")
+        lines.append(f"  {'':>9}  {'':7}  {_link_text(link)}\n")
+
+    linked = sum(1 for link in links.values() if link is not None)
+    lines.append(
+        f"\n{linked} of {len(links)} commit(s) linked to a conversation; "
+        f"follow one up with: loch ask {args.file}:<line>\n"
+    )
+    return Result(
+        command="blame",
+        payload={"file": args.file, "hunks": rows},
+        text="".join(lines),
+    )
+
+
+def _resolve_commit(root: str, target: str) -> str:
+    file, _, line = target.rpartition(":")
+    if file and line.isdigit() and os.path.exists(file):
+        relative = os.path.relpath(os.path.abspath(file), root)
+        for hunk in blame_hunks(root, relative):
+            if hunk.start <= int(line) <= hunk.end:
+                if hunk.commit == UNCOMMITTED:
+                    fail("not-linked", f"{target} is not committed yet")
+                return hunk.commit
+        fail("usage", f"{file} has no line {line}")
+    output = git(
+        root, "rev-parse", "--verify", "-q", f"{target}^{{commit}}", check=False
+    )
+    if not output.strip():
+        fail("usage", f"{target} is neither a commit nor <file>:<line>")
+    return output.strip()
+
+
+def command_ask(argv: list[str]) -> Result:
+    parser = _parser("ask")
+    parser.add_argument("target")
+    parser.add_argument("question", nargs="?")
+    parser.add_argument("--no-launch", action="store_true")
+    parser.add_argument("--store")
+    args = parser.parse_args(argv)
+    as_json = JSON_FLAG in sys.argv
+
+    with trace_errors():
+        root = repo_root(os.getcwd())
+        commit = _resolve_commit(root, args.target)
+        link = Resolver(root, _store_or_none(args.store)).resolve(commit)
+        if link is None:
+            fail("not-linked", f"no conversation is recorded for {commit[:7]}")
+        if link.transcript is None:
+            fail(
+                "transcript-missing",
+                f"session {link.session_id} is linked but its transcript is "
+                "neither in ~/.claude/projects nor in the store",
+            )
+        fork = fork_at_call(
+            link.transcript, link.call, root, title=f"loch ask {commit[:7]}"
+        )
+
+    command = ["claude", "--resume", fork.session_id]
+    if args.question:
+        command.append(args.question)
+    payload = {
+        "commit": commit,
+        "conversation": link.payload(),
+        "fork": {
+            "sessionId": fork.session_id,
+            "path": fork.path,
+            "cwd": fork.cwd,
+            "records": fork.records,
+        },
+        "launch": command,
+    }
+    text = (
+        f"forked session {fork.origin_session[:8]} at {commit[:7]} "
+        f"({fork.records} records) as {fork.session_id}\n"
+    )
+    if args.no_launch or as_json:
+        return Result(
+            command="ask",
+            payload=payload,
+            text=text + f"resume with: cd {root} && {' '.join(command)}\n",
+        )
+    sys.stderr.write(text)
+    os.chdir(root)
+    os.execvp("claude", command)
+
+
+def command_backfill(argv: list[str]) -> Result:
+    parser = _parser("backfill")
+    parser.add_argument("--cwd")
+    # Branches rather than --all, which would walk refs/notes/loch too.
+    parser.add_argument("--revision", default="--branches")
+    args = parser.parse_args(argv)
+
+    with trace_errors():
+        root = repo_root(args.cwd or os.getcwd())
+        linked = backfill(root, args.revision)
+    rows = [
+        {"commit": sha, "session": call.session_id, "call": call.call}
+        for sha, call in linked
+    ]
+    text = "".join(
+        f"  {sha[:7]}  session {call.session_id[:8]}\n" for sha, call in linked
+    )
+    text += f"linked {len(linked)} commit(s)\n"
+    return Result(command="backfill", payload={"linked": rows}, text=text)
+
+
 def command_help(argv: list[str]) -> Result:
     return Result(command="help", payload={"usage": USAGE}, text=USAGE)
 
@@ -702,6 +962,11 @@ COMMANDS: dict[str, Callable[[list[str]], Result]] = {
     "delete": command_delete,
     "reindex": command_reindex,
     "ingest": command_ingest,
+    "install": command_install,
+    "blame": command_blame,
+    "ask": command_ask,
+    "backfill": command_backfill,
+    "hook": command_hook,
     "help": command_help,
     "version": command_version,
 }

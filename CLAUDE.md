@@ -151,6 +151,7 @@ loch/
 ├── format.py    # loch format: canonical JSON, turn and content ids, derived files
 ├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
 ├── index.py     # store key layout, derived index entries, delete and reindex
+├── trace.py     # commit -> conversation notes, hooks, blame, backfill, ask's fork
 ├── git.py       # current branch of a checkout, for the list default
 ├── output.py    # result envelope, the two renderers, structured failures
 ├── redact.py    # secret scrubbing, applied on save before packing
@@ -485,6 +486,11 @@ never a code. The set today:
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
 | `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
+| `not-a-repository` | `install`/`blame`/`ask`/`backfill` outside a git repository |
+| `not-linked` | `ask` on a commit with no conversation note, or an uncommitted line |
+| `transcript-missing` | the note exists but the transcript is in neither Claude's directory nor the store |
+| `call-not-found` | the transcript has no result for the noted tool call |
+| `git-failed` | a git command failed |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -681,6 +687,22 @@ workflow has ever run**, though — they were written against a repo with no
 CI and no release, so the first tag push is also the first execution of the
 release path. No release exists yet, so the wheel URL in the README points at
 a `v0.1.0` that has to be cut before it resolves.
+
+**Blame and ask (`trace.py`) are a working demo on this repository.** All 12
+commits whose sessions still existed were backfilled exactly; the 50 from
+August have no conversation left, because Claude Code had already deleted
+their transcripts (`cleanupPeriodDays`, default 30) — the reason the stop
+hook snapshots every session into the store. Backfill could not have used
+commit hashes from tool output: `git commit -q` prints none, which is why
+hooks capture links live. A fork made by `ask` was resumed with
+`claude --resume -p` and answered from the original conversation. Known gaps:
+the fork resumes in the current checkout rather than a worktree at the commit
+(a pin, §10); the transcript snapshot is one mutable key per session rather
+than content-addressed `raw/<hex>`; subagent sidecars aren't snapshotted;
+backfill reads every transcript on the machine (~25s on 750MB). The hook
+input's `tool_use_id` is used when present and otherwise recovered from the
+transcript by command; which one current Claude Code sends hasn't been
+observed, since hooks only load at session start.
 
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the

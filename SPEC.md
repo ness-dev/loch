@@ -277,7 +277,26 @@ content/<hex>    content object
 turns/<hex>      turn core
 ```
 
-## 10. Git pins (not yet implemented)
+## 10. Git pins (partly implemented)
+
+**Implemented: commit to turn.** A git note on `refs/notes/loch` links a
+commit to the tool call that made it:
+
+```json
+{"loch": 1, "agent": "claude-code", "session": "<session id>", "call": "<tool call id>", "captured": "hook"}
+```
+
+`captured` is `hook` when Claude Code hooks recorded it as the commit was made
+(HEAD before and after each Bash call, bounded by commit time so a checkout
+isn't mistaken for authorship), or `backfill` when it was matched afterwards:
+exactly one Bash call whose command holds the commit's subject and whose run
+brackets the commit's author or committer time. The note names the agent's own
+ids, not a turn id, because it is written before any ingest; a reader resolves
+it to the turn holding that `tool-call`. Notes carry no transcript text, so they
+are envelopes in the §9 sense. `notes.rewriteRef` makes amend and rebase carry
+them over.
+
+The rest is the original design, not yet built.
 
 A pin links a turn to the commit the working tree was at:
 

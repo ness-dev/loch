@@ -251,7 +251,7 @@ the environment, because it is part of every id.
 - Every derived file reads back verified and byte-identical.
 - Turn ids and heads are unchanged after a `restore`-style rewrite to another
   home, cwd and session id. The one exception is a transcript whose content
-  already names the destination paths (§14.2).
+  already names the destination paths (§14.1).
 
 ## 9. Storage: envelope and content (not yet implemented)
 
@@ -266,7 +266,8 @@ The bundle store chose S3 over git because a leaked secret in git can't be delet
 reasoning still holds for content and doesn't apply to envelopes. Deleting
 content leaves a tombstone; the graph above it still verifies. Sharing a
 conversation without some of its content is the same operation as deleting
-it locally.
+it locally. Withheld content is absent, not secret: a short message can be
+confirmed by guessing it (§13, salting).
 
 Intended layout, extending the existing store:
 
@@ -341,22 +342,11 @@ These were open in the first draft. Each is settled, with the reason.
 | Pin capture | Live, from the driving tool. Old transcripts get none and are not guessed. | A pin inferred from tool output that turns out wrong is worse than no pin. |
 | Envelopes in git | Yes | They carry structure and hashes, never text. Deletability applies to content (§9). |
 | Resume from a derived-only share | The emitter synthesizes context | Thinking signatures and `toolUseResult` exist only in the raw source. With it at hand, the emitter resumes natively. |
+| Salting content hashes | No salt. Content ids are the plain hash of the content object. | Keeping content private is not a goal. Deleting content exists to remove things like a leaked secret, which is too high-entropy to recover by guessing. A short deleted message ("yes", "lgtm") can be confirmed by hashing guesses against its envelope; that is accepted. Chaining wouldn't prevent it, since the guesser holds the parents too. |
 
-## 14. Open
+## 14. Known limits
 
-1. **Salting content hashes.** A deleted low-entropy content object ("yes",
-   "lgtm", "run the tests") can be confirmed by anyone holding its envelope:
-   hash the guess and compare. Chaining doesn't help, because content is
-   hashed on its own so it can be deleted on its own, and the guesser can
-   see the parents anyway. A salt stored inside the content object goes when
-   the content goes, which closes the hole. To keep re-ingest idempotent the
-   salt must be deterministic, so it would be
-   `HMAC(owner secret, source id + record position)`.
-
-   The cost: re-deriving the same ids then needs the owner's secret, so
-   losing it means the next converter upgrade changes ids. Awaiting a
-   decision.
-2. **Content that names the destination.** A known limit rather than a
+1. **Content that names the destination.** A known limit rather than a
    question. A transcript that already contains the path it is later
    restored to can't be told apart from a rewritten one. It happened once in
    3,810 sessions, in the session that built this test.

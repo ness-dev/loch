@@ -169,7 +169,7 @@ copy rewritten by one set of pairs normalizes back through the same set — so
 a change to the guards changes both behaviours at once, which is the point.
 `test_corpus.py` is the check that it still holds on real data: 3809 of 3810
 sessions keep every turn id across a simulated move, and the one that doesn't
-is a transcript that already contains the destination paths (SPEC.md §14.2).
+is a transcript that already contains the destination paths (SPEC.md §14.1).
 
 The turn core holds the content's *hash*, not the content, so deleting
 content never invalidates an id. Anything that makes a turn's id depend on
@@ -693,8 +693,8 @@ discoverable, but nothing resolves a prefix.
 **The loch format (SPEC.md) is v1 draft.** `loch ingest` converts every
 session in the local corpus (3810 sessions, 266k turns) and the derived files
 read back verified and byte-identical; re-ingest is idempotent. The draft
-questions are settled in SPEC.md §13; the one still open is §14.1, salting
-content hashes. What it doesn't do yet: write anything to a store (derived
+questions are all settled in SPEC.md §13, including no salt on content
+hashes: privacy of withheld content is not a goal. What it doesn't do yet: write anything to a store (derived
 files go to `~/.loch/derived`, raw sources aren't snapshotted), convert
 subagent sidecars, give each of a moved session's cwds its own root, capture
 git pins, or emit back to Claude Code JSONL. Until the first conversation is

@@ -89,7 +89,8 @@ loch blame loch/format.py
 #                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
 
 loch ask loch/format.py:105 "why not just json.dumps?"
-# forks that conversation right after the commit and resumes it in Claude Code
+# forks the conversation that wrote line 105 and resumes it in Claude Code,
+# from where it ended; --at-commit stops it just after the commit instead
 ```
 
 With the hooks installed, every commit an agent makes gets a git note on
@@ -97,7 +98,7 @@ With the hooks installed, every commit an agent makes gets a git note on
 session's transcript is copied into the store when it stops — Claude Code
 deletes its own after 30 days. Notes hold no transcript text; share them with
 `git push origin refs/notes/loch`. `ask` never touches the original session:
-it writes a new one holding the conversation up to that commit, filed under
+it writes a new one holding the conversation, filed under
 the current checkout, so the follow-up sees today's code, not the commit's.
 
 ## Scripting it

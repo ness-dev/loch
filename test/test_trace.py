@@ -12,7 +12,7 @@ from loch.store import FileStore
 from loch.trace import (
     Resolver,
     backfill,
-    fork_at_call,
+    fork_session,
     hook_post_tool,
     hook_pre_tool,
     install_hooks,
@@ -272,7 +272,7 @@ def test_fork_cuts_after_the_whole_round_and_leaves_the_original(
 
     target = env["tmp"] / "elsewhere"
     target.mkdir()
-    fork = fork_at_call(path, CALL, str(target))
+    fork = fork_session(path, str(target), call=CALL)
 
     assert Path(path).read_text() == original
     forked = [json.loads(line) for line in Path(fork.path).read_text().splitlines()]
@@ -281,3 +281,19 @@ def test_fork_cuts_after_the_whole_round_and_leaves_the_original(
     assert {r["cwd"] for r in forked if "cwd" in r} == {str(target)}
     assert forked[-1]["type"] == "custom-title"
     assert fork.path == transcript_path_for(str(target), fork.session_id)
+
+
+def test_fork_without_a_call_runs_to_the_end_of_the_conversation(
+    env: dict[str, Path],
+) -> None:
+    repo = env["repo"]
+    path = transcript(repo, "git commit")
+    records = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    later = dict(records[0], uuid="u2", parentUuid="r1", message={"content": "more"})
+    Path(path).write_text(
+        "".join(json.dumps(record) + "\n" for record in [*records, later])
+    )
+
+    fork = fork_session(path, str(repo))
+    forked = [json.loads(line) for line in Path(fork.path).read_text().splitlines()]
+    assert [r.get("uuid") for r in forked] == ["u1", "a1", "r1", "u2", None]

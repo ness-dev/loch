@@ -594,26 +594,36 @@ def _parent(record: dict[str, Any]) -> str | None:
     return parent if isinstance(parent, str) else None
 
 
-def fork_at_call(
-    transcript: str, call: str, target_cwd: str, title: str | None = None
+def fork_session(
+    transcript: str,
+    target_cwd: str,
+    call: str | None = None,
+    title: str | None = None,
 ) -> Fork:
-    """A new Claude session holding the conversation up to and including the
-    result of `call`, filed under `target_cwd` so `claude --resume` finds it.
+    """A new Claude session holding the conversation, filed under
+    `target_cwd` so `claude --resume` finds it. The original session is never
+    modified: a follow-up is a branch of the conversation, not more of it.
 
-    The cut is after the whole round of tool results the call belongs to, not
-    after the call alone: an assistant message that issued parallel calls is
-    one API message, and resuming with any of its results missing is a
-    malformed conversation. The original session is never modified."""
+    With no `call` it holds the conversation to its end — the last record
+    written, which after a rewind is the branch the session was left on.
+    With one, it is cut after the whole round of tool results that call
+    belongs to, not after the call alone: an assistant message that issued
+    parallel calls is one API message, and resuming with any of its results
+    missing is a malformed conversation."""
     raw = Path(transcript).read_text(encoding="utf-8", errors="surrogateescape")
     records = [
         record for record in _records_of(raw) if isinstance(record.get("uuid"), str)
     ]
-    by_uuid = {record["uuid"]: record for record in records}
     children: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         parent = _parent(record)
         if parent is not None:
             children.setdefault(parent, []).append(record)
+
+    if call is None:
+        if not records:
+            raise TraceError("call-not-found", "the transcript holds no records")
+        return _write_fork(transcript, raw, records, records[-1], target_cwd, title)
 
     result = next(
         (
@@ -640,7 +650,18 @@ def fork_at_call(
         if not following:
             break
         leaf = following[0]
+    return _write_fork(transcript, raw, records, leaf, target_cwd, title)
 
+
+def _write_fork(
+    transcript: str,
+    raw: str,
+    records: list[dict[str, Any]],
+    leaf: dict[str, Any],
+    target_cwd: str,
+    title: str | None,
+) -> Fork:
+    by_uuid = {record["uuid"]: record for record in records}
     keep: set[str] = set()
     walker: dict[str, Any] | None = leaf
     while walker is not None and walker["uuid"] not in keep:

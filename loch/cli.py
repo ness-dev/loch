@@ -73,7 +73,7 @@ from .trace import (
     TraceError,
     backfill,
     blame_hunks,
-    fork_at_call,
+    fork_session,
     git,
     hook_post_tool,
     hook_pre_tool,
@@ -98,7 +98,8 @@ Usage:
                [--out <dir>]
   loch install  [--local] [--command <loch>]
   loch blame   <file> [--store <uri>]
-  loch ask     <commit | file:line> [<question>] [--no-launch] [--store <uri>]
+  loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
+               [--store <uri>]
   loch backfill [--revision <rev>]   (default: every branch)
   loch hook    pre-tool | post-tool | stop      (run by Claude Code)
   loch --version
@@ -121,7 +122,8 @@ Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 agent makes, the conversation and tool call that made it (git notes on
 refs/notes/loch), and snapshot each session's transcript into the store.
 `blame` shows which conversation wrote each line; `ask` forks that
-conversation at the commit and resumes it in Claude Code.
+conversation and resumes it in Claude Code — from its end, or with
+--at-commit from just after the commit.
 """
 
 
@@ -855,6 +857,7 @@ def command_ask(argv: list[str]) -> Result:
     parser = _parser("ask")
     parser.add_argument("target")
     parser.add_argument("question", nargs="?")
+    parser.add_argument("--at-commit", action="store_true")
     parser.add_argument("--no-launch", action="store_true")
     parser.add_argument("--store")
     args = parser.parse_args(argv)
@@ -872,8 +875,11 @@ def command_ask(argv: list[str]) -> Result:
                 f"session {link.session_id} is linked but its transcript is "
                 "neither in ~/.claude/projects nor in the store",
             )
-        fork = fork_at_call(
-            link.transcript, link.call, root, title=f"loch ask {commit[:7]}"
+        fork = fork_session(
+            link.transcript,
+            root,
+            call=link.call if args.at_commit else None,
+            title=f"loch ask {commit[:7]}",
         )
 
     command = ["claude", "--resume", fork.session_id]
@@ -888,11 +894,13 @@ def command_ask(argv: list[str]) -> Result:
             "cwd": fork.cwd,
             "records": fork.records,
         },
+        "at": "commit" if args.at_commit else "end",
         "launch": command,
     }
+    where = "just after it" if args.at_commit else "to its end"
     text = (
-        f"forked session {fork.origin_session[:8]} at {commit[:7]} "
-        f"({fork.records} records) as {fork.session_id}\n"
+        f"forked session {fork.origin_session[:8]}, which made {commit[:7]}, "
+        f"{where}: {fork.records} records, as {fork.session_id}\n"
     )
     if args.no_launch or as_json:
         return Result(

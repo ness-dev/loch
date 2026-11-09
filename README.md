@@ -84,14 +84,38 @@ sessions produces a single ref.
 loch install          # once per repo: Claude Code hooks, committed in .claude/
 loch backfill         # link commits made before the hooks, where it can be exact
 
-loch blame loch/format.py
-#   102-112  6eb7b0d  Canonicalize per RFC 8785, fold agent events into facts
-#                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
+loch blame loch/format.py      # every line, marked by the conversation that wrote it
+loch blame --hunks loch/format.py   # or one row per block of lines
 
 loch ask loch/format.py:105 "why not just json.dumps?"
 # forks the conversation that wrote line 105 and resumes it in Claude Code,
 # from where it ended; --at-commit stops it just after the commit instead
 ```
+
+`blame` prints the file with a mark in the margin for each conversation, and a
+key at the top saying what each mark asked for:
+
+```
+loch/format.py — 2 conversations
+
+  A  "I would prefer this tool to be agnostic of the editor that …"  37d467e5 · 45b565e
+  B  "honeslty none of those seem like open questions they all se…"  37d467e5 · 6eb7b0d
+
+A   1 │ import hashlib
+A   2 │ import json
+B   3 │ import re
+A   4 │ from collections.abc import Iterable, Iterator
+  ...
+A 101 │ def canonical(value: Any) -> bytes:
+B 102 │     """RFC 8785 (JSON Canonicalization Scheme): the one encoding every id is
+B 103 │     computed over, so a second implementation in any language can reproduce
+B 104 │     an id byte for byte. Keys sort by UTF-16 code units, numbers print as
+B 105 │     ECMAScript does, and strings escape as JSON.stringify does.
+```
+
+Marks are per request rather than per session, so one long session that made
+many commits for many asks doesn't paint the whole file one letter; `·` is a
+commit with no conversation recorded and `+` a line not committed yet.
 
 With the hooks installed, every commit an agent makes gets a git note on
 `refs/notes/loch` naming the session and tool call that made it, and every

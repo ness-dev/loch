@@ -97,7 +97,7 @@ Usage:
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
   loch install  [--local] [--command <loch>]
-  loch blame   <file> [--store <uri>]
+  loch blame   <file> [--hunks] [--store <uri>]
   loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
                [--store <uri>]
   loch backfill [--revision <rev>]   (default: every branch)
@@ -772,24 +772,46 @@ def _store_or_none(uri: str | None) -> Any:
         return None
 
 
+def _flat(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 def _link_text(link: Link | None) -> str:
     if link is None:
         return "no conversation recorded"
     if link.transcript is None:
         return f"session {link.session_id[:8]} (transcript not available)"
     title = f' "{link.title}"' if link.title else ""
-    prompt = ""
-    if link.prompt:
-        flat = " ".join(link.prompt.split())
-        flat = flat if len(flat) <= 72 else flat[:71] + "…"
-        prompt = f' — asked: "{flat}"'
-
+    prompt = f' — asked: "{_flat(link.prompt, 72)}"' if link.prompt else ""
     return f"session {link.session_id[:8]}{title}{prompt}"
+
+
+UNLINKED_MARK = "·"
+UNCOMMITTED_MARK = "+"
+
+# Foreground colours for the margin marks, cycled. Only the mark is coloured:
+# the code keeps the terminal's own colours, so it reads as code.
+MARK_COLOURS = ("36", "33", "35", "32", "34", "31", "96", "93", "95", "92")
+
+
+def _mark(index: int) -> str:
+    letters = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def _use_colour() -> bool:
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
 
 
 def command_blame(argv: list[str]) -> Result:
     parser = _parser("blame")
     parser.add_argument("file")
+    parser.add_argument("--hunks", action="store_true")
     parser.add_argument("--store")
     args = parser.parse_args(argv)
 
@@ -803,8 +825,31 @@ def command_blame(argv: list[str]) -> Result:
         if hunk.commit not in links and hunk.commit != UNCOMMITTED:
             links[hunk.commit] = resolver.resolve(hunk.commit)
 
+    # One mark per request rather than per session: a long session makes many
+    # commits for many asks, and marking by session would paint the whole file
+    # one letter. Marks are handed out in order of first appearance in the
+    # file, so A is always the first conversation you read.
+    marks: dict[tuple[str, str], str] = {}
+    legend: list[dict[str, Any]] = []
+    mark_of: dict[str, str] = {}
+    for hunk in hunks:
+        link = links.get(hunk.commit)
+        if hunk.commit == UNCOMMITTED:
+            mark_of[hunk.commit] = UNCOMMITTED_MARK
+            continue
+        if link is None:
+            mark_of[hunk.commit] = UNLINKED_MARK
+            continue
+        key = (link.session_id, link.prompt or link.call)
+        if key not in marks:
+            marks[key] = _mark(len(marks))
+            legend.append({"mark": marks[key], **link.payload(), "commits": []})
+        entry = next(item for item in legend if item["mark"] == marks[key])
+        if hunk.commit not in entry["commits"]:
+            entry["commits"].append(hunk.commit)
+        mark_of[hunk.commit] = marks[key]
+
     rows: list[dict[str, Any]] = []
-    lines = [f"{args.file}\n"]
     for hunk in hunks:
         link = links.get(hunk.commit)
         rows.append(
@@ -813,26 +858,94 @@ def command_blame(argv: list[str]) -> Result:
                 "end": hunk.end,
                 "commit": None if hunk.commit == UNCOMMITTED else hunk.commit,
                 "summary": hunk.summary,
+                "mark": mark_of[hunk.commit],
                 "conversation": link.payload() if link is not None else None,
             }
         )
+    text = (
+        _hunks_text(args.file, hunks, links)
+        if args.hunks
+        else _annotated_text(args.file, hunks, legend, mark_of, links)
+    )
+    return Result(
+        command="blame",
+        payload={"file": args.file, "conversations": legend, "hunks": rows},
+        text=text,
+    )
+
+
+def _annotated_text(
+    file: str,
+    hunks: list[Any],
+    legend: list[dict[str, Any]],
+    mark_of: dict[str, str],
+    links: dict[str, Link | None],
+) -> str:
+    colour = _use_colour()
+    colours = {
+        entry["mark"]: MARK_COLOURS[index % len(MARK_COLOURS)]
+        for index, entry in enumerate(legend)
+    }
+
+    def paint(mark: str, text: str) -> str:
+        code = colours.get(mark, "2")
+        return f"\033[{code}m{text}\033[0m" if colour else text
+
+    width = max((len(entry["mark"]) for entry in legend), default=1)
+    count = len(legend)
+    out = [f"{file} — {count} conversation{'s' if count != 1 else ''}\n\n"]
+    for entry in legend:
+        if entry["available"]:
+            prompt = f'"{_flat(entry["prompt"], 60)}"' if entry["prompt"] else ""
+        else:
+            prompt = "(transcript not available)"
+        commits = ", ".join(commit[:7] for commit in entry["commits"])
+        out.append(
+            f"  {paint(entry['mark'], entry['mark'].ljust(width))}  "
+            f"{prompt}  {entry['session'][:8]} · {commits}\n"
+        )
+    unlinked = sorted({c[:7] for c, m in mark_of.items() if m == UNLINKED_MARK})
+    if unlinked:
+        out.append(
+            f"  {paint(UNLINKED_MARK, UNLINKED_MARK.ljust(width))}  "
+            f"no conversation recorded  {', '.join(unlinked)}\n"
+        )
+    if UNCOMMITTED_MARK in mark_of.values():
+        out.append(
+            f"  {paint(UNCOMMITTED_MARK, UNCOMMITTED_MARK.ljust(width))}  "
+            "not committed yet\n"
+        )
+    out.append("\n")
+
+    digits = len(str(hunks[-1].end)) if hunks else 1
+    for hunk in hunks:
+        mark = mark_of[hunk.commit]
+        for offset, line in enumerate(hunk.lines):
+            out.append(
+                f"{paint(mark, mark.ljust(width))} "
+                f"{hunk.start + offset:>{digits}} │ {line}\n"
+            )
+    if legend:
+        out.append(f"\nfollow one up with: loch ask {file}:<line>\n")
+    return "".join(out)
+
+
+def _hunks_text(file: str, hunks: list[Any], links: dict[str, Link | None]) -> str:
+    lines = [f"{file}\n"]
+    for hunk in hunks:
+        link = links.get(hunk.commit)
         span = f"{hunk.start}-{hunk.end}" if hunk.end > hunk.start else str(hunk.start)
         if hunk.commit == UNCOMMITTED:
             lines.append(f"  {span:>9}  uncommitted\n")
             continue
         lines.append(f"  {span:>9}  {hunk.commit[:7]}  {hunk.summary[:60]}\n")
         lines.append(f"  {'':>9}  {'':7}  {_link_text(link)}\n")
-
     linked = sum(1 for link in links.values() if link is not None)
     lines.append(
         f"\n{linked} of {len(links)} commit(s) linked to a conversation; "
-        f"follow one up with: loch ask {args.file}:<line>\n"
+        f"follow one up with: loch ask {file}:<line>\n"
     )
-    return Result(
-        command="blame",
-        payload={"file": args.file, "hunks": rows},
-        text="".join(lines),
-    )
+    return "".join(lines)
 
 
 def _resolve_commit(root: str, target: str) -> str:

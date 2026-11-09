@@ -342,30 +342,37 @@ class Hunk:
     end: int
     commit: str
     summary: str
+    lines: tuple[str, ...] = ()
 
 
 def blame_hunks(cwd: str, path: str) -> list[Hunk]:
     porcelain = git(cwd, "blame", "--porcelain", "--", path)
     summaries: dict[str, str] = {}
-    lines: list[tuple[int, str]] = []
+    lines: list[tuple[int, str, str]] = []
     current = ""
-    for line in porcelain.splitlines():
+    number = 0
+    for line in porcelain.split("\n"):
         if line.startswith("\t"):
+            # Each header is followed by the line's text, tab-prefixed.
+            lines.append((number, current, line[1:]))
             continue
         parts = line.split(" ")
         if len(parts) >= 3 and len(parts[0]) == 40 and parts[1].isdigit():
-            current = parts[0]
-            lines.append((int(parts[2]), current))
+            current, number = parts[0], int(parts[2])
         elif line.startswith("summary "):
             summaries[current] = line[len("summary ") :]
 
     hunks: list[Hunk] = []
-    for number, commit in sorted(lines):
+    for number, commit, text in sorted(lines):
         last = hunks[-1] if hunks else None
         if last is not None and last.commit == commit and last.end == number - 1:
-            hunks[-1] = Hunk(last.start, number, commit, last.summary)
+            hunks[-1] = Hunk(
+                last.start, number, commit, last.summary, (*last.lines, text)
+            )
         else:
-            hunks.append(Hunk(number, number, commit, summaries.get(commit, "")))
+            hunks.append(
+                Hunk(number, number, commit, summaries.get(commit, ""), (text,))
+            )
     return hunks
 
 

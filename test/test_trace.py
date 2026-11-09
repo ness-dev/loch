@@ -297,3 +297,27 @@ def test_fork_without_a_call_runs_to_the_end_of_the_conversation(
     fork = fork_session(path, str(repo))
     forked = [json.loads(line) for line in Path(fork.path).read_text().splitlines()]
     assert [r.get("uuid") for r in forked] == ["u1", "a1", "r1", "u2", None]
+
+
+def test_blame_marks_every_line_with_its_conversation(
+    env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = env["repo"]
+    commit(repo, "f.txt", "human line\n", "by hand")
+    transcript(repo, "git commit -am 'agent'", prompt="make it two lines")
+    hook_pre_tool(event(repo))
+    commit(repo, "f.txt", "human line\nagent line\n", "agent")
+    hook_post_tool(event(repo))
+    (repo / "f.txt").write_text("human line\nagent line\nwork in progress\n")
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("sys.argv", ["loch", "blame", "f.txt"])
+    main()
+    out = capsys.readouterr().out
+    assert '  A  "make it two lines"' in out
+    assert "· 1 │ human line\n" in out
+    assert "A 2 │ agent line\n" in out
+    assert "+ 3 │ work in progress\n" in out
+    assert "\033[" not in out

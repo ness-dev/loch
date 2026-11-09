@@ -152,6 +152,7 @@ loch/
 ├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
 ├── index.py     # store key layout, derived index entries, delete and reindex
 ├── trace.py     # commit -> conversation notes, hooks, blame, backfill, ask's fork
+├── blame_html.py # `blame --html`: self-contained page, no external assets
 ├── git.py       # current branch of a checkout, for the list default
 ├── output.py    # result envelope, the two renderers, structured failures
 ├── redact.py    # secret scrubbing, applied on save before packing

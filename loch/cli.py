@@ -7,14 +7,17 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import time
 import uuid
+import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
+from .blame_html import parse_ranges, render
 from .bundle import (
     BUNDLE_VERSION,
     Bundle,
@@ -97,7 +100,8 @@ Usage:
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
   loch install  [--local] [--command <loch>]
-  loch blame   <file> [--hunks] [--store <uri>]
+  loch blame   <file> [--html [<path>] [--lines <ranges>] [--no-open]]
+               [--store <uri>]
   loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
                [--store <uri>]
   loch backfill [--revision <rev>]   (default: every branch)
@@ -790,10 +794,6 @@ def _link_text(link: Link | None) -> str:
 UNLINKED_MARK = "·"
 UNCOMMITTED_MARK = "+"
 
-# Foreground colours for the margin marks, cycled. Only the mark is coloured:
-# the code keeps the terminal's own colours, so it reads as code.
-MARK_COLOURS = ("36", "33", "35", "32", "34", "31", "96", "93", "95", "92")
-
 
 def _mark(index: int) -> str:
     letters = ""
@@ -804,14 +804,12 @@ def _mark(index: int) -> str:
     return letters
 
 
-def _use_colour() -> bool:
-    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
-
-
 def command_blame(argv: list[str]) -> Result:
     parser = _parser("blame")
     parser.add_argument("file")
-    parser.add_argument("--hunks", action="store_true")
+    parser.add_argument("--html", nargs="?", const="", metavar="PATH")
+    parser.add_argument("--lines", metavar="RANGES")
+    parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--store")
     args = parser.parse_args(argv)
 
@@ -862,72 +860,37 @@ def command_blame(argv: list[str]) -> Result:
                 "conversation": link.payload() if link is not None else None,
             }
         )
-    text = (
-        _hunks_text(args.file, hunks, links)
-        if args.hunks
-        else _annotated_text(args.file, hunks, legend, mark_of, links)
-    )
-    return Result(
-        command="blame",
-        payload={"file": args.file, "conversations": legend, "hunks": rows},
-        text=text,
-    )
-
-
-def _annotated_text(
-    file: str,
-    hunks: list[Any],
-    legend: list[dict[str, Any]],
-    mark_of: dict[str, str],
-    links: dict[str, Link | None],
-) -> str:
-    colour = _use_colour()
-    colours = {
-        entry["mark"]: MARK_COLOURS[index % len(MARK_COLOURS)]
-        for index, entry in enumerate(legend)
+    text = _hunks_text(args.file, hunks, links)
+    payload: dict[str, Any] = {
+        "file": args.file,
+        "conversations": legend,
+        "hunks": rows,
     }
-
-    def paint(mark: str, text: str) -> str:
-        code = colours.get(mark, "2")
-        return f"\033[{code}m{text}\033[0m" if colour else text
-
-    width = max((len(entry["mark"]) for entry in legend), default=1)
-    count = len(legend)
-    out = [f"{file} — {count} conversation{'s' if count != 1 else ''}\n\n"]
-    for entry in legend:
-        if entry["available"]:
-            prompt = f'"{_flat(entry["prompt"], 60)}"' if entry["prompt"] else ""
-        else:
-            prompt = "(transcript not available)"
-        commits = ", ".join(commit[:7] for commit in entry["commits"])
-        out.append(
-            f"  {paint(entry['mark'], entry['mark'].ljust(width))}  "
-            f"{prompt}  {entry['session'][:8]} · {commits}\n"
+    if args.html is not None:
+        try:
+            visible = parse_ranges(args.lines) if args.lines else None
+        except ValueError:
+            fail("usage", f"--lines takes ranges like 1-12,99-110, not {args.lines}")
+        page = render(
+            args.file,
+            legend,
+            rows,
+            {
+                hunk.start + offset: line
+                for hunk in hunks
+                for offset, line in enumerate(hunk.lines)
+            },
+            visible,
         )
-    unlinked = sorted({c[:7] for c, m in mark_of.items() if m == UNLINKED_MARK})
-    if unlinked:
-        out.append(
-            f"  {paint(UNLINKED_MARK, UNLINKED_MARK.ljust(width))}  "
-            f"no conversation recorded  {', '.join(unlinked)}\n"
+        target = args.html or os.path.join(
+            tempfile.gettempdir(), f"loch-blame-{os.path.basename(args.file)}.html"
         )
-    if UNCOMMITTED_MARK in mark_of.values():
-        out.append(
-            f"  {paint(UNCOMMITTED_MARK, UNCOMMITTED_MARK.ljust(width))}  "
-            "not committed yet\n"
-        )
-    out.append("\n")
-
-    digits = len(str(hunks[-1].end)) if hunks else 1
-    for hunk in hunks:
-        mark = mark_of[hunk.commit]
-        for offset, line in enumerate(hunk.lines):
-            out.append(
-                f"{paint(mark, mark.ljust(width))} "
-                f"{hunk.start + offset:>{digits}} │ {line}\n"
-            )
-    if legend:
-        out.append(f"\nfollow one up with: loch ask {file}:<line>\n")
-    return "".join(out)
+        Path(target).write_text(page, encoding="utf-8")
+        payload["html"] = os.path.abspath(target)
+        text = f"wrote {payload['html']}\n"
+        if not args.no_open and JSON_FLAG not in sys.argv:
+            webbrowser.open(Path(target).resolve().as_uri())
+    return Result(command="blame", payload=payload, text=text)
 
 
 def _hunks_text(file: str, hunks: list[Any], links: dict[str, Link | None]) -> str:

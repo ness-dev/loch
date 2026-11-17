@@ -1,0 +1,29 @@
+[package]
+name = "loch"
+# Kept equal to pyproject's version by release.sh: both implementations answer
+# `loch --version`, and they must not disagree while both ship.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT"
+description = "Save and restore agent coding sessions across machines"
+publish = false
+
+[[bin]]
+name = "loch"
+path = "src/main.rs"
+
+[dependencies]
+# preserve_order: payload keys come out in insertion order, as Python's dicts do.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

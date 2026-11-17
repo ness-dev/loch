@@ -41,6 +41,17 @@ if count != 1:
 path.write_text(new)
 PY
 grep -q "^version = \"$version\"$" pyproject.toml || die "version bump did not apply"
+# The Rust build answers `loch --version` too, and the two must agree.
+python3 - "$version" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path("rust/Cargo.toml")
+text = path.read_text()
+new, count = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{sys.argv[1]}"', text, count=1)
+if count != 1:
+    raise SystemExit("release: could not find a single version line in rust/Cargo.toml")
+path.write_text(new)
+PY
+(cd rust && cargo update -q -w --offline 2>/dev/null || cargo update -q -w)
 
 # Not asserting `loch --version` here: it reads installed package metadata,
 # which still holds the old number until the bumped project is reinstalled.
@@ -50,12 +61,15 @@ poetry run ruff check
 poetry run ruff format --check
 poetry run mypy .
 poetry run pytest -q
+(cd rust && cargo fmt --check && cargo clippy -q --release --all-targets -- -D warnings \
+  && cargo test -q --release && cargo build -q --release)
+LOCH_RUST=rust/target/release/loch poetry run pytest -q test/test_equivalence.py
 
 echo "==> tagging $tag"
 # pyproject may already hold this version — the first release, or a re-cut after
 # a deleted tag. An empty commit fails under `set -e`, so tag what's there.
 if [ -n "$(git status --porcelain)" ]; then
-  run git add pyproject.toml
+  run git add pyproject.toml rust/Cargo.toml rust/Cargo.lock
   run git commit -m "release: $tag"
 else
   echo "  pyproject is already at $version; tagging the current commit"
@@ -65,8 +79,8 @@ run git push origin "$BRANCH"
 run git push origin "$tag"
 
 if [ -n "$DRY_RUN" ]; then
-  git checkout -- pyproject.toml
-  echo "==> dry run: pyproject.toml restored, nothing pushed"
+  git checkout -- pyproject.toml rust/Cargo.toml rust/Cargo.lock
+  echo "==> dry run: versions restored, nothing pushed"
   exit 0
 fi
 

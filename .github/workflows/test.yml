@@ -40,3 +40,41 @@ jobs:
       - run: poetry run ruff format --check
       - run: poetry run mypy .
       - run: poetry run pytest
+
+  # The Rust build, held to the Python reference by test/test_equivalence.py.
+  # Linux and macOS because the hooks' native git fast path is Unix-only and
+  # its filesystem details (realpath, ownership) differ between the two.
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustup ships on both runner images; pinned to the crate's
+      # rust-version so a newer toolchain can't hide an MSRV break.
+      - run: |
+          rustup toolchain install 1.83.0 --profile minimal -c clippy,rustfmt
+          rustup default 1.83.0
+
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pipx install poetry
+      - run: poetry env use python && poetry install
+        working-directory: .
+      - run: poetry run pytest -q test/test_equivalence.py
+        working-directory: .
+        env:
+          LOCH_RUST: rust/target/release/loch

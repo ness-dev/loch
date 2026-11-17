@@ -187,6 +187,15 @@ pub fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// `cli._creation_time`: `SOURCE_DATE_EPOCH` when it holds an integer.
+pub fn creation_time() -> f64 {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| crate::blame_html::py_int(&v))
+        .map(|v| v as f64)
+        .unwrap_or_else(now)
+}
+
 /// `os.stat(path).st_mtime`, computed as CPython computes it: the seconds
 /// plus `nsec * 1e-9`, in double arithmetic.
 pub fn mtime(meta: &fs::Metadata) -> f64 {

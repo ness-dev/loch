@@ -1,208 +1,24 @@
-"""The Rust build against the Python reference, on the same inputs.
+"""`loch hook` in the Rust build against the Python reference.
 
 Opt-in: set LOCH_RUST to a built binary (`cargo build --release` in rust/, then
-LOCH_RUST=rust/target/release/loch). Every scenario is built twice at the same
-path with pinned git dates, so commit hashes, note objects and the notes ref
-come out byte-identical; one copy is driven by `python -m loch.cli`, the other
-by the binary, and everything observable is compared: stdout, stderr, exit
-status, the notes ref, the pending-state directory and the store.
-
-With LOCH_CORPUS=1 as well, the transcript-reading path is run against this
-machine's real transcripts. Their content only ever exists in a temporary
-directory and in memory; failures report session ids and counts, never text.
+LOCH_RUST=rust/target/release/loch). See equivalence.py for how a scenario is
+run twice and compared. With LOCH_CORPUS=1 as well, the one hook path that
+reads a transcript runs against this machine's real ones.
 """
 
-import hashlib
 import json
 import os
 import random
 import shutil
-import subprocess
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-RUST = os.environ.get("LOCH_RUST")
+from equivalence import PAST, RUST, SESSION, Run, Scenario, World, twin
 
 pytestmark = pytest.mark.skipif(not RUST, reason="set LOCH_RUST to a Rust build")
-
-SESSION = "11111111-2222-3333-4444-555555555555"
-# In the future, so the hook's "committed after the call began" bound admits
-# commits made during a call; fixed, so their hashes are too.
-NOW = "2031-01-01T00:00:00Z"
-PAST = "2020-01-01T00:00:00Z"
-
-
-def implementation(name: str) -> list[str]:
-    if name == "py":
-        return [sys.executable, "-m", "loch.cli"]
-    assert RUST is not None
-    return [os.path.abspath(RUST)]
-
-
-@dataclass
-class Run:
-    stdout: bytes
-    stderr: bytes
-    status: int
-
-
-class World:
-    """One scratch machine: a HOME, a repository, a store, an environment."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.home = root / "home"
-        self.repo = root / "repo"
-        self.store = root / "store"
-        self.home.mkdir(parents=True)
-        self.env = {
-            "PATH": os.environ["PATH"],
-            "HOME": str(self.home),
-            "LOCH_STORE": str(self.store),
-            "GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-            "GIT_AUTHOR_DATE": NOW,
-            "GIT_COMMITTER_DATE": NOW,
-            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
-        }
-
-    def git(self, *args: str, cwd: Path | None = None, date: str = NOW) -> str:
-        env = {**self.env, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
-        return subprocess.run(
-            ["git", "-C", str(cwd or self.repo), *args],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=env,
-        ).stdout.strip()
-
-    def init(self, *extra: str) -> None:
-        self.repo.mkdir(exist_ok=True)
-        self.git("init", "-q", "-b", "main", *extra)
-
-    def commit(self, message: str, cwd: Path | None = None, date: str = NOW) -> str:
-        self.git("commit", "-q", "--allow-empty", "-m", message, cwd=cwd, date=date)
-        return self.git("rev-parse", "HEAD", cwd=cwd)
-
-    def loch(
-        self,
-        impl: str,
-        *args: str,
-        stdin: Any = None,
-        env: dict[str, str] | None = None,
-        cwd: Path | None = None,
-    ) -> Run:
-        data = (
-            stdin
-            if isinstance(stdin, bytes)
-            else b""
-            if stdin is None
-            else json.dumps(stdin).encode()
-        )
-        result = subprocess.run(
-            [*implementation(impl), *args],
-            input=data,
-            capture_output=True,
-            env={**self.env, **(env or {})},
-            cwd=str(cwd or self.root),
-        )
-        return Run(result.stdout, result.stderr, result.returncode)
-
-    def event(self, call: str | None = "toolu_1", **fields: Any) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "session_id": SESSION,
-            "cwd": str(self.repo),
-            "tool_name": "Bash",
-            "tool_input": {"command": "git commit -m work"},
-        }
-        if call is not None:
-            body["tool_use_id"] = call
-        body.update(fields)
-        return body
-
-    def observe(self) -> dict[str, Any]:
-        """Everything a hook can leave behind, in a form two runs can be
-        compared on. The one nondeterministic value — the pending state's
-        timestamp — is reduced to its type."""
-        seen: dict[str, Any] = {}
-        for path in sorted(self.root.rglob("*")):
-            relative = path.relative_to(self.root).as_posix()
-            if "/.git/objects/" in f"/{relative}" or relative.startswith("home/.loch/"):
-                continue
-            if "/loch/pending/" in relative and path.is_file():
-                try:
-                    state = json.loads(path.read_text())
-                except ValueError:
-                    state = path.read_text()
-                seen[relative] = (
-                    {"head": state.get("head"), "at": type(state.get("at")).__name__}
-                    if isinstance(state, dict)
-                    else state
-                )
-            elif path.is_file() and (
-                relative.startswith("store/") or relative.endswith("/NOTES_EDITMSG")
-            ):
-                seen[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-            elif path.is_dir() and "/loch" in relative:
-                seen[relative] = "dir"
-        for repo in {self.repo, *self.root.glob("wt*")}:
-            if (repo / ".git").exists():
-                seen[f"notes:{repo.name}"] = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(repo),
-                        "rev-parse",
-                        "-q",
-                        "--verify",
-                        "refs/notes/loch",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    env=self.env,
-                ).stdout.strip()
-        return seen
-
-
-Scenario = Callable[[World, Callable[..., Run]], list[Run]]
-
-
-def twin(
-    tmp_path: Path, scenario: Scenario, mix: tuple[str, str] | None = None
-) -> dict[str, Any]:
-    """Runs `scenario` once per implementation in identical worlds at the same
-    path, and asserts nothing observable differs. With `mix`, the second run
-    alternates implementations call by call — pre under one, post under the
-    other — which is what a machine switching over mid-session does."""
-    root = tmp_path / "world"
-    outcomes = []
-    plans: list[tuple[str, ...]] = [("py",), ("rs",)] if mix is None else [("py",), mix]
-    for plan in plans:
-        if root.exists():
-            shutil.rmtree(root)
-        world = World(root)
-        calls = iter(range(10_000))
-
-        def loch(
-            *args: str, _w: World = world, _p: tuple[str, ...] = plan, **kw: Any
-        ) -> Run:
-            return _w.loch(_p[next(calls) % len(_p)], *args, **kw)
-
-        runs = scenario(world, loch)
-        outcomes.append(([vars(run) for run in runs], world.observe()))
-    (py_runs, py_seen), (rs_runs, rs_seen) = outcomes
-    assert rs_runs == py_runs
-    assert rs_seen == py_seen
-    return py_seen
 
 
 # -- scenarios ----------------------------------------------------------------
@@ -717,7 +533,7 @@ def test_call_recovery_matches_on_real_transcripts(tmp_path: Path) -> None:
             mismatched.append(session)
             continue
         # Agreeing that nothing happened would pass vacuously.
-        unnoted += not seen["notes:repo"]
+        unnoted += not seen["repo:refs/notes/loch"]
     assert not unnoted, f"{unnoted}/{len(cases)} cases wrote no note"
     assert not mismatched, (
         f"{len(mismatched)}/{len(cases)} sessions differ: {mismatched}"

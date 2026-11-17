@@ -584,39 +584,72 @@ fn b64encode(data: &[u8]) -> String {
     out
 }
 
-/// `base64.b64decode(text, validate=True)`, with binascii's messages.
+/// `base64.b64decode(text, validate=True)`: binascii's `a2b_base64` in
+/// strict mode, which checks in this order and words each failure its way.
 fn b64decode_strict(text: &str) -> Result<Vec<u8>, String> {
     if !text.is_ascii() {
         return Err("string argument should contain only ASCII characters".into());
     }
-    let body = text.trim_end_matches('=');
-    let pad = text.len() - body.len();
-    if pad > 2 || !body.bytes().all(|b| B64.contains(&b)) {
-        return Err("Non-base64 digit found".into());
-    }
-    let data_chars = body.len();
-    if data_chars % 4 == 1 {
-        return Err(format!(
-            "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
-            data_chars
-        ));
-    }
-    if !(data_chars + pad).is_multiple_of(4) {
-        return Err("Incorrect padding".into());
+    let bytes = text.as_bytes();
+    if bytes.first() == Some(&b'=') {
+        return Err("Leading padding not allowed".into());
     }
     let mut out = Vec::new();
-    let mut buffer = 0u32;
-    let mut bits = 0;
-    for b in body.bytes() {
-        let value = B64.iter().position(|&c| c == b).expect("checked alphabet") as u32;
-        buffer = buffer << 6 | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits & 0xff) as u8);
+    let (mut quad, mut pads, mut left, mut padding) = (0usize, 0usize, 0u32, false);
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'=' {
+            padding = true;
+            if quad == 0 {
+                return Err("Excess padding not allowed".into());
+            }
+            if quad >= 2 {
+                pads += 1;
+                if quad + pads >= 4 {
+                    if i + 1 < bytes.len() {
+                        return Err("Excess data after padding".into());
+                    }
+                    return Ok(out);
+                }
+            }
+            continue;
+        }
+        let Some(value) = B64.iter().position(|&c| c == b) else {
+            return Err("Only base64 data is allowed".into());
+        };
+        if padding {
+            return Err("Discontinuous padding not allowed".into());
+        }
+        pads = 0;
+        let value = value as u32;
+        match quad {
+            0 => {
+                left = value;
+                quad = 1;
+            }
+            1 => {
+                out.push((left << 2 | value >> 4) as u8);
+                left = value & 0x0f;
+                quad = 2;
+            }
+            2 => {
+                out.push((left << 4 | value >> 2) as u8);
+                left = value & 0x03;
+                quad = 3;
+            }
+            _ => {
+                out.push((left << 6 | value) as u8);
+                quad = 0;
+            }
         }
     }
-    Ok(out)
+    match quad {
+        0 => Ok(out),
+        1 => Err(format!(
+            "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
+            out.len() / 3 * 4 + 1
+        )),
+        _ => Err("Incorrect padding".into()),
+    }
 }
 
 /// `ssh:SHA256:<base64>`, the fingerprint `ssh-keygen -l` prints.
@@ -644,9 +677,18 @@ mod tests {
             b64decode_strict("aGVsbG8").unwrap_err(),
             "Incorrect padding"
         );
-        assert_eq!(
-            b64decode_strict("a!").unwrap_err(),
-            "Non-base64 digit found"
-        );
+        for (input, error) in [
+            ("not*base64", "Only base64 data is allowed"),
+            ("ab=c", "Discontinuous padding not allowed"),
+            ("aGVs====", "Excess padding not allowed"),
+            ("=aGVs", "Leading padding not allowed"),
+            ("aGVsbA==x", "Excess data after padding"),
+            ("aGVsbA===", "Excess data after padding"),
+            ("a===", "Invalid base64-encoded string: number of data characters (1) cannot be 1 more than a multiple of 4"),
+            ("aGVsb", "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4"),
+        ] {
+            assert_eq!(b64decode_strict(input).unwrap_err(), error, "{input}");
+        }
+        assert_eq!(b64decode_strict("abc=").unwrap(), b"i\xb7");
     }
 }

@@ -403,7 +403,7 @@ pub fn command_save(argv: &[String]) -> Run {
     let bundle = Bundle {
         version: BUNDLE_VERSION,
         agent: AGENT.into(),
-        created_at: sys::iso_timestamp(sys::now()),
+        created_at: sys::iso_timestamp(sys::creation_time()),
         origin: BundleOrigin {
             home: home_dir(),
             platform: sys::platform_name().into(),

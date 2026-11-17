@@ -121,6 +121,7 @@ Stores:
 
 Environment:
   LOCH_STORE        default store URI
+  SOURCE_DATE_EPOCH fixed createdAt for save, so a bundle is reproducible
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override
   CLAUDE_CONFIG_DIR Claude Code's state directory (default ~/.claude)
@@ -330,6 +331,16 @@ def _list_remote_text(
     return "".join(lines)
 
 
+def _creation_time() -> float:
+    """`SOURCE_DATE_EPOCH` when it holds an integer, the reproducible-builds
+    convention: a bundle's ref hashes its createdAt, so fixing the clock is
+    what makes the same sessions pack to the same ref twice."""
+    try:
+        return float(int(os.environ["SOURCE_DATE_EPOCH"]))
+    except (KeyError, ValueError):
+        return time.time()
+
+
 def command_save(argv: list[str]) -> Result:
     parser = _parser("save")
     parser.add_argument("--cwd")
@@ -372,7 +383,7 @@ def command_save(argv: list[str]) -> Result:
     bundle = Bundle(
         version=BUNDLE_VERSION,
         agent=AGENT,
-        created_at=iso_timestamp(time.time()),
+        created_at=iso_timestamp(_creation_time()),
         origin=BundleOrigin(
             home=home_dir(), platform=_platform_name(), hostname=socket.gethostname()
         ),

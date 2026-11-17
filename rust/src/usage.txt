@@ -29,6 +29,7 @@ Stores:
 
 Environment:
   LOCH_STORE        default store URI
+  SOURCE_DATE_EPOCH fixed createdAt for save, so a bundle is reproducible
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override
   CLAUDE_CONFIG_DIR Claude Code's state directory (default ~/.claude)

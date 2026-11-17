@@ -1159,3 +1159,29 @@ def test_an_undecodable_transcript_is_listed_but_not_packed(
     assert code == 1
     assert saved["code"] == "transcript-unreadable"
     assert not (tmp_path / "store").exists()
+
+
+def test_source_date_epoch_makes_save_reproducible(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_session(home, str(project), "abc")
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
+    refs = []
+    for store in ("a", "b"):
+        document, _, _ = invoke_json(
+            monkeypatch,
+            capsys,
+            home,
+            "save",
+            "--json",
+            "--cwd",
+            str(project),
+            "--store",
+            str(tmp_path / store),
+        )
+        assert document["createdAt"] == "2023-11-14T22:13:20.000Z"
+        refs.append(document["ref"])
+    assert refs[0] == refs[1]

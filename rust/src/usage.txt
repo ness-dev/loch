@@ -1,0 +1,44 @@
+loch — save and restore agent coding sessions across machines
+
+Usage:
+  loch list    [--cwd <path>] [--branch <name>]
+  loch list    --remote [--branch <name>] [--all] [--store <uri>]
+  loch save    [--cwd <path>] [--branch <name>] [--session <id>] [--store <uri>]
+  loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
+  loch delete  <ref> [--store <uri>]
+  loch reindex [--store <uri>]
+  loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
+               [--author <id> | --author-key <key.pub>]
+               [--out <dir>]
+  loch install  [--local] [--command <loch>]
+  loch blame   <file> [--html [<path>] [--lines <ranges>] [--no-open]]
+               [--store <uri>]
+  loch log     <file>[:<line>[-<end>]] [--store <uri>]
+  loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
+               [--store <uri>]
+  loch backfill [--revision <rev>]   (default: every branch)
+  loch hook    pre-tool | post-tool | stop      (run by Claude Code)
+  loch --version
+
+Every command takes --json, which replaces the text below with one machine-
+readable document on stdout.
+
+Stores:
+  <path>              local directory
+  s3://bucket/prefix  any S3-compatible endpoint
+
+Environment:
+  LOCH_STORE        default store URI
+  LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
+  LOCH_S3_REGION    region override
+  CLAUDE_CONFIG_DIR Claude Code's state directory (default ~/.claude)
+
+Derived conversation files go to ~/.loch/derived unless --out says otherwise.
+
+`install` adds Claude Code hooks to a repository that note, on every commit an
+agent makes, the conversation and tool call that made it (git notes on
+refs/notes/loch), and snapshot each session's transcript into the store.
+`blame` shows which conversation wrote each line, `log` every conversation
+that changed a file or line range over its history; `ask` forks that
+conversation and resumes it in Claude Code — from its end, or with
+--at-commit from just after the commit.

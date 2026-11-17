@@ -206,7 +206,9 @@ impl Parser {
     pub fn flag(&mut self, option: &'static str, dest: Option<&str>) -> &mut Self {
         self.actions.push(Action {
             options: vec![option],
-            dest: dest.map(str::to_string).unwrap_or_else(|| Self::dest_of(option)),
+            dest: dest
+                .map(str::to_string)
+                .unwrap_or_else(|| Self::dest_of(option)),
             nargs: Nargs::Zero,
             kind: Kind::StoreTrue,
             metavar: None,
@@ -323,7 +325,11 @@ impl Parser {
                 }
             }
         } else {
-            let split = arg.char_indices().nth(2).map(|(i, _)| i).unwrap_or(arg.len());
+            let split = arg
+                .char_indices()
+                .nth(2)
+                .map(|(i, _)| i)
+                .unwrap_or(arg.len());
             let (short, short_explicit) = arg.split_at(split);
             for (option, index) in self.option_strings() {
                 if option == short {
@@ -389,9 +395,19 @@ impl Parser {
         let mut start = 0usize;
         if let Some(max_option) = max_option {
             while start <= max_option {
-                let next = *options.keys().filter(|&&i| i >= start).min().expect("an option remains");
+                let next = *options
+                    .keys()
+                    .filter(|&&i| i >= start)
+                    .min()
+                    .expect("an option remains");
                 if start != next {
-                    let end = self.consume_positionals(&mut state, &mut positionals, argv, &pattern, start);
+                    let end = self.consume_positionals(
+                        &mut state,
+                        &mut positionals,
+                        argv,
+                        &pattern,
+                        start,
+                    );
                     if end > start {
                         start = end;
                         continue;
@@ -406,7 +422,9 @@ impl Parser {
             }
         }
         let stop = self.consume_positionals(&mut state, &mut positionals, argv, &pattern, start);
-        state.extras.extend(argv[stop.min(argv.len())..].iter().cloned());
+        state
+            .extras
+            .extend(argv[stop.min(argv.len())..].iter().cloned());
 
         let missing: Vec<String> = self
             .actions
@@ -422,7 +440,10 @@ impl Parser {
             )));
         }
         if !state.extras.is_empty() {
-            return Err(self.error(format!("unrecognized arguments: {}", state.extras.join(" "))));
+            return Err(self.error(format!(
+                "unrecognized arguments: {}",
+                state.extras.join(" ")
+            )));
         }
         Ok(Args {
             values: state.values,
@@ -618,13 +639,24 @@ impl Parser {
     }
 
     pub fn format_usage(&self) -> String {
-        format!("{}\n", self.usage_block(Self::width()).trim_end_matches('\n'))
+        format!(
+            "{}\n",
+            self.usage_block(Self::width()).trim_end_matches('\n')
+        )
     }
 
     fn usage_block(&self, width: usize) -> String {
         let prefix = "usage: ";
-        let optionals: Vec<&Action> = self.actions.iter().filter(|a| !a.options.is_empty()).collect();
-        let positionals: Vec<&Action> = self.actions.iter().filter(|a| a.options.is_empty()).collect();
+        let optionals: Vec<&Action> = self
+            .actions
+            .iter()
+            .filter(|a| !a.options.is_empty())
+            .collect();
+        let positionals: Vec<&Action> = self
+            .actions
+            .iter()
+            .filter(|a| a.options.is_empty())
+            .collect();
         let opt_parts: Vec<String> = optionals.iter().map(|a| a.usage()).collect();
         let pos_parts: Vec<String> = positionals.iter().map(|a| a.usage()).collect();
         let all: Vec<String> = opt_parts.iter().chain(&pos_parts).cloned().collect();
@@ -661,7 +693,8 @@ impl Parser {
                 lines
             };
             let prog_len = self.prog.chars().count();
-            let lines: Vec<String> = if (prefix.len() + prog_len) as f64 <= 0.75 * text_width as f64 {
+            let lines: Vec<String> = if (prefix.len() + prog_len) as f64 <= 0.75 * text_width as f64
+            {
                 let indent = " ".repeat(prefix.len() + prog_len + 1);
                 let mut head = vec![self.prog.clone()];
                 if !opt_parts.is_empty() {
@@ -712,15 +745,20 @@ impl Parser {
             match action.help {
                 None => out.push_str(&format!("{}{}\n", " ".repeat(indent), header)),
                 Some(help) => {
-                    let first_indent;
-                    if header.chars().count() as isize <= action_width {
+                    let fits = header.chars().count() as isize <= action_width;
+                    let first_indent = if fits {
                         let pad = action_width as usize - header.chars().count();
-                        out.push_str(&format!("{}{}{}  ", " ".repeat(indent), header, " ".repeat(pad)));
-                        first_indent = 0;
+                        out.push_str(&format!(
+                            "{}{}{}  ",
+                            " ".repeat(indent),
+                            header,
+                            " ".repeat(pad)
+                        ));
+                        0
                     } else {
                         out.push_str(&format!("{}{}\n", " ".repeat(indent), header));
-                        first_indent = help_position;
-                    }
+                        help_position
+                    };
                     let lines = wrap(help, help_width);
                     out.push_str(&format!("{}{}\n", " ".repeat(first_indent), lines[0]));
                     for line in &lines[1..] {
@@ -740,11 +778,17 @@ impl Parser {
         let mut help = self.usage_block(width);
         help.push_str(&section(
             "positional arguments",
-            self.actions.iter().filter(|a| a.options.is_empty()).collect(),
+            self.actions
+                .iter()
+                .filter(|a| a.options.is_empty())
+                .collect(),
         ));
         help.push_str(&section(
             "options",
-            self.actions.iter().filter(|a| !a.options.is_empty()).collect(),
+            self.actions
+                .iter()
+                .filter(|a| !a.options.is_empty())
+                .collect(),
         ));
         // _long_break_matcher, then strip('\n') + '\n'.
         while help.contains("\n\n\n") {
@@ -819,7 +863,11 @@ fn is_negative_number(arg: &str) -> bool {
 
 /// Python's `repr()` of a str, as `%r` puts it in "ignored explicit argument".
 fn py_repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') { '"' } else { '\'' };
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
     let mut out = String::new();
     out.push(quote);
     for c in text.chars() {
@@ -832,7 +880,9 @@ fn py_repr(text: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -900,7 +950,10 @@ mod tests {
             .positional("target", Nargs::One)
             .positional("question", Nargs::Optional)
             .flag("--at-commit", None);
-        let args = parser.parse(&argv(&["t", "--at-commit", "q"])).ok().unwrap();
+        let args = parser
+            .parse(&argv(&["t", "--at-commit", "q"]))
+            .ok()
+            .unwrap();
         assert_eq!(args.str("target").as_deref(), Some("t"));
         assert_eq!(args.str("question").as_deref(), Some("q"));
         assert!(args.flag("at_commit"));

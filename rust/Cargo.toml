@@ -22,7 +22,7 @@ fancy-regex = "0.14"
 # the gzip bytes, and only zlib's own deflate reproduces zlib's output.
 # miniz_oxide (flate2's default) compresses differently.
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
-libz-sys = { version = "1", default-features = false, features = ["static", "libc"] }
+libz-sys = { version = "1", default-features = false, features = ["static", "libc"] } # flate2's backend, built from source and linked statically
 getrandom = "0.2"
 sha2 = "0.10"
 hmac = "0.12"

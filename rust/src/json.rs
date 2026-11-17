@@ -168,12 +168,6 @@ pub fn loads(text: &str) -> Result<Value, ParseError> {
     Ok(value)
 }
 
-/// `json.loads(line)` for a line that is UTF-8 bytes, which is how transcript
-/// lines arrive. Undecodable input fails, as `bytes.decode` would first.
-pub fn loads_bytes(bytes: &[u8]) -> Result<Value, ParseError> {
-    loads(std::str::from_utf8(bytes).map_err(|_| ParseError)?)
-}
-
 struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
@@ -570,7 +564,10 @@ fn shortest_digits(value: f64) -> (String, i32) {
     let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
     let digits = digits.trim_end_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
-    (digits.to_string(), exponent.parse().expect("integer exponent"))
+    (
+        digits.to_string(),
+        exponent.parse().expect("integer exponent"),
+    )
 }
 
 /// Python's `float.__repr__`, which `json.dumps` writes: positional when the
@@ -717,7 +714,12 @@ fn ecma_number(value: f64) -> Result<String, NotJson> {
     Ok(if k <= n && n <= 21 {
         format!("{}{}{}", sign, digits, "0".repeat((n - k) as usize))
     } else if 0 < n && n <= 21 {
-        format!("{}{}.{}", sign, &digits[..n as usize], &digits[n as usize..])
+        format!(
+            "{}{}.{}",
+            sign,
+            &digits[..n as usize],
+            &digits[n as usize..]
+        )
     } else if -6 < n && n <= 0 {
         format!("{}0.{}{}", sign, "0".repeat((-n) as usize), digits)
     } else {
@@ -787,7 +789,7 @@ mod tests {
             dumps(&map["b"], DEFAULT),
             "[1.5, 0, 123456789012345678901234567890]"
         );
-        assert_eq!(dumps(&map["s"], DEFAULT), r#""😀\ud83d x""#);
+        assert_eq!(dumps(&map["s"], DEFAULT), r#""\ud83d\ude00\ud83d x""#);
         assert!(loads("[1] x").is_err());
         assert!(loads("\"a\nb\"").is_err());
         assert!(loads("01").is_err());
@@ -795,7 +797,9 @@ mod tests {
 
     #[test]
     fn strings_escape_like_ensure_ascii() {
-        let value = Value::Object(object! {"a" => "é😀\u{7f}\u{1}\"\\\n", "b" => Value::Array(vec![Value::int(1), Value::Bool(true), Value::Null])});
+        let value = Value::Object(
+            object! {"a" => "é😀\u{7f}\u{1}\"\\\n", "b" => Value::Array(vec![Value::int(1), Value::Bool(true), Value::Null])},
+        );
         assert_eq!(
             dumps(&value, DEFAULT),
             "{\"a\": \"\\u00e9\\ud83d\\ude00\\u007f\\u0001\\\"\\\\\\n\", \"b\": [1, true, null]}"
@@ -808,7 +812,9 @@ mod tests {
 
     #[test]
     fn indent_matches_python() {
-        let value = Value::Object(object! {"a" => Value::Array(vec![]), "b" => Value::Object(object!{"c" => 1i64})});
+        let value = Value::Object(
+            object! {"a" => Value::Array(vec![]), "b" => Value::Object(object!{"c" => 1i64})},
+        );
         assert_eq!(
             dumps(&value, INDENTED),
             "{\n  \"a\": [],\n  \"b\": {\n    \"c\": 1\n  }\n}"

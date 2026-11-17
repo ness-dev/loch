@@ -35,12 +35,13 @@ pub fn is_space(c: char) -> bool {
 
 /// The same set as a regex character-class body, for patterns ported from
 /// Python that say `\s`.
-pub const SPACE_CLASS: &str =
-    r"\t\n\x0b\x0c\r\x1c-\x1f \x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}";
+pub const SPACE_CLASS: &str = r"\t\n\x0b\x0c\r\x1c-\x1f \x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}";
 
 /// `str.split()` with no argument.
 pub fn split(text: &str) -> Vec<&str> {
-    text.split(is_space).filter(|part| !part.is_empty()).collect()
+    text.split(is_space)
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 /// `str.strip()` with no argument.
@@ -161,7 +162,10 @@ mod tests {
     fn surrogateescape_round_trips() {
         let bytes = b"ok \xff\xfe \xed\xa0\x80 \xe2\x9c\x93 \xe2\x9c";
         let text = decode_surrogateescape(bytes);
-        assert_eq!(text.chars().filter(|&c| as_surrogate(c).is_some()).count(), 7);
+        assert_eq!(
+            text.chars().filter(|&c| as_surrogate(c).is_some()).count(),
+            7
+        );
         assert_eq!(encode_surrogateescape(&text).unwrap(), bytes);
         assert!(encode_strict(&text).is_err());
     }

@@ -1,23 +1,17 @@
-//! `loch hook`, run by Claude Code around every Bash call and at every stop.
-//! A port of the hook half of `loch/trace.py`; the Python is the reference
-//! and `test/test_equivalence.py` holds the two to the same side effects.
+//! `loch hook`, run by Claude Code around every Bash call and at every stop —
+//! the hook half of `loch/trace.py`.
 //!
 //! The pending-state file is shared across implementations — a session can
 //! start its Bash call under one and finish it under the other while a machine
 //! switches over — so its name and JSON shape must stay exactly Python's.
 
 use crate::git::{self, GitError};
-use crate::output::{python_dumps, python_dumps_compact_sorted};
+use crate::json::{self, Map, Value};
+use crate::object;
 use crate::store::{self, Store};
-use serde_json::{json, Map, Value};
+use crate::trace::{self, content, make_note, read_records, write_note};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-pub const NOTES_REF: &str = "refs/notes/loch";
-pub const NOTE_VERSION: i64 = 1;
-pub const AGENT: &str = "claude-code";
 
 /// Any failure: the hook swallows them all, so the only thing that matters
 /// about one is where it stopped.
@@ -35,108 +29,89 @@ impl From<std::io::Error> for Stop {
     }
 }
 
-fn event_cwd(event: &Map<String, Value>) -> Result<String, Stop> {
-    // Python's `str(event.get("cwd") or os.getcwd())`. A non-string cwd would
-    // be str()-ed into something git can't enter, so it stops here instead.
+impl From<trace::TraceError> for Stop {
+    fn from(_: trace::TraceError) -> Self {
+        Stop
+    }
+}
+
+fn event_cwd(event: &Map) -> Result<String, Stop> {
+    // `str(event.get("cwd") or os.getcwd())`. A non-string cwd would be
+    // str()-ed into something git can't enter, so it stops here instead.
     match event.get("cwd") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => current_dir(),
-        Some(Value::String(text)) if text.is_empty() => current_dir(),
-        Some(Value::String(text)) => Ok(text.clone()),
+        None => Ok(crate::sys::getcwd()),
+        Some(v) if !v.truthy() => Ok(crate::sys::getcwd()),
+        Some(Value::Str(text)) => Ok(text.clone()),
         Some(_) => Err(Stop),
     }
 }
 
-fn current_dir() -> Result<String, Stop> {
-    Ok(std::env::current_dir()?.to_string_lossy().into_owned())
-}
-
-fn pending_dir(cwd: &str) -> Result<PathBuf, Stop> {
+fn pending_dir(cwd: &str) -> Result<String, Stop> {
     let git_dir = git::absolute_git_dir(cwd)?;
-    Ok(Path::new(&git_dir).join("loch").join("pending"))
+    Ok(crate::sys::join(
+        &crate::sys::join(&git_dir, "loch"),
+        "pending",
+    ))
 }
 
-/// `(event.get("tool_input") or {}).get("command", "")`, stringified. A truthy
-/// non-object tool_input raises in Python, so it stops here.
-fn tool_command(event: &Map<String, Value>) -> Result<String, Stop> {
-    let input = match event.get("tool_input") {
-        None | Some(Value::Null) => return Ok(String::new()),
-        Some(Value::Object(map)) => map,
-        Some(value) if !truthy(value) => return Ok(String::new()),
-        Some(_) => return Err(Stop),
-    };
-    match input.get("command") {
+/// `(event.get("tool_input") or {}).get("command", "")`, stringified. A
+/// truthy non-object raises in Python, so it stops here.
+fn tool_command(event: &Map) -> Result<String, Stop> {
+    match event.get("tool_input") {
         None => Ok(String::new()),
-        Some(Value::String(text)) => Ok(text.clone()),
-        // str() of anything else; commands are strings in every real event.
+        Some(v) if !v.truthy() => Ok(String::new()),
+        Some(Value::Object(input)) => match input.get("command") {
+            None => Ok(String::new()),
+            Some(Value::Str(text)) => Ok(text.clone()),
+            other => Ok(trace::py_str(other)),
+        },
         Some(_) => Err(Stop),
     }
 }
 
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64() != Some(0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
-
-fn tool_use_id(event: &Map<String, Value>) -> Option<String> {
+fn tool_use_id(event: &Map) -> Option<String> {
     match event.get("tool_use_id") {
-        Some(Value::String(call)) if !call.is_empty() => Some(call.clone()),
+        Some(Value::Str(call)) if !call.is_empty() => Some(call.clone()),
         _ => None,
     }
 }
 
-fn call_key(event: &Map<String, Value>) -> Result<String, Stop> {
+fn call_key(event: &Map) -> Result<String, Stop> {
     if let Some(call) = tool_use_id(event) {
         return Ok(call);
     }
     let digest = Sha256::digest(tool_command(event)?.as_bytes());
-    let hex: String = digest[..16]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .concat();
+    let hex: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
     Ok(format!("cmd-{}", hex))
-}
-
-fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 /// Remembers HEAD before a Bash call, so the matching post hook can tell
 /// exactly which commits the call made rather than guessing from history.
-pub fn pre_tool(event: &Map<String, Value>) -> Result<(), Stop> {
+pub fn pre_tool(event: &Map) -> Result<(), Stop> {
     let cwd = event_cwd(event)?;
     let before = git::head(&cwd)?.unwrap_or_default();
     let directory = pending_dir(&cwd)?;
     fs::create_dir_all(&directory)?;
     let key = call_key(event)?;
-    let state = json!({"head": before, "at": now()});
-    fs::write(directory.join(key), python_dumps(&state))?;
+    let state = Value::Object(object! {"head" => before, "at" => Value::Float(crate::sys::now())});
+    fs::write(
+        crate::sys::join(&directory, &key),
+        json::dumps(&state, json::DEFAULT),
+    )?;
     Ok(())
 }
 
-pub fn post_tool(event: &Map<String, Value>) -> Result<Vec<String>, Stop> {
+pub fn post_tool(event: &Map) -> Result<Vec<String>, Stop> {
     let cwd = event_cwd(event)?;
-    let Some(Value::String(session_id)) = event.get("session_id") else {
+    let Some(Value::Str(session_id)) = event.get("session_id") else {
         return Ok(Vec::new());
     };
-    let state_path = pending_dir(&cwd)?.join(call_key(event)?);
-    let state: Value = serde_json::from_slice(&fs::read(&state_path)?).map_err(|_| Stop)?;
+    let state_path = crate::sys::join(&pending_dir(&cwd)?, &call_key(event)?);
+    let text = String::from_utf8(fs::read(&state_path)?).map_err(|_| Stop)?;
+    let state = json::loads(&text).map_err(|_| Stop)?;
     fs::remove_file(&state_path)?;
     let before = match state.get("head") {
-        Some(Value::String(head)) => head.clone(),
-        _ => return Err(Stop),
-    };
-    let since = match state.get("at") {
-        Some(Value::Number(at)) => at.as_f64().ok_or(Stop)?,
+        Some(Value::Str(head)) => head.clone(),
         _ => return Err(Stop),
     };
     let after = match git::head(&cwd)? {
@@ -149,7 +124,7 @@ pub fn post_tool(event: &Map<String, Value>) -> Result<Vec<String>, Stop> {
         None => {
             let command = tool_command(event)?;
             let found = match event.get("transcript_path") {
-                Some(Value::String(path)) => call_from_transcript(path, &command),
+                Some(Value::Str(path)) => call_from_transcript(path, &command)?,
                 _ => None,
             };
             match found {
@@ -159,6 +134,11 @@ pub fn post_tool(event: &Map<String, Value>) -> Result<Vec<String>, Stop> {
         }
     };
 
+    let since = match state.get("at") {
+        Some(Value::Float(at)) => *at,
+        Some(Value::Int(at)) => at.parse::<f64>().map_err(|_| Stop)?,
+        _ => return Err(Stop),
+    };
     let made = commits_made(&cwd, &before, &after, since)?;
     for commit in &made {
         write_note(&cwd, commit, &make_note(session_id, &call, "hook"))?;
@@ -176,11 +156,11 @@ fn commits_made(cwd: &str, before: &str, after: &str, since: f64) -> Result<Vec<
     } else {
         format!("{}..{}", before, after)
     };
-    let listing = git::git(cwd, &["log", "--format=%H %ct", &span], None)?;
+    let listing = trace::git(cwd, &["log", "--format=%H %ct", &span])?;
     // Python's int() truncates toward zero, as `as` does.
     let floor = since.trunc() as i64 - 1;
     let mut made = Vec::new();
-    for line in listing.lines() {
+    for line in trace::splitlines(&listing) {
         let (sha, stamp) = line.split_once(' ').unwrap_or((line, ""));
         if stamp.is_empty() {
             continue;
@@ -195,59 +175,32 @@ fn commits_made(cwd: &str, before: &str, after: &str, since: f64) -> Result<Vec<
 
 /// The tool call id, for a hook payload that didn't carry one: the last Bash
 /// call in the transcript that ran exactly this command.
-fn call_from_transcript(path: &str, command: &str) -> Option<String> {
-    let raw = fs::read(path).ok()?;
+fn call_from_transcript(path: &str, command: &str) -> Result<Option<String>, Stop> {
     let mut found: Option<Value> = None;
-    for line in raw.split(|&b| b == b'\n') {
-        let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        let Some(Value::Object(message)) = record.get("message") else {
-            continue;
-        };
-        let Some(Value::Array(content)) = message.get("content") else {
-            continue;
-        };
-        for block in content {
-            let Value::Object(block) = block else {
-                continue;
-            };
-            let input_command = match block.get("input") {
-                Some(Value::Object(input)) => input.get("command"),
-                _ => None,
-            };
-            if block.get("type") == Some(&Value::from("tool_use"))
-                && block.get("name") == Some(&Value::from("Bash"))
-                && input_command == Some(&Value::from(command))
+    for record in read_records(path) {
+        for block in content(&record) {
+            if !(block.get("type").is_some_and(|t| t.is_str("tool_use"))
+                && block.get("name").is_some_and(|n| n.is_str("Bash")))
             {
+                continue;
+            }
+            // `(block.get("input") or {}).get("command")`, which raises on a
+            // truthy non-object and so ends the hook.
+            let input_command = match block.get("input") {
+                None => None,
+                Some(v) if !v.truthy() => None,
+                Some(Value::Object(input)) => input.get("command"),
+                Some(_) => return Err(Stop),
+            };
+            if input_command.is_some_and(|c| c.is_str(command)) {
                 found = Some(block.get("id").cloned().unwrap_or(Value::Null));
             }
         }
     }
-    match found {
-        Some(Value::String(id)) => Some(id),
+    Ok(match found {
+        Some(Value::Str(id)) => Some(id),
         _ => None,
-    }
-}
-
-pub fn make_note(session_id: &str, call: &str, captured: &str) -> Value {
-    json!({
-        "loch": NOTE_VERSION,
-        "agent": AGENT,
-        "session": session_id,
-        "call": call,
-        "captured": captured,
     })
-}
-
-fn write_note(cwd: &str, commit: &str, note: &Value) -> Result<(), Stop> {
-    let body = python_dumps_compact_sorted(note);
-    git::git(
-        cwd,
-        &["notes", "--ref", NOTES_REF, "add", "-f", "-F", "-", commit],
-        Some(&body),
-    )?;
-    Ok(())
 }
 
 /// Copies the live transcript into the store. Claude Code deletes transcripts
@@ -255,11 +208,8 @@ fn write_note(cwd: &str, commit: &str, note: &Value) -> Result<(), Stop> {
 /// pointing at nothing; this is the copy that outlives it. The file is
 /// append-only, so the latest snapshot covers every earlier one and one key
 /// per session suffices.
-pub fn snapshot_transcript(
-    event: &Map<String, Value>,
-    store: &dyn Store,
-) -> Result<Option<String>, Stop> {
-    let (Some(Value::String(path)), Some(Value::String(session_id))) =
+pub fn snapshot_transcript(event: &Map, store: &dyn Store) -> Result<Option<String>, Stop> {
+    let (Some(Value::Str(path)), Some(Value::Str(session_id))) =
         (event.get("transcript_path"), event.get("session_id"))
     else {
         return Ok(None);
@@ -267,25 +217,15 @@ pub fn snapshot_transcript(
     let Ok(data) = fs::read(path) else {
         return Ok(None);
     };
-    let key = transcript_key(&project_of(path), session_id);
+    let project = crate::sys::basename(&crate::sys::dirname(path));
+    let key = format!(
+        "{}{}/{}.jsonl",
+        trace::transcripts_prefix(),
+        project,
+        session_id
+    );
     store.put(&key, &data).map_err(|_| Stop)?;
     Ok(Some(key))
-}
-
-/// `os.path.basename(os.path.dirname(path))`.
-fn project_of(path: &str) -> String {
-    let dir = match path.rfind('/') {
-        Some(slash) => path[..slash].trim_end_matches('/'),
-        None => "",
-    };
-    match dir.rfind('/') {
-        Some(slash) => dir[slash + 1..].to_string(),
-        None => dir.to_string(),
-    }
-}
-
-pub fn transcript_key(project: &str, session_id: &str) -> String {
-    format!("transcripts/{}/{}/{}.jsonl", AGENT, project, session_id)
 }
 
 /// Run by Claude Code with the event as JSON on stdin. It must never fail the
@@ -297,7 +237,7 @@ pub fn run(name: &str, stdin: &[u8]) {
         return;
     };
     let text = if text.is_empty() { "{}" } else { text };
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+    let Ok(parsed) = json::loads(text) else {
         return;
     };
     let event = match parsed {
@@ -307,9 +247,10 @@ pub fn run(name: &str, stdin: &[u8]) {
     let _ = match name {
         "pre-tool" => pre_tool(&event),
         "post-tool" => post_tool(&event).map(|_| ()),
-        "stop" => store::create_store(&store::resolve_store_uri(None))
-            .map_err(|_| Stop)
-            .and_then(|store| snapshot_transcript(&event, store.as_ref()).map(|_| ())),
+        "stop" => match store::create_store(&store::resolve_store_uri(None)) {
+            Ok(store) => snapshot_transcript(&event, store.as_ref()).map(|_| ()),
+            Err(_) => Err(Stop),
+        },
         _ => Ok(()),
     };
 }
@@ -319,19 +260,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_is_the_containing_directory_name() {
-        assert_eq!(project_of("/h/.claude/projects/-a-b/s.jsonl"), "-a-b");
-        assert_eq!(project_of("s.jsonl"), "");
-        assert_eq!(project_of("/s.jsonl"), "");
-    }
-
-    #[test]
     fn command_key_matches_python() {
-        let event: Map<String, Value> =
-            serde_json::from_str(r#"{"tool_input": {"command": "git commit"}}"#).unwrap();
+        let event = json::loads(r#"{"tool_input": {"command": "git commit"}}"#).unwrap();
         // hashlib.sha256(b"git commit").hexdigest()[:32]
         assert_eq!(
-            call_key(&event).ok().unwrap(),
+            call_key(event.as_object().unwrap()).ok().unwrap(),
             "cmd-993c9eb42f6efa07b7501be8a0378748"
         );
     }

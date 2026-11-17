@@ -1,78 +1,39 @@
 //! The Rust build of loch: one static binary for Ness, the VS Code extension
-//! and the Claude Code hooks to ship. The Python package is the reference
-//! implementation; a command lands here only once `test/test_equivalence.py`
-//! holds it to the same output and side effects.
+//! and the Claude Code hooks to ship. The Python package is the reference;
+//! `test/test_equivalence.py` holds every command here to its output and side
+//! effects.
 
 // The error path is cold and runs once per process; boxing it buys nothing.
 #![allow(clippy::result_large_err)]
 
+mod argparse;
+mod blame_html;
+mod bundle;
 mod claude;
+mod cli;
+mod format;
 mod git;
 mod hook;
+mod index;
+mod ingest;
+mod json;
 mod output;
+mod py;
+mod redact;
+mod rewrite;
 mod s3;
 mod store;
+mod sys;
+mod trace;
 
+use cli::Failure;
 use output::{emit, emit_error, CommandError, Outcome, JSON_FLAG};
-use serde_json::Value;
-use std::io::Read;
-
-/// Commands the Python implementation has and this one doesn't yet. Asking
-/// for one is `not-ported` rather than `unknown-command`: the command exists,
-/// and the fix is the Python install, not a typo.
-const UNPORTED: &[&str] = &[
-    "list", "save", "restore", "delete", "reindex", "ingest", "install", "blame", "ask", "log",
-    "backfill",
-];
-
-const USAGE: &str = "loch — save and restore agent coding sessions across machines
-
-This is the Rust build, which so far implements:
-
-  loch hook    pre-tool | post-tool | stop      (run by Claude Code)
-  loch --version
-
-Every other command is still served by the Python implementation (`uv tool
-install loch`); asking this build for one fails with code `not-ported`.
-
-Every command takes --json, which replaces the text below with one machine-
-readable document on stdout.
-
-Environment:
-  LOCH_STORE        default store URI
-  CLAUDE_CONFIG_DIR Claude Code's state directory (default ~/.claude)
-";
-
-fn command_hook(argv: &[String]) -> Result<Outcome, CommandError> {
-    let name = argv.first().map(String::as_str).unwrap_or("");
-    let mut stdin = Vec::new();
-    if std::io::stdin().read_to_end(&mut stdin).is_ok() {
-        hook::run(name, &stdin);
-    }
-    Ok(Outcome::new("hook"))
-}
-
-fn command_version(_argv: &[String]) -> Result<Outcome, CommandError> {
-    let version = env!("CARGO_PKG_VERSION");
-    let mut outcome = Outcome::new("version");
-    outcome
-        .payload
-        .insert("version".into(), Value::from(version));
-    outcome.text = format!("loch {}\n", version);
-    Ok(outcome)
-}
-
-fn command_help(_argv: &[String]) -> Result<Outcome, CommandError> {
-    let mut outcome = Outcome::new("help");
-    outcome.payload.insert("usage".into(), Value::from(USAGE));
-    outcome.text = USAGE.into();
-    Ok(outcome)
-}
 
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     // Read off argv rather than from a parsed command line: an unknown
-    // command has to render in the mode the caller asked for.
+    // command, or a parser rejecting a flag, has to render in the mode the
+    // caller asked for, and neither has a namespace by the time it fails.
     let as_json = argv.iter().any(|arg| arg == JSON_FLAG);
     if argv.first().map(String::as_str) == Some(JSON_FLAG) {
         argv.remove(0);
@@ -90,24 +51,30 @@ fn main() {
         &argv[1..]
     };
 
-    let result = match command.as_str() {
-        "hook" => command_hook(rest),
-        "version" => command_version(rest),
-        "help" => command_help(rest),
-        name if UNPORTED.contains(&name) => Err(CommandError::new(
-            "not-ported",
-            format!(
-                "'{}' is not in the Rust build yet; use the Python loch",
-                name
-            ),
-        )),
-        name => Err(CommandError::new(
+    let result = match cli::dispatch(&command, rest) {
+        Some(result) => result,
+        None => Err(Failure::Error(CommandError::new(
             "unknown-command",
-            format!("unknown command '{}' (try: loch help)", name),
-        )),
+            format!("unknown command '{}' (try: loch help)", command),
+        ))),
     };
     match result {
         Ok(outcome) => emit(outcome, as_json),
-        Err(error) => emit_error(&command, error, as_json),
+        Err(Failure::Help(text)) => {
+            let mut outcome = Outcome::new(&command);
+            outcome.payload.insert("usage".into(), text.as_str().into());
+            outcome.text = text;
+            emit(outcome, as_json);
+        }
+        Err(Failure::Error(error)) => emit_error(&command, error, as_json),
+        // Python prints a traceback here, which is the one thing a consumer
+        // can't parse; JSON mode gets the same `internal` document.
+        Err(Failure::Internal(message)) => {
+            let mut error = CommandError::new("internal", message.clone());
+            if !as_json {
+                error.prose = Some(format!("loch: internal error: {}\n", message));
+            }
+            emit_error(&command, error, as_json)
+        }
     }
 }

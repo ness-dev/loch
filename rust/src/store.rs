@@ -1,50 +1,139 @@
-//! The store interface, as in `loch/store.py`. Only what the ported commands
-//! use is here; the rest arrives with the commands that need it.
+//! The store interface, as in `loch/store.py`: a local directory or any
+//! S3-compatible endpoint behind the same five operations.
 
 use crate::claude::home_dir;
+use crate::sys;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
-/// The message is for the commands that report it; the hook only needs to
-/// know that the put failed.
+/// The failures a caller can act on, kept apart for the reasons
+/// `cli.store_errors` gives. There is no "missing dependency": the Rust build
+/// carries its S3 client, so `s3-extra-missing` can't arise.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum StoreError {
-    /// The store didn't answer (`store-unreachable`).
+    /// The store answered and the object isn't there (`bundle-not-found`).
+    Missing(String),
+    /// The store didn't answer, or refused (`store-unreachable`).
     Unreachable(String),
-    Invalid(String),
 }
 
-pub trait Store {
-    fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError>;
-}
-
-pub struct FileStore {
-    root: PathBuf,
-}
-
-impl FileStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        FileStore { root: root.into() }
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            StoreError::Missing(m) | StoreError::Unreachable(m) => f.write_str(m),
+        }
     }
 }
 
-impl Store for FileStore {
-    fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError> {
-        let path = self.root.join(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| StoreError::Unreachable(e.to_string()))?;
+pub trait Store {
+    fn describe(&self) -> String;
+    fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError>;
+    fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+    /// Deleting an absent key succeeds: index entries are derived, so a repair
+    /// pass has to be able to remove ones a half-finished save never wrote.
+    fn delete(&self, key: &str) -> Result<(), StoreError>;
+}
+
+pub struct FileStore {
+    root: String,
+}
+
+impl FileStore {
+    pub fn new(root: impl Into<String>) -> Self {
+        FileStore { root: root.into() }
+    }
+
+    /// `Path(root) / key`, which collapses repeated and trailing slashes.
+    fn path(&self, key: &str) -> String {
+        let mut path = self.root.trim_end_matches('/').to_string();
+        if path.is_empty() && self.root.starts_with('/') {
+            path.push('/');
         }
-        fs::write(&path, data).map_err(|e| StoreError::Unreachable(e.to_string()))
+        for part in key.split('/').filter(|p| !p.is_empty() && *p != ".") {
+            if !path.ends_with('/') {
+                path.push('/');
+            }
+            path.push_str(part);
+        }
+        path
+    }
+}
+
+fn unreachable(error: &std::io::Error, path: &str) -> StoreError {
+    StoreError::Unreachable(sys::os_error(error, path))
+}
+
+impl Store for FileStore {
+    fn describe(&self) -> String {
+        self.root.clone()
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError> {
+        let path = self.path(key);
+        let parent = sys::dirname(&path);
+        fs::create_dir_all(&parent).map_err(|e| unreachable(&e, &parent))?;
+        fs::write(&path, data).map_err(|e| unreachable(&e, &path))
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        let path = self.path(key);
+        fs::read(&path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => StoreError::Missing(format!("no object at {}", key)),
+            _ => unreachable(&error, &path),
+        })
+    }
+
+    /// String prefix rather than directory descent, so both backends answer
+    /// the same question for a prefix that stops mid-segment.
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let root = self.path("");
+        if !Path::new(&root).is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        walk(Path::new(&root), "", &mut keys);
+        keys.retain(|key| key.starts_with(prefix));
+        keys.sort_by(|a, b| crate::py::cmp(a, b));
+        Ok(keys)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        let path = self.path(key);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(unreachable(&error, &path)),
+        }
+    }
+}
+
+/// `root.rglob("*")` keeping files: directories are descended without
+/// following symlinks, and a symlink to a file counts as a file.
+fn walk(dir: &Path, relative: &str, keys: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let key = if relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", relative, name)
+        };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk(&entry.path(), &key, keys);
+        } else if entry.path().is_file() {
+            keys.push(key);
+        }
     }
 }
 
 pub fn default_store() -> String {
-    Path::new(&home_dir())
-        .join(".loch")
-        .join("store")
-        .to_string_lossy()
-        .into_owned()
+    sys::join(&sys::join(&home_dir(), ".loch"), "store")
 }
 
 pub fn resolve_store_uri(explicit: Option<&str>) -> String {
@@ -54,14 +143,14 @@ pub fn resolve_store_uri(explicit: Option<&str>) -> String {
     std::env::var("LOCH_STORE").unwrap_or_else(|_| default_store())
 }
 
-pub fn create_store(uri: &str) -> Result<Box<dyn Store>, StoreError> {
+#[derive(Debug)]
+pub struct InvalidUri(pub String);
+
+pub fn create_store(uri: &str) -> Result<Box<dyn Store>, InvalidUri> {
     if let Some(rest) = uri.strip_prefix("s3://") {
         let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
         if bucket.is_empty() {
-            return Err(StoreError::Invalid(format!(
-                "invalid S3 store URI: {}",
-                uri
-            )));
+            return Err(InvalidUri(format!("invalid S3 store URI: {}", uri)));
         }
         // `re.sub(r"/$", "", prefix)`: one trailing slash, not all of them.
         let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
@@ -70,57 +159,20 @@ pub fn create_store(uri: &str) -> Result<Box<dyn Store>, StoreError> {
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(Box::new(FileStore::new(file_uri_path(rest))));
     }
-    Ok(Box::new(FileStore::new(abspath(uri))))
+    if uri.starts_with('/') {
+        return Ok(Box::new(FileStore::new(uri)));
+    }
+    Ok(Box::new(FileStore::new(sys::abspath(uri))))
 }
 
-/// `unquote(urlparse(uri).path)`: the netloc and any query or fragment are
-/// dropped, and percent-escapes decoded as UTF-8 with replacement.
+/// `unquote(urlparse(uri).path)`.
 fn file_uri_path(rest: &str) -> String {
     let path = match rest.find('/') {
         Some(slash) => &rest[slash..],
         None => "",
     };
     let path = path.split(['?', '#']).next().unwrap_or("");
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(value) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                decoded.push(value);
-                i += 3;
-                continue;
-            }
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-/// `os.path.abspath`: joined onto the working directory and normalised
-/// lexically, without touching the filesystem.
-pub fn abspath(path: &str) -> String {
-    let joined = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    let mut parts: Vec<Component> = Vec::new();
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(parts.last(), Some(Component::Normal(_))) {
-                    parts.pop();
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    let normal: PathBuf = parts.iter().collect();
-    normal.to_string_lossy().into_owned()
+    crate::index::unquote(path)
 }
 
 #[cfg(test)]
@@ -132,11 +184,5 @@ mod tests {
         assert_eq!(file_uri_path("/tmp/a%20b"), "/tmp/a b");
         assert_eq!(file_uri_path("host/tmp/x?q=1#f"), "/tmp/x");
         assert_eq!(file_uri_path("/tmp/%zz%2"), "/tmp/%zz%2");
-    }
-
-    #[test]
-    fn abspath_normalises_lexically() {
-        assert_eq!(abspath("/a/./b/../c"), "/a/c");
-        assert_eq!(abspath("/.."), "/");
     }
 }

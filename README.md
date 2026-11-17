@@ -78,6 +78,39 @@ loch reindex
 `save` bundles every session matching the filter, so a branch with several
 sessions produces a single ref.
 
+## Blame a line back to its conversation
+
+```sh
+loch install          # once per repo: Claude Code hooks, committed in .claude/
+loch backfill         # link commits made before the hooks, where it can be exact
+
+loch blame loch/format.py
+#   102-112  6eb7b0d  Canonicalize per RFC 8785, fold agent events into facts
+#                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
+loch blame --html loch/format.py   # the whole file in a browser, tinted by conversation
+
+loch log loch/format.py:105        # every conversation that ever changed line 105
+loch log loch/format.py:90-120     # ...or a range, followed through edits and moves
+loch log loch/format.py            # ...or the whole file, followed through renames
+
+loch ask loch/format.py:105 "why not just json.dumps?"
+# forks the conversation that wrote line 105 and resumes it in Claude Code,
+# from where it ended; --at-commit stops it just after the commit instead
+```
+
+`blame --html` writes the same thing as a page and opens it: every line of the
+file tinted by the conversation that wrote it, a key of what each one asked,
+and a line's `loch ask` command a click away. `--lines 1-20,90-120` limits it
+to an excerpt.
+
+With the hooks installed, every commit an agent makes gets a git note on
+`refs/notes/loch` naming the session and tool call that made it, and every
+session's transcript is copied into the store when it stops — Claude Code
+deletes its own after 30 days. Notes hold no transcript text; share them with
+`git push origin refs/notes/loch`. `ask` never touches the original session:
+it writes a new one holding the conversation, filed under
+the current checkout, so the follow-up sees today's code, not the commit's.
+
 ## Scripting it
 
 Every command takes `--json`, before or after the subcommand, and prints one
@@ -123,6 +156,8 @@ An empty result is `{"sessions": []}` with `ok: true`, not a failure, and
 ```
 bundles/<ref>.loch                 the bundle, named by the hash of its bytes
 index/branch/<branch>/<ref>        a small entry per branch the bundle touches
+transcripts/claude-code/<project>/<session>.jsonl
+                                   latest snapshot of a session, from the stop hook
 ```
 
 `loch list --remote` reads only the index, so listing a branch never
@@ -156,6 +191,10 @@ These were `LOCHY_*` before the rename, and the default store was
 `~/.lochy/store`. The old names are not read, so an old variable is silently
 ignored rather than rejected — rename it, and `mv ~/.lochy ~/.loch` to keep
 existing bundles visible.
+
+`loch ingest` converts sessions into the loch conversation format (see
+[SPEC.md](SPEC.md)) and writes one derived file per session to
+`~/.loch/derived`, or `--out <dir>`.
 
 Credentials come from the standard AWS chain, so `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY`, a shared profile, or an instance role all work.

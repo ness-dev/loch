@@ -12,6 +12,13 @@ it elsewhere with paths rewritten so the session actually resumes.
 Currently supports Claude Code. Codex and Cursor are the intended next
 adapters.
 
+It is also becoming the **conversation format**: `loch ingest` turns a
+session into a content-addressed graph of turns that can be forked, shared
+and eventually merged between people. loch is the `git` of that world and an
+editor (Ness first) is the `vim`. The format is specified in `SPEC.md`, which
+is the one design document here on purpose: it is meant to be implementable
+by someone who never reads this file.
+
 ## Why it exists
 
 The driving use case is **PR review**: a reviewer should be able to pull
@@ -27,12 +34,16 @@ travel with the code they produced.
 
 - **Not a Harness feature.** Harness is one consumer among many. Anything
   that only makes sense inside Harness belongs in Harness.
-- **Not a normalized cross-agent schema.** Resume is same-agent only —
-  a Claude transcript can't be resumed by Codex, the tool-call schemas
-  differ. Native blobs round-trip; normalization would be lossy for the
-  one thing that matters. A normalized projection may come later for
-  review rendering, but it is not the source of truth.
-- **Not git-backed storage.** See below.
+- **Not a normalized source of truth.** Resume is same-agent only — a
+  Claude transcript can't be resumed by Codex, the tool-call schemas differ.
+  Native blobs round-trip; normalization would be lossy for the one thing
+  that matters. The loch format *is* a normalized projection, and that is
+  exactly its status: derived, stamped with the converter that made it,
+  regenerated from the raw source whenever the converter improves. The raw
+  transcript stays the thing that has to survive.
+- **Not git-backed storage for content.** See below. Turn envelopes (which
+  hold hashes and structure, never transcript text) are a different
+  question — SPEC.md §9 and §13.
 
 ## Design decisions and their reasoning
 
@@ -54,10 +65,14 @@ change the identity of a bundle.
 a reviewer wants one ref to pull. `save` filters by cwd/branch/session
 and packs everything matching.
 
-**Link at branch level, not per commit.** A reviewer asks "what produced
-this PR," not "what produced commit abc123." Commit-level pointers would
-drag in squash-merge, rebase, and `post-rewrite` handling for no benefit.
-(Nothing writes git pointers yet — this is the intended shape.)
+**Link at branch level, not per commit — for bundles.** A reviewer asks
+"what produced this PR," not "what produced commit abc123." Commit-level
+pointers would drag in squash-merge, rebase, and `post-rewrite` handling for
+no benefit. (Nothing writes git pointers yet — this is the intended shape.)
+The conversation graph is the exception: forking at a turn needs the disk
+state *at that turn*, so turns get per-commit pins kept alive by refs, which
+is precisely the squash/rebase problem this avoided, taken on deliberately
+(SPEC.md §10).
 
 **No single index object.** A shared `index.json` would need
 read-modify-write on every save, so two machines saving concurrently would
@@ -130,18 +145,38 @@ Python 3.10 through 3.13, Poetry, boto3 behind an extra.
 
 ```
 loch/
-├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex
+├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex/ingest
 ├── claude.py    # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.py    # bundle format, gzip, content-addressed ref
+├── format.py    # loch format: canonical JSON, turn and content ids, derived files
+├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
 ├── index.py     # store key layout, derived index entries, delete and reindex
+├── trace.py     # commit -> conversation notes, hooks, blame, log, backfill, ask's fork
+├── blame_html.py # `blame --html`: self-contained page, no external assets
 ├── git.py       # current branch of a checkout, for the list default
 ├── output.py    # result envelope, the two renderers, structured failures
 ├── redact.py    # secret scrubbing, applied on save before packing
 ├── rewrite.py   # path rewriting (the load-bearing logic)
 └── store.py     # Store interface + local-fs and S3-compatible backends
 test/
-└── test_*.py    # one module per source module
+├── test_corpus.py  # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
+└── test_*.py       # one module per source module
 ```
+
+`ingest.py` normalizes with `rewrite.py`'s machinery rather than its own:
+`compile_replacements` is the same single pass with the same guards, fed
+placeholder targets (`{{loch:root}}`, `{{loch:home}}`, …) instead of another
+machine's paths. That sharing is what makes a turn id survive `restore` — a
+copy rewritten by one set of pairs normalizes back through the same set — so
+a change to the guards changes both behaviours at once, which is the point.
+`test_corpus.py` is the check that it still holds on real data: 3809 of 3810
+sessions keep every turn id across a simulated move, and the one that doesn't
+is a transcript that already contains the destination paths (SPEC.md §14.1).
+
+The turn core holds the content's *hash*, not the content, so deleting
+content never invalidates an id. Anything that makes a turn's id depend on
+content directly breaks tombstones; anything that makes it depend on facts
+(timestamps, record uuids, model, cwd) breaks stability across copies.
 
 The store layout is:
 
@@ -451,6 +486,12 @@ never a code. The set today:
 | `s3-extra-missing` | an `s3://` store on an install without the `s3` extra |
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
+| `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
+| `not-a-repository` | `install`/`blame`/`log`/`ask`/`backfill` outside a git repository |
+| `not-linked` | `ask` on a commit with no conversation note, or an uncommitted line |
+| `transcript-missing` | the note exists but the transcript is in neither Claude's directory nor the store |
+| `call-not-found` | the transcript has no result for the noted tool call |
+| `git-failed` | a git command failed |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -648,6 +689,22 @@ CI and no release, so the first tag push is also the first execution of the
 release path. No release exists yet, so the wheel URL in the README points at
 a `v0.1.0` that has to be cut before it resolves.
 
+**Blame and ask (`trace.py`) are a working demo on this repository.** All 12
+commits whose sessions still existed were backfilled exactly; the 50 from
+August have no conversation left, because Claude Code had already deleted
+their transcripts (`cleanupPeriodDays`, default 30) — the reason the stop
+hook snapshots every session into the store. Backfill could not have used
+commit hashes from tool output: `git commit -q` prints none, which is why
+hooks capture links live. A fork made by `ask` was resumed with
+`claude --resume -p` and answered from the original conversation. Known gaps:
+the fork resumes in the current checkout rather than a worktree at the commit
+(a pin, §10); the transcript snapshot is one mutable key per session rather
+than content-addressed `raw/<hex>`; subagent sidecars aren't snapshotted;
+backfill reads every transcript on the machine (~25s on 750MB). The hook
+input's `tool_use_id` is used when present and otherwise recovered from the
+transcript by command; which one current Claude Code sends hasn't been
+observed, since hooks only load at session start.
+
 The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
 `LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are
 simply no longer read. That was chosen because nothing had been released and
@@ -660,11 +717,28 @@ old name, and warn on stderr in text mode only.
 
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the
-obvious next one, and the layout takes it without a migration), any git
-integration (no notes, no PR-level pointers), and no adapters beyond
-Claude Code.
+obvious next one, and the layout takes it without a migration), PR-level
+git pointers for bundles, and no adapters beyond Claude Code.
 `restore` still needs a full 64-character ref — the index makes refs
 discoverable, but nothing resolves a prefix.
+
+**The loch format (SPEC.md) is v1 draft.** `loch ingest` converts every
+session in the local corpus (3810 sessions, 266k turns) and the derived files
+read back verified and byte-identical; re-ingest is idempotent. The draft
+questions are all settled in SPEC.md §13, including no salt on content
+hashes: privacy of withheld content is not a goal. What it doesn't do yet: write anything to a store (derived
+files go to `~/.loch/derived`, raw sources aren't snapshotted), convert
+subagent sidecars, give each of a moved session's cwds its own root, capture
+git pins, or emit back to Claude Code JSONL. Until the first conversation is
+shared, ids may change between commits (SPEC.md §12). The bundle format and
+everything `save`/`restore` do are unchanged.
+
+`format.canonical` is RFC 8785 written out by hand rather than `json.dumps`,
+because Python's float repr and code-point key order both disagree with it.
+That costs speed: the corpus check went from about 3.5 to about 5.5 minutes.
+If it ever matters, the fast path is `json.dumps` for any value containing no
+float, no non-BMP key and no lone surrogate, which is nearly all of them, and checking the two
+agree is a one-line property test.
 
 ## Conventions
 

@@ -31,6 +31,12 @@ ruff = "^0.11.2"
 boto3 = "^1.37.31"
 boto3-stubs = "^1.34.145"
 mypy-boto3-s3 = "^1.34.105"
+# moto's threaded server, which the Rust S3 client is tested against: a real
+# HTTP endpoint rather than boto3's in-process mock. flask-cors caps Python
+# below 4; the marker keeps that cap on this dev dependency alone rather than
+# on loch's own requires-python.
+flask = { version = "^3.0", python = ">=3.10,<4.0" }
+flask-cors = { version = ">=4.0", python = ">=3.10,<4.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

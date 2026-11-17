@@ -10,6 +10,7 @@ mod claude;
 mod git;
 mod hook;
 mod output;
+mod s3;
 mod store;
 
 use output::{emit, emit_error, CommandError, Outcome, JSON_FLAG};

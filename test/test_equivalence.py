@@ -501,16 +501,157 @@ def test_switching_over_mid_call(
     twin(tmp_path, scenario, mix=mix)
 
 
-def test_stop_with_s3_store_differs_only_as_expected(tmp_path: Path) -> None:
-    """Placeholder until S3 is ported: both must at least leave stdout empty
-    and exit zero, since a hook may never fail its tool call."""
+@dataclass
+class S3:
+    signed: bool
+    endpoint: str
+    access_key: str
+    secret_key: str
+    client: Any
+
+
+@pytest.fixture(params=["signed", "unsigned"])
+def s3(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A real HTTP endpoint rather than boto3's in-process mock, since the Rust
+    build signs its own requests. "signed" turns moto's IAM auth on, so a
+    wrong signature is refused rather than waved through; the first four
+    actions, which create the user who signs everything after, go unchecked.
+
+    "unsigned" exists because moto's verifier rejects boto3's own correct
+    signature on a key holding a space or `+`, so key encoding — which real
+    project directories exercise — can only be compared with auth off."""
+    import urllib.request
+
+    import boto3
+    import moto.settings
+    from moto.core.responses import ActionAuthenticatorMixin
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0)
+    server.start()
+    host, port = server.get_host_and_port()
+    endpoint = f"http://{host}:{port}"
+    # moto's state belongs to the process, not the server; start clean.
+    urllib.request.urlopen(urllib.request.Request(f"{endpoint}/moto-api/reset", b""))
+    if request.param == "signed":
+        monkeypatch.setattr(moto.settings, "INITIAL_NO_AUTH_ACTION_COUNT", 4)
+        monkeypatch.setattr(ActionAuthenticatorMixin, "request_count", 0)
+    iam = boto3.client(
+        "iam",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="bootstrap",
+        aws_secret_access_key="bootstrap",
+    )
+    iam.create_user(UserName="loch")
+    key = iam.create_access_key(UserName="loch")["AccessKey"]
+    iam.put_user_policy(
+        UserName="loch",
+        PolicyName="s3",
+        PolicyDocument=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+            }
+        ),
+    )
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=key["AccessKeyId"],
+        aws_secret_access_key=key["SecretAccessKey"],
+    )
+    client.create_bucket(Bucket="loch-test")
+    yield S3(
+        request.param == "signed",
+        endpoint,
+        key["AccessKeyId"],
+        key["SecretAccessKey"],
+        client,
+    )
+    server.stop()
+
+
+def test_stop_snapshots_into_s3_identically(tmp_path: Path, s3: S3) -> None:
+    """Each implementation snapshots under its own prefix of one bucket; the
+    keys and bytes beneath must match, and a bad secret must write nothing."""
     world = World(tmp_path / "world")
-    event = {"session_id": SESSION, "transcript_path": str(tmp_path / "none")}
+    name = "-Users-x-repo" if s3.signed else "-a b+c%"
+    project = world.home / ".claude" / "projects" / name
+    project.mkdir(parents=True)
+    transcript = project / f"{SESSION}.jsonl"
+    transcript.write_bytes(b'{"type": "user"}\n\xff raw bytes \xe2\x9c\x93\n')
+    event = {"session_id": SESSION, "transcript_path": str(transcript)}
+    signed = {
+        "AWS_ACCESS_KEY_ID": s3.access_key,
+        "LOCH_S3_ENDPOINT": s3.endpoint,
+        "LOCH_S3_REGION": "us-east-1",
+        "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+        "AWS_CONFIG_FILE": os.devnull,
+    }
+
+    contents: dict[str, dict[str, bytes]] = {}
     for impl in ("py", "rs"):
-        run = world.loch(
-            impl, "hook", "stop", stdin=event, env={"LOCH_STORE": "s3://bucket/p"}
+        runs = [
+            world.loch(
+                impl,
+                "hook",
+                "stop",
+                stdin=event,
+                env={
+                    **signed,
+                    "AWS_SECRET_ACCESS_KEY": s3.secret_key,
+                    "LOCH_STORE": f"s3://loch-test/{impl}/",
+                },
+            ),
+            world.loch(
+                impl,
+                "hook",
+                "stop",
+                stdin=event,
+                env={
+                    **signed,
+                    "AWS_SECRET_ACCESS_KEY": "wrong",
+                    "LOCH_STORE": f"s3://loch-test/{impl}-badly-signed",
+                },
+            ),
+            world.loch(
+                impl,
+                "hook",
+                "stop",
+                stdin=event,
+                env={
+                    **{k: v for k, v in signed.items() if k != "AWS_ACCESS_KEY_ID"},
+                    "LOCH_STORE": f"s3://loch-test/{impl}-anonymous",
+                },
+            ),
+        ]
+        # A hook may never fail its tool call, whatever the store says.
+        assert [(r.stdout, r.stderr, r.status) for r in runs] == [(b"", b"", 0)] * len(
+            runs
         )
-        assert (run.stdout, run.status) == (b"", 0)
+        # Unprefixed: moto's verifier also rejects boto3's own signature on a
+        # listing whose prefix holds a `/`.
+        listed = s3.client.list_objects_v2(Bucket="loch-test")
+        contents[impl] = {
+            item["Key"]: s3.client.get_object(Bucket="loch-test", Key=item["Key"])[
+                "Body"
+            ].read()
+            for item in listed.get("Contents", [])
+            if item["Key"].startswith(f"{impl}/")
+        }
+    assert list(contents["py"]) == [
+        f"py/transcripts/claude-code/{name}/{SESSION}.jsonl"
+    ]
+    assert list(contents["py"].values()) == [transcript.read_bytes()]
+    assert {k.replace("rs/", "py/", 1): v for k, v in contents["rs"].items()} == (
+        contents["py"]
+    )
+    if s3.signed:
+        # Neither the bad secret nor the absent key got anything in.
+        every = s3.client.list_objects_v2(Bucket="loch-test").get("Contents", [])
+        assert sorted(item["Key"].split("/")[0] for item in every) == ["py", "rs"]
 
 
 # -- corpus -------------------------------------------------------------------

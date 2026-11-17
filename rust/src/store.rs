@@ -56,16 +56,16 @@ pub fn resolve_store_uri(explicit: Option<&str>) -> String {
 
 pub fn create_store(uri: &str) -> Result<Box<dyn Store>, StoreError> {
     if let Some(rest) = uri.strip_prefix("s3://") {
-        let bucket = rest.split('/').next().unwrap_or("");
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
         if bucket.is_empty() {
             return Err(StoreError::Invalid(format!(
                 "invalid S3 store URI: {}",
                 uri
             )));
         }
-        return Err(StoreError::Unreachable(
-            "the S3 backend is not ported to the Rust build yet".into(),
-        ));
+        // `re.sub(r"/$", "", prefix)`: one trailing slash, not all of them.
+        let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        return Ok(Box::new(crate::s3::S3Store::new(bucket, prefix)));
     }
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(Box::new(FileStore::new(file_uri_path(rest))));

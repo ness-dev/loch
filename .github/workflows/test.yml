@@ -57,11 +57,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # rustup ships on both runner images; pinned to the crate's
-      # rust-version so a newer toolchain can't hide an MSRV break.
-      - run: |
-          rustup toolchain install 1.83.0 --profile minimal -c clippy,rustfmt
-          rustup default 1.83.0
+      # rustup ships on both runner images and installs the version
+      # rust/rust-toolchain.toml pins on first use; this makes that explicit.
+      - run: rustup show active-toolchain || rustup toolchain install
 
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings

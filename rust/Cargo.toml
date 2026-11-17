@@ -4,7 +4,7 @@ name = "loch"
 # `loch --version`, and they must not disagree while both ship.
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.91"
 license = "MIT"
 description = "Save and restore agent coding sessions across machines"
 publish = false
@@ -17,6 +17,10 @@ path = "src/main.rs"
 # preserve_order: payload keys come out in insertion order, as Python's dicts do.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+hmac = "0.12"
+# Blocking and rustls-only: no async runtime and no system OpenSSL, so the
+# binary stays static. Used by the S3 backend alone.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

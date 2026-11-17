@@ -347,7 +347,14 @@ def command_save(argv: list[str]) -> Result:
     for meta in sessions:
         # In memory only — the agent's own transcript on disk stays verbatim.
         try:
-            scrubbed = redact(Path(meta.path).read_text(encoding="utf-8"))
+            raw = Path(meta.path).read_bytes().decode("utf-8")
+        except UnicodeDecodeError as error:
+            fail(
+                "transcript-unreadable",
+                f"refusing to pack {meta.session_id}: not UTF-8 at byte {error.start}",
+            )
+        try:
+            scrubbed = redact(raw)
         except RedactionError as error:
             fail("redaction-failed", f"refusing to pack {meta.session_id}: {error}")
         packed_sessions.append(

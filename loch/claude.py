@@ -171,7 +171,11 @@ def _display_summary(text: str | None) -> str | None:
 def read_session_meta(path: str) -> SessionMeta | None:
     try:
         stat = os.stat(path)
-        raw = Path(path).read_text(encoding="utf-8")
+        # Replacing rather than strict: one undecodable byte (a file truncated
+        # mid-character) used to raise out of `list` and lose every session in
+        # the directory. Only metadata is read here; `save` decides separately
+        # whether the transcript can be packed.
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 

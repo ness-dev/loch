@@ -14,8 +14,16 @@ name = "loch"
 path = "src/main.rs"
 
 [dependencies]
-# preserve_order: payload keys come out in insertion order, as Python's dicts do.
-serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+# Python's `re` has lookarounds, which the `regex` crate deliberately lacks;
+# fancy-regex adds them and hands everything else to `regex`.
+fancy-regex = "0.14"
+# zlib itself, built from source and linked statically: the ref is a hash of
+# the gzip bytes, and only zlib's own deflate reproduces zlib's output.
+# miniz_oxide (flate2's default) compresses differently.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+libz-sys = { version = "1", default-features = false, features = ["static", "libc"] }
+getrandom = "0.2"
 sha2 = "0.10"
 hmac = "0.12"
 # Blocking and rustls-only: no async runtime and no system OpenSSL, so the

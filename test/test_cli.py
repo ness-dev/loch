@@ -1129,3 +1129,33 @@ def test_ingest_rejects_an_unreadable_author_key(
     )
 
     assert (code, document["code"]) == (1, "author-key-unreadable")
+
+
+def test_an_undecodable_transcript_is_listed_but_not_packed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = write_session(home, str(project), "abc")
+    path.write_bytes(path.read_bytes() + b'{"type": "user", "x": "\xff"}\n')
+
+    listed, _, _ = invoke_json(
+        monkeypatch, capsys, home, "list", "--json", "--cwd", str(project)
+    )
+    assert [s["sessionId"] for s in listed["sessions"]] == ["abc"]
+
+    saved, _, code = invoke_json(
+        monkeypatch,
+        capsys,
+        home,
+        "save",
+        "--json",
+        "--cwd",
+        str(project),
+        "--store",
+        str(tmp_path / "store"),
+    )
+    assert code == 1
+    assert saved["code"] == "transcript-unreadable"
+    assert not (tmp_path / "store").exists()

@@ -491,6 +491,7 @@ never a code. The set today:
 | --- | --- |
 | `no-sessions` | `save` matched nothing |
 | `redaction-failed` | a secret survived redaction; nothing was uploaded |
+| `transcript-unreadable` | `save` found a transcript that isn't UTF-8; nothing was uploaded |
 | `missing-ref` | `restore`/`delete` called without a ref |
 | `bundle-not-found` | the store answered and the ref isn't there |
 | `store-unreachable` | the store didn't answer |

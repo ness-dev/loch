@@ -165,7 +165,13 @@ loch/
 └── store.py     # Store interface + local-fs and S3-compatible backends
 test/
 ├── test_corpus.py  # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
+├── test_equivalence.py  # opt-in, Rust build vs Python (LOCH_RUST=<binary>)
 └── test_*.py       # one module per source module
+rust/               # the Rust build: one crate, binary `loch` (see "The Rust build")
+├── src/            # main, output, hook, git, store, s3, claude
+├── bench/hook.py   # per-call wall clock of `loch hook`, any number of binaries
+└── rust-toolchain.toml
+npm/                # @ness-dev/loch and its per-platform packages
 ```
 
 `ingest.py` normalizes with `rewrite.py`'s machinery rather than its own:
@@ -499,6 +505,7 @@ never a code. The set today:
 | `git-failed` | a git command failed |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
+| `not-ported` | the Rust build was asked for a command only the Python one has yet |
 | `internal` | an unexpected exception |
 
 The four store-facing codes — `bundle-not-found`, `store-unreachable`,
@@ -601,6 +608,131 @@ afterwards. `uv build` emits a
 both are attached to the GitHub release. The build is byte-reproducible; don't
 introduce anything timestamp-dependent into it. There is deliberately no PyPI
 publishing.
+
+## The Rust build
+
+The goal is one static binary that Ness, a VS Code extension and the Claude
+Code hooks can ship and run, with no Python on the machine. **The Python
+package stays the reference implementation** until the port is complete: a
+command moves to Rust only once `test/test_equivalence.py` holds the two to
+the same output and side effects, and the Python suite has to keep passing
+on its own throughout.
+
+**Layout: `rust/`, one crate, not a root workspace.** The repository root
+belongs to Poetry (pyproject, the `loch` package, `release.sh`), and a root
+`Cargo.toml` would mean two build systems claiming the same directory and a
+`target/` beside the wheel's sources. One crate with modules mirroring the
+Python ones (`hook.rs` ↔ the hook half of `trace.py`, `output.rs` ↔
+`output.py`, …) is enough until something needs splitting into a library a
+second binary links; that is the point to make `rust/` a workspace, and
+nothing outside it would have to move.
+
+The toolchain is pinned in `rust/rust-toolchain.toml` (1.91.0), scoped to
+`rust/` so it never changes anyone's default. 1.83, which was installed,
+can't build today's `url`/`idna`, and pinning half the dependency tree
+backwards to stay on it would have been a standing cost for nothing.
+
+Unported commands answer `not-ported` rather than `unknown-command`: the
+command exists, and the fix is the Python install, not a typo.
+
+**The equivalence harness** builds each scenario twice at the same path with
+pinned git dates, so commit hashes, note blobs and even the notes-ref commit
+come out byte-identical, then drives one copy with `python -m loch.cli` and
+the other with the binary. It compares stdout, stderr and exit status
+byte-for-byte — `output.rs` reproduces `json.dumps` exactly, `", "`
+separators, `ensure_ascii` and float `repr` included, so that a comparison
+can be on bytes rather than on parsed values — plus the notes ref, the
+pending-state directory and the store. It also runs *mixed*: pre hook under
+one build, post hook under the other, which is what happens the moment a
+machine switches over mid-session; that is why the pending file's name and
+JSON shape are part of the contract between the two. With `LOCH_CORPUS=1`
+it adds the one hook path that reads a transcript (recovering a call id
+when the payload lacks one) on 150 of this machine's real sessions by
+default; their content exists only in a temp directory, failures name
+session ids, and it asserts a note was written so that two builds agreeing
+on nothing can't pass. Mutating the Rust (a wrong `captured` value, a
+loosened time bound, a corrupted signing key) fails it; that was checked.
+
+**`loch hook` is ported, and costs 3ms a call instead of ~73ms.** Measured
+with `rust/bench/hook.py` against the `uv tool` install: pre-tool 72.9 →
+3.1ms, post-tool with no commit 72.4 → 3.1ms, post-tool writing a note
+98.5 → 27.3ms (median of 60). The hooks run twice per agent shell command,
+so that is ~145ms of every Bash call down to ~6ms. Python's cost was ~50ms
+of imports — `importlib.metadata` alone is 19ms — and ~8ms per `git`
+process, of which the hot path ran two.
+
+Getting under the git floor is the fast path in `git.rs`: the two
+questions asked on every call — where is the git directory, what is HEAD —
+are answered by reading `.git` (including a worktree's `gitdir:` file,
+`commondir`, loose and packed refs) instead of spawning git. It answers
+only on layouts it fully understands and returns "ask git" for anything
+else: any discovery-changing `GIT_*` variable, reftable, a repository owned
+by another user (git's `safe.directory` would refuse it), a cwd inside
+`.git`, an unparseable ref, and Windows outright. **A gap there may only
+ever cost speed, never a different answer**, which the harness checks by
+having reftable, `GIT_DIR`, worktree, packed-refs, detached, unborn and
+symlinked-subdirectory scenarios. The note-writing path still runs `git log`
+and `git notes`, which is the remaining 24ms; it runs only when a call
+actually committed.
+
+**S3 in Rust is SigV4 by hand over `ureq`/rustls**, not the AWS SDK — one
+signed PUT doesn't justify an async runtime and several MB. Its credential
+chain is `AWS_*` variables, then the shared credentials and config files for
+`AWS_PROFILE`; **SSO, `credential_process`, assumed roles and instance
+metadata are not read**, so a machine relying on them keeps the Python
+hook for now. The signer is pinned to AWS's published worked example, and
+the harness runs both builds against a moto server with IAM auth on, so a
+bad signature is refused rather than waved through. moto's verifier itself
+rejects boto3's correct signatures on keys holding a space or `+`, and on a
+`ListObjectsV2` prefix holding `/`; the test works around both, and a
+failure that looks like a signing bug in exactly those cases is moto's.
+A stop hook against a store that doesn't answer gives up after 20s rather
+than holding the turn.
+
+### Packaging
+
+**npm, the way Claude Code is shipped:** `@ness-dev/loch` with
+`optionalDependencies` on `@ness-dev/loch-{darwin,linux,win32}-{arm64,x64}`,
+each declaring `os`/`cpu` and holding one binary, so npm installs only the
+host's. `npm/platforms.json` is the target-triple → package map,
+`npm/assemble.mjs` lays out a release's packages from built binaries, and
+`.github/workflows/rust-binaries.yml` (manual, publish-free, **never run**)
+builds all six targets and assembles them. Assembling, `npm pack` and a
+global install were dry-run locally for darwin-arm64.
+
+Linux binaries are static musl, so one package per architecture serves
+glibc and musl alike. That is a deliberate difference from Claude Code's
+packages, and Ness's resolver adds `-musl` on musl hosts, so it must not do
+that for loch.
+
+**Embedders spawn the platform binary, never a Node shim.** Measured: going
+through the wrapper's Node launcher costs ~24ms a call (27ms against 3ms),
+which hands most of the port's win back on every hook. So `index.js`
+exports `binaryPath()` — the same `createRequire` + `app.asar` →
+`app.asar.unpacked` resolution Ness already uses for Claude Code — and an
+Electron app must `asarUnpack` `**/node_modules/@ness-dev/loch-*/**`. For a
+global `npm install -g`, the postinstall replaces `bin/loch` with a hardlink
+to the native binary, so the `loch` on PATH is the binary itself; with
+`--ignore-scripts`, or on Windows where npm runs bins through a `.cmd`
+wrapper anyway, the shim remains and still works. For hooks, Ness
+should write the binary's absolute path with `loch install --local
+--command <path>` (settings.local.json, since the path is machine-specific)
+rather than rely on PATH.
+
+**`uv tool install` users** have a working install of the reference, so
+nothing changes for them until the port is complete. The intended switch is
+to ship the Rust binary as platform wheels too — maturin's `bindings =
+"bin"`, the way ruff and uv ship — attached to the GitHub release next to
+today's pure-Python wheel, so the switch is the same `uv tool install
+--force <wheel URL>` people already run. Platform wheels make that URL
+per-platform. `uv tool install loch --find-links
+https://github.com/ness-dev/loch/releases/expanded_assets/<tag>` would let uv
+pick the right one without PyPI, **but it hasn't been tried** against a real
+release page. Until then, a `uv tool` install and an npm global install both
+put a `loch` on PATH and whichever comes first wins; the settings files
+written by `install` name `loch`, so it is PATH order that decides which
+build the hooks run. That is fine while the two are equivalent, which is
+what the harness is for.
 
 ## State
 
@@ -710,6 +842,14 @@ input's `tool_use_id` is used when present and otherwise recovered from the
 transcript by command; which one current Claude Code sends hasn't been
 observed, since hooks only load at session start.
 
+**Squash merges drop every note today**, and that is a requirement to fix,
+not a workflow to avoid: loch has to support squash transparently in any
+repository that installs it. It bit #2 — its commits' notes now annotate
+commits `main` doesn't contain. A note annotates one object id, and a
+squash makes a new commit from many, so nothing carries them. The design is
+pending review: see the squash proposal in the conversation of the
+`rust-rewrite` branch, which is to be recorded here once settled.
+
 The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
 `LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are
 simply no longer read. That was chosen because nothing had been released and
@@ -749,7 +889,13 @@ agree is a one-line property test.
 
 - Verify before committing: `poetry run ruff check`,
   `poetry run ruff format --check`, `poetry run mypy .`, and
-  `poetry run pytest`.
+  `poetry run pytest`. Touching `rust/` adds `cargo fmt --check`,
+  `cargo clippy --release --all-targets -- -D warnings`, `cargo test` there,
+  and `LOCH_RUST=rust/target/release/loch poetry run pytest
+  test/test_equivalence.py` after a `cargo build --release`.
+- A command is ported when the harness covers it, not when it compiles. Port
+  behaviour exactly, quirks included, and fix a quirk in Python first if it
+  is a bug, so the reference stays the reference.
 - Commit coherent changes as you go rather than batching.
 - **Every command must be fully drivable by a program that never reads the
   human text.** A new command isn't finished until `--json` covers it —

@@ -1,0 +1,8 @@
+{
+  "aarch64-apple-darwin": { "package": "@ness-dev/loch-darwin-arm64", "os": "darwin", "cpu": "arm64", "bin": "loch" },
+  "x86_64-apple-darwin": { "package": "@ness-dev/loch-darwin-x64", "os": "darwin", "cpu": "x64", "bin": "loch" },
+  "aarch64-unknown-linux-musl": { "package": "@ness-dev/loch-linux-arm64", "os": "linux", "cpu": "arm64", "bin": "loch" },
+  "x86_64-unknown-linux-musl": { "package": "@ness-dev/loch-linux-x64", "os": "linux", "cpu": "x64", "bin": "loch" },
+  "aarch64-pc-windows-msvc": { "package": "@ness-dev/loch-win32-arm64", "os": "win32", "cpu": "arm64", "bin": "loch.exe" },
+  "x86_64-pc-windows-msvc": { "package": "@ness-dev/loch-win32-x64", "os": "win32", "cpu": "x64", "bin": "loch.exe" }
+}

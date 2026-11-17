@@ -1,0 +1,12 @@
+{
+  "name": "@ness-dev/loch",
+  "version": "0.0.0",
+  "description": "Save and restore agent coding sessions across machines",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/ness-dev/loch.git" },
+  "main": "index.js",
+  "bin": { "loch": "bin/loch" },
+  "scripts": { "postinstall": "node install.js" },
+  "files": ["index.js", "install.js", "platforms.json", "bin/loch"],
+  "optionalDependencies": {}
+}

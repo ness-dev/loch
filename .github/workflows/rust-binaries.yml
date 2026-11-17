@@ -1,0 +1,73 @@
+name: rust-binaries
+
+# Builds the Rust binary for every npm platform and assembles the npm packages
+# as an artifact. Manual and publish-free on purpose: it has never run, and the
+# release path it will eventually join must not inherit an untested job. Fold
+# it into release.yml once a run has produced binaries that pass the harness.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to stamp into the npm packages"
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # musl, statically linked: one binary per architecture runs on any
+          # distribution, glibc or not, which is why npm has no -musl packages.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+      # ring compiles C, and a static musl build needs musl's own compiler.
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check a Linux binary really is static
+        if: matrix.musl
+        run: |
+          file target/${{ matrix.target }}/release/loch
+          file target/${{ matrix.target }}/release/loch | grep -q "statically linked"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loch-${{ matrix.target }}
+          path: rust/target/${{ matrix.target }}/release/loch${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+      - name: Assemble the npm packages
+        run: |
+          args=()
+          for dir in binaries/loch-*; do
+            target=${dir#binaries/loch-}
+            args+=("$target=$(ls "$dir"/loch*)")
+          done
+          node npm/assemble.mjs "${{ inputs.version }}" dist/npm "${args[@]}"
+          for pkg in dist/npm/@ness-dev/*; do (cd "$pkg" && npm pack --pack-destination ../../..); done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/*.tgz

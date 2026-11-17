@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// Only used until install.js swaps in the native binary, or on Windows.
+"use strict";
+
+const { spawnSync } = require("child_process");
+const { binaryPath } = require("../index.js");
+
+const result = spawnSync(binaryPath(), process.argv.slice(2), { stdio: "inherit" });
+if (result.error) {
+  process.stderr.write(`loch: ${result.error.message}\n`);
+  process.exit(1);
+}
+process.exit(result.status === null ? 1 : result.status);

@@ -18,7 +18,7 @@ import os
 import subprocess
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -552,7 +552,11 @@ def commit_calls(path: str) -> list[Call]:
     return calls
 
 
-def backfill(cwd: str, revision: str = "HEAD") -> list[tuple[str, Call]]:
+def backfill(
+    cwd: str,
+    revision: str = "HEAD",
+    progress: Callable[[int, int, int, int], None] | None = None,
+) -> list[tuple[str, Call]]:
     """Links commits made before the hooks existed, accepting only an exact
     match: one Bash call whose command contains the commit's subject line and
     whose run brackets the commit's timestamp. A commit with no such call, or
@@ -573,22 +577,35 @@ def backfill(cwd: str, revision: str = "HEAD") -> list[tuple[str, Call]]:
         return []
 
     subjects = {subject for _, _, subject in pending}
-    calls: list[Call] = []
+    # Listed and sized up front so progress has a real total: reading every
+    # transcript on the machine is the whole cost (~25s on 750MB).
+    transcripts: list[tuple[str, int]] = []
     root = projects_dir()
     for project in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         directory = os.path.join(root, project)
         if not os.path.isdir(directory):
             continue
         for name in sorted(os.listdir(directory)):
-            if not name.endswith(".jsonl"):
-                continue
-            path = os.path.join(directory, name)
-            try:
-                raw = Path(path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if "git commit" in raw and any(subject in raw for subject in subjects):
-                calls.extend(commit_calls(path))
+            if name.endswith(".jsonl"):
+                path = os.path.join(directory, name)
+                try:
+                    transcripts.append((path, os.path.getsize(path)))
+                except OSError:
+                    continue
+    total_bytes = sum(size for _, size in transcripts)
+
+    calls: list[Call] = []
+    read = 0
+    for done, (path, size) in enumerate(transcripts, 1):
+        read += size
+        try:
+            raw = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = ""
+        if "git commit" in raw and any(subject in raw for subject in subjects):
+            calls.extend(commit_calls(path))
+        if progress is not None:
+            progress(done, len(transcripts), read, total_bytes)
 
     linked: list[tuple[str, Call]] = []
     for sha, stamps, subject in pending:

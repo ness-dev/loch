@@ -1078,6 +1078,33 @@ def command_ask(argv: list[str]) -> Result:
     os.execvp("claude", command)
 
 
+def _progress_meter() -> Callable[[int, int, int, int], None] | None:
+    """A one-line counter on stderr, for a person watching a terminal only.
+
+    JSON mode keeps stderr empty, and a pipe or log file would get every
+    redraw as garbage, so both get nothing.
+    """
+    if JSON_FLAG in sys.argv or not sys.stderr.isatty():
+        return None
+    last = [0.0]
+
+    def meter(done: int, total: int, read: int, size: int) -> None:
+        now = time.monotonic()
+        if done < total and now - last[0] < 0.1:
+            return
+        last[0] = now
+        percent = 100 * read // size if size else 100
+        sys.stderr.write(
+            f"\rscanning transcripts {done}/{total} "
+            f"({format_bytes(read)} of {format_bytes(size)}, {percent}%)\033[K"
+        )
+        if done == total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    return meter
+
+
 def command_backfill(argv: list[str]) -> Result:
     parser = _parser("backfill")
     parser.add_argument("--cwd")
@@ -1087,7 +1114,7 @@ def command_backfill(argv: list[str]) -> Result:
 
     with trace_errors():
         root = repo_root(args.cwd or os.getcwd())
-        linked = backfill(root, args.revision)
+        linked = backfill(root, args.revision, _progress_meter())
     rows = [
         {"commit": sha, "session": call.session_id, "call": call.call}
         for sha, call in linked

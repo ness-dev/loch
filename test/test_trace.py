@@ -216,8 +216,11 @@ def test_backfill_links_only_an_exact_match(env: dict[str, Path]) -> None:
     unnamed = commit(repo, "c.txt", "c\n", "add c", date="2026-01-01T00:00:15Z")
     transcript(repo, 'git add a.txt && git commit -m "add a"')
 
-    linked = backfill(str(repo), "HEAD")
+    seen: list[tuple[int, int, int, int]] = []
+    linked = backfill(str(repo), "HEAD", lambda *step: seen.append(step))
     assert [sha for sha, _ in linked] == [inside]
+    # One step per transcript, ending with everything read.
+    assert seen and seen[-1][0] == seen[-1][1] and seen[-1][2] == seen[-1][3] > 0
     note = read_note(str(repo), inside)
     assert note is not None and note["captured"] == "backfill"
     assert read_note(str(repo), outside) is None

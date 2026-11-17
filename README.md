@@ -89,6 +89,10 @@ loch blame loch/format.py
 #                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
 loch blame --html loch/format.py   # the whole file in a browser, tinted by conversation
 
+loch log loch/format.py:105        # every conversation that ever changed line 105
+loch log loch/format.py:90-120     # ...or a range, followed through edits and moves
+loch log loch/format.py            # ...or the whole file, followed through renames
+
 loch ask loch/format.py:105 "why not just json.dumps?"
 # forks the conversation that wrote line 105 and resumes it in Claude Code,
 # from where it ended; --at-commit stops it just after the commit instead

@@ -14,6 +14,7 @@ import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
@@ -78,6 +79,7 @@ from .trace import (
     blame_hunks,
     fork_session,
     git,
+    history,
     hook_post_tool,
     hook_pre_tool,
     install_hooks,
@@ -102,6 +104,7 @@ Usage:
   loch install  [--local] [--command <loch>]
   loch blame   <file> [--html [<path>] [--lines <ranges>] [--no-open]]
                [--store <uri>]
+  loch log     <file>[:<line>[-<end>]] [--store <uri>]
   loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
                [--store <uri>]
   loch backfill [--revision <rev>]   (default: every branch)
@@ -125,7 +128,8 @@ Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 `install` adds Claude Code hooks to a repository that note, on every commit an
 agent makes, the conversation and tool call that made it (git notes on
 refs/notes/loch), and snapshot each session's transcript into the store.
-`blame` shows which conversation wrote each line; `ask` forks that
+`blame` shows which conversation wrote each line, `log` every conversation
+that changed a file or line range over its history; `ask` forks that
 conversation and resumes it in Claude Code — from its end, or with
 --at-commit from just after the commit.
 """
@@ -911,6 +915,91 @@ def _hunks_text(file: str, hunks: list[Any], links: dict[str, Link | None]) -> s
     return "".join(lines)
 
 
+def _history_target(target: str) -> tuple[str, tuple[int, int] | None]:
+    """`file`, `file:105` or `file:100-120`; a path that exists wins outright."""
+    if os.path.exists(target):
+        return target, None
+    file, _, span = target.rpartition(":")
+    start, _, end = span.partition("-")
+    if not file or not start.isdigit() or (end and not end.isdigit()):
+        fail("usage", f"{target} is neither a file nor <file>:<line>[-<end>]")
+    first, last = int(start), int(end) if end else int(start)
+    if first < 1 or last < first:
+        fail("usage", f"{span} is not a line range")
+    return file, (first, last)
+
+
+def command_log(argv: list[str]) -> Result:
+    parser = _parser("log")
+    parser.add_argument("target")
+    parser.add_argument("--store")
+    args = parser.parse_args(argv)
+
+    file, lines = _history_target(args.target)
+    cwd = os.path.dirname(os.path.abspath(file)) or os.getcwd()
+    with trace_errors():
+        root = repo_root(cwd)
+        relative = os.path.relpath(os.path.abspath(file), root)
+        if lines is not None:
+            # -L past the end is a fatal git error with a worse message.
+            length = max((hunk.end for hunk in blame_hunks(root, relative)), default=0)
+            if lines[1] > length:
+                fail("usage", f"{file} has {length} lines, not {lines[1]}")
+        changes = history(root, relative, lines)
+    resolver = Resolver(root, _store_or_none(args.store))
+
+    # Grouped the way blame marks them — per request, not per session — and
+    # in order of most recent change, since "who touched this last" is the
+    # question a history is usually opened to answer.
+    conversations: list[dict[str, Any]] = []
+    keyed: dict[tuple[str, str], dict[str, Any]] = {}
+    entries: list[dict[str, Any]] = []
+    text = []
+    for change in changes:
+        link = resolver.resolve(change.commit)
+        when = datetime.fromtimestamp(change.time, timezone.utc)
+        entries.append(
+            {
+                "commit": change.commit,
+                "time": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "summary": change.summary,
+                "conversation": link.payload() if link is not None else None,
+            }
+        )
+        text.append(
+            f"  {change.commit[:7]}  {when:%Y-%m-%d}  {change.summary[:60]}\n"
+            f"  {'':7}  {'':10}  {_link_text(link)}\n"
+        )
+        if link is None:
+            continue
+        key = (link.session_id, link.prompt or link.call)
+        if key not in keyed:
+            keyed[key] = {**link.payload(), "commits": []}
+            conversations.append(keyed[key])
+        keyed[key]["commits"].append(change.commit)
+
+    span = (
+        ""
+        if lines is None
+        else (f":{lines[0]}" if lines[0] == lines[1] else f":{lines[0]}-{lines[1]}")
+    )
+    header = (
+        f"{file}{span}: {len(changes)} commit(s) from "
+        f"{len(conversations)} conversation(s), newest first\n"
+    )
+    footer = "\nfollow one up with: loch ask <commit>\n" if conversations else ""
+    return Result(
+        command="log",
+        payload={
+            "file": file,
+            "lines": None if lines is None else {"start": lines[0], "end": lines[1]},
+            "conversations": conversations,
+            "commits": entries,
+        },
+        text=header + "".join(text) + footer,
+    )
+
+
 def _resolve_commit(root: str, target: str) -> str:
     file, _, line = target.rpartition(":")
     if file and line.isdigit() and os.path.exists(file):
@@ -1049,6 +1138,7 @@ COMMANDS: dict[str, Callable[[list[str]], Result]] = {
     "install": command_install,
     "blame": command_blame,
     "ask": command_ask,
+    "log": command_log,
     "backfill": command_backfill,
     "hook": command_hook,
     "help": command_help,

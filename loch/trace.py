@@ -377,6 +377,33 @@ def blame_hunks(cwd: str, path: str) -> list[Hunk]:
 
 
 @dataclass(frozen=True)
+class Change:
+    commit: str
+    time: int
+    summary: str
+
+
+def history(cwd: str, path: str, lines: tuple[int, int] | None = None) -> list[Change]:
+    """Every commit that touched `path` (or just `lines` of it), newest first.
+
+    `-L` follows the range through edits above it and through moves; a whole
+    file follows renames. Both are git's own tracking, so this answers "which
+    commits shaped these lines" exactly as `git log` would.
+    """
+    scope = (
+        ["-L", f"{lines[0]},{lines[1]}:{path}"]
+        if lines is not None
+        else ["--follow", "--", path]
+    )
+    output = git(cwd, "log", "-s", "--format=%x1e%H%x1f%ct%x1f%s", *scope)
+    changes = []
+    for record in output.split("\x1e")[1:]:
+        commit, time, summary = record.strip("\n").split("\x1f", 2)
+        changes.append(Change(commit, int(time), summary.split("\n", 1)[0]))
+    return changes
+
+
+@dataclass(frozen=True)
 class Link:
     """A commit resolved to the conversation turn that made it."""
 

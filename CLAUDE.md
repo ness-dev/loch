@@ -151,7 +151,7 @@ loch/
 ├── format.py    # loch format: canonical JSON, turn and content ids, derived files
 ├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
 ├── index.py     # store key layout, derived index entries, delete and reindex
-├── trace.py     # commit -> conversation notes, hooks, blame, backfill, ask's fork
+├── trace.py     # commit -> conversation notes, hooks, blame, log, backfill, ask's fork
 ├── blame_html.py # `blame --html`: self-contained page, no external assets
 ├── git.py       # current branch of a checkout, for the list default
 ├── output.py    # result envelope, the two renderers, structured failures
@@ -487,7 +487,7 @@ never a code. The set today:
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
 | `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
-| `not-a-repository` | `install`/`blame`/`ask`/`backfill` outside a git repository |
+| `not-a-repository` | `install`/`blame`/`log`/`ask`/`backfill` outside a git repository |
 | `not-linked` | `ask` on a commit with no conversation note, or an uncommitted line |
 | `transcript-missing` | the note exists but the transcript is in neither Claude's directory nor the store |
 | `call-not-found` | the transcript has no result for the noted tool call |

@@ -250,6 +250,42 @@ def test_blame_names_the_prompt_behind_each_line(
     assert hunks[1]["conversation"]["turn"].startswith("sha256:")
 
 
+def test_log_finds_conversations_blame_has_painted_over(
+    env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = env["repo"]
+    first = commit(repo, "f.txt", "one\nother\n", "by hand")
+    transcript(repo, "git commit -am 'agent'", prompt="reword line one")
+    hook_pre_tool(event(repo))
+    agent = commit(repo, "f.txt", "uno\nother\n", "agent")
+    hook_post_tool(event(repo))
+    last = commit(repo, "f.txt", "ONE\nother\n", "by hand again")
+    commit(repo, "f.txt", "ONE\nelse\n", "only line two")
+
+    def log(target: str) -> dict[str, Any]:
+        monkeypatch.setattr("sys.argv", ["loch", "log", target, "--json"])
+        main()
+        result: dict[str, Any] = json.loads(capsys.readouterr().out)
+        return result
+
+    monkeypatch.chdir(repo)
+    # blame of line 1 sees only `last`; its history still holds the agent.
+    line = log("f.txt:1")
+    assert [c["commit"] for c in line["commits"]] == [last, agent, first]
+    assert [c["conversation"] is None for c in line["commits"]] == [True, False, True]
+    assert line["lines"] == {"start": 1, "end": 1}
+    assert [c["prompt"] for c in line["conversations"]] == ["reword line one"]
+    assert line["conversations"][0]["commits"] == [agent]
+    assert len(log("f.txt")["commits"]) == 4
+
+    monkeypatch.setattr("sys.argv", ["loch", "log", "f.txt:9", "--json"])
+    with pytest.raises(SystemExit):
+        main()
+    assert json.loads(capsys.readouterr().out)["code"] == "usage"
+
+
 def test_fork_cuts_after_the_whole_round_and_leaves_the_original(
     env: dict[str, Path],
 ) -> None:

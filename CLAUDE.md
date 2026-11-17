@@ -92,7 +92,12 @@ These were verified by experiment, not documentation, and are not stable
 public API. Re-verify if something breaks.
 
 - Sessions live at
-  `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+  `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, or under
+  `$CLAUDE_CONFIG_DIR/projects` when that is set (how one machine runs
+  several accounts). loch follows the same rule and only that rule —
+  never both places — since a restore filed anywhere Claude doesn't look
+  is a session `--resume` can't find. `claude.config_dir` is the one place
+  it's decided.
 - The encoding is `re.sub(r"[^a-zA-Z0-9]", "-", cwd)` — every
   non-alphanumeric character, not just slashes.
 - The cwd is **symlink-resolved first**, so `/tmp/x` is stored as

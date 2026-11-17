@@ -34,6 +34,7 @@ from .claude import (
     home_dir,
     iso_timestamp,
     list_sessions,
+    projects_dir,
     resolve_cwd,
     transcript_path_for,
 )
@@ -122,6 +123,7 @@ Environment:
   LOCH_STORE        default store URI
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override
+  CLAUDE_CONFIG_DIR Claude Code's state directory (default ~/.claude)
 
 Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 
@@ -1038,7 +1040,7 @@ def command_ask(argv: list[str]) -> Result:
             fail(
                 "transcript-missing",
                 f"session {link.session_id} is linked but its transcript is "
-                "neither in ~/.claude/projects nor in the store",
+                f"neither in {projects_dir()} nor in the store",
             )
         fork = fork_session(
             link.transcript,

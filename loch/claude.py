@@ -41,8 +41,22 @@ def iso_timestamp(seconds: float) -> str:
     return f"{moment.strftime('%Y-%m-%dT%H:%M:%S')}.{moment.microsecond // 1000:03d}Z"
 
 
+def config_dir(home: str | None = None) -> str:
+    """Where Claude Code keeps its state: `CLAUDE_CONFIG_DIR` when set, which
+    is how one machine runs several accounts, else `~/.claude`. Only the
+    variable is consulted, never both places, because that is the rule Claude
+    itself follows — a restore filed anywhere else is one `--resume` can't
+    find. An explicit `home` names another machine's layout and ignores it."""
+    if home is None:
+        configured = os.environ.get("CLAUDE_CONFIG_DIR")
+        if configured:
+            return configured
+        home = home_dir()
+    return os.path.join(home, ".claude")
+
+
 def projects_dir(home: str | None = None) -> str:
-    return os.path.join(home if home is not None else home_dir(), ".claude", "projects")
+    return os.path.join(config_dir(home), "projects")
 
 
 def resolve_cwd(cwd: str) -> str:

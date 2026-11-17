@@ -9,6 +9,7 @@ from loch.claude import (
     encode_cwd,
     encode_path,
     list_sessions,
+    projects_dir,
     read_session_meta,
     resolve_cwd,
     session_dir_for,
@@ -262,3 +263,16 @@ def test_lists_and_filters_sessions(tmp_path: Path) -> None:
     assert [meta.session_id for meta in by_id] == ["one"]
 
     assert list_sessions(cwd="/Users/mike/other", home=str(tmp_path)) == []
+
+
+def test_claude_config_dir_replaces_the_home_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "work-account"))
+    assert projects_dir() == str(tmp_path / "work-account" / "projects")
+    # An explicit home names some other machine's layout, where this
+    # machine's variable means nothing.
+    assert projects_dir("/home/other") == "/home/other/.claude/projects"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+    assert projects_dir() == str(tmp_path / "home" / ".claude" / "projects")

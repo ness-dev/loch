@@ -1,6 +1,8 @@
 import gzip
 import hashlib
 import json
+import struct
+import zlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,11 +62,26 @@ def _bundle_to_json(bundle: Bundle) -> dict[str, Any]:
     }
 
 
+# The gzip header, written out rather than left to gzip.compress: from 3.11
+# that delegates to zlib, which stamps its own OS byte (19 on macOS, 3 on
+# Linux) where 3.10 wrote 255. The ref is a hash of these bytes, so the same
+# sessions got a different ref per platform and per Python. Fixed at 255
+# ("unknown"), which is what 3.10 always produced; XFL 2 is level 9.
+GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
+
+
+def gzip_deterministic(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS, 8, 0)
+    body = compressor.compress(data) + compressor.flush()
+    trailer = struct.pack("<II", zlib.crc32(data), len(data) & 0xFFFFFFFF)
+    return GZIP_HEADER + body + trailer
+
+
 def pack_bundle(bundle: Bundle) -> bytes:
     encoded = json.dumps(
         _bundle_to_json(bundle), separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
-    return gzip.compress(encoded, compresslevel=9, mtime=0)
+    return gzip_deterministic(encoded)
 
 
 def unpack_bundle(data: bytes) -> Bundle:

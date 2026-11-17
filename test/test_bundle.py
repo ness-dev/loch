@@ -1,3 +1,6 @@
+import gzip
+import hashlib
+
 import pytest
 
 from loch.bundle import (
@@ -71,3 +74,15 @@ def test_rejects_an_unsupported_version() -> None:
     )
     with pytest.raises(ValueError, match="unsupported bundle version 2"):
         unpack_bundle(packed)
+
+
+def test_packing_matches_python_310_on_every_platform() -> None:
+    from loch.bundle import gzip_deterministic
+
+    data = b'{"a":"' + b"xyz" * 5000 + b'"}'
+    packed = gzip_deterministic(data)
+    # What 3.10's gzip.compress(data, 9, mtime=0) produced, OS byte 255
+    # included; 3.12 on macOS writes 19 there and Linux 3.
+    assert packed[:10].hex() == "1f8b08000000000002ff"
+    assert hashlib.sha256(packed).hexdigest()[:16] == "405552bff938ef58"
+    assert gzip.decompress(packed) == data

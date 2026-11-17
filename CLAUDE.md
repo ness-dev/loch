@@ -847,8 +847,7 @@ not a workflow to avoid: loch has to support squash transparently in any
 repository that installs it. It bit #2 — its commits' notes now annotate
 commits `main` doesn't contain. A note annotates one object id, and a
 squash makes a new commit from many, so nothing carries them. The design is
-pending review: see the squash proposal in the conversation of the
-`rust-rewrite` branch, which is to be recorded here once settled.
+pending review and gets recorded here once settled.
 
 The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
 `LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are

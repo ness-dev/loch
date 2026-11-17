@@ -187,6 +187,11 @@ itself for `list`/`reindex` and `s3:DeleteObject` for `delete`.
 | `LOCH_S3_ENDPOINT` | custom endpoint for R2, MinIO, Backblaze, ... |
 | `LOCH_S3_REGION` | region override |
 
+These were `LOCHY_*` before the rename, and the default store was
+`~/.lochy/store`. The old names are not read, so an old variable is silently
+ignored rather than rejected — rename it, and `mv ~/.lochy ~/.loch` to keep
+existing bundles visible.
+
 `loch ingest` converts sessions into the loch conversation format (see
 [SPEC.md](SPEC.md)) and writes one derived file per session to
 `~/.loch/derived`, or `--out <dir>`.

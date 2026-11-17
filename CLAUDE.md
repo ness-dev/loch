@@ -705,11 +705,20 @@ input's `tool_use_id` is used when present and otherwise recovered from the
 transcript by command; which one current Claude Code sends hasn't been
 observed, since hooks only load at session start.
 
+The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
+`LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are
+simply no longer read. That was chosen because nothing had been released and
+no consumer set the old variables — but the failure it leaves is the silent
+kind, so it is worth knowing about: a stale `LOCHY_STORE=s3://...` makes
+`save` succeed into the local default with `ok: true`, and an unmoved
+`~/.lochy` makes `list --remote` an empty, healthy-looking answer. If a
+shim is ever wanted, the shape is to read `LOCH_*` first, fall back to the
+old name, and warn on stderr in text mode only.
+
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the
-obvious next one, and the layout takes it without a migration), any git
-integration (no notes, no PR-level pointers), and no adapters beyond
-Claude Code.
+obvious next one, and the layout takes it without a migration), PR-level
+git pointers for bundles, and no adapters beyond Claude Code.
 `restore` still needs a full 64-character ref — the index makes refs
 discoverable, but nothing resolves a prefix.
 

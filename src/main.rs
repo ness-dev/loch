@@ -1,33 +1,9 @@
-//! The Rust build of loch: one static binary for Ness, the VS Code extension
-//! and the Claude Code hooks to ship. The Python package is the reference;
-//! `test/test_equivalence.py` holds every command here to its output and side
-//! effects.
+//! `loch`: one static binary for Ness, the VS Code extension and the Claude
+//! Code hooks to ship.
 
-// The error path is cold and runs once per process; boxing it buys nothing.
-#![allow(clippy::result_large_err)]
 
-mod argparse;
-mod blame_html;
-mod bundle;
-mod claude;
-mod cli;
-mod format;
-mod git;
-mod hook;
-mod index;
-mod ingest;
-mod json;
-mod output;
-mod py;
-mod redact;
-mod rewrite;
-mod s3;
-mod store;
-mod sys;
-mod trace;
-
-use cli::Failure;
-use output::{emit, emit_error, CommandError, Outcome, JSON_FLAG};
+use loch::cli::{self, Failure};
+use loch::output::{emit, emit_error, CommandError, Outcome, JSON_FLAG};
 
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
@@ -67,8 +43,7 @@ fn main() {
             emit(outcome, as_json);
         }
         Err(Failure::Error(error)) => emit_error(&command, error, as_json),
-        // Python prints a traceback here, which is the one thing a consumer
-        // can't parse; JSON mode gets the same `internal` document.
+        // A bug in this process rather than a failure a caller can act on.
         Err(Failure::Internal(message)) => {
             let mut error = CommandError::new("internal", message.clone());
             if !as_json {

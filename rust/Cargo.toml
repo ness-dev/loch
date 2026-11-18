@@ -18,6 +18,9 @@ indexmap = "2"
 # Python's `re` has lookarounds, which the `regex` crate deliberately lacks;
 # fancy-regex adds them and hands everything else to `regex`.
 fancy-regex = "0.14"
+# Linear-time search for the redaction rules once their lookarounds are
+# checked by hand; see redact.rs.
+regex = "1"
 # zlib itself, built from source and linked statically: the ref is a hash of
 # the gzip bytes, and only zlib's own deflate reproduces zlib's output.
 # miniz_oxide (flate2's default) compresses differently.

@@ -294,6 +294,32 @@ def digest_of(value: Any) -> str:
     return hashlib.sha256(repr(value).encode()).hexdigest()[:16]
 
 
+def quiet_difference(py: Any, rs: Any) -> str:
+    """Where two observations part, by position and hash only: safe to print
+    when they were made from real transcripts."""
+    py_runs, py_seen = py
+    rs_runs, rs_seen = rs
+    for index, (a, b) in enumerate(zip(py_runs, rs_runs)):
+        for stream in ("stdout", "stderr", "status"):
+            x, y = a[stream], b[stream]
+            if x != y:
+                if isinstance(x, bytes) and isinstance(y, bytes):
+                    at = next(
+                        (i for i, (p, q) in enumerate(zip(x, y)) if p != q),
+                        min(len(x), len(y)),
+                    )
+                    return f"run {index} {stream}: lengths {len(x)}/{len(y)}, first difference at byte {at}"
+                return f"run {index} {stream}: {x!r} != {y!r}"
+    only_py = sorted(set(py_seen) - set(rs_seen))
+    only_rs = sorted(set(rs_seen) - set(py_seen))
+    if only_py or only_rs:
+        return f"{len(only_py)} files only in py, {len(only_rs)} only in rs"
+    for key in py_seen:
+        if py_seen[key] != rs_seen[key]:
+            return f"{key}: py {digest_of(py_seen[key])} rs {digest_of(rs_seen[key])}"
+    return "no difference"
+
+
 def first_difference(py: Any, rs: Any) -> str:
     """Where two observations part, named by run index or file path. File
     contents are reported by hash: a scenario's files are synthetic, but the
@@ -351,6 +377,6 @@ def twin(
         outcomes.append(normalized(runs, seen))
     if outcomes[0] != outcomes[1]:
         if quiet:
-            raise AssertionError("builds differ (details withheld: real transcripts)")
+            raise AssertionError(quiet_difference(outcomes[0], outcomes[1]))
         raise AssertionError(first_difference(outcomes[0], outcomes[1]))
     return raw_seen[0]

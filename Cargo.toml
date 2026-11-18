@@ -1,7 +1,5 @@
 [package]
 name = "loch"
-# Kept equal to pyproject's version by release.sh: both implementations answer
-# `loch --version`, and they must not disagree while both ship.
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"

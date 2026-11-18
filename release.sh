@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cut a release. Bumps the version, verifies, tags, and pushes; CI builds the
-# wheel and publishes the GitHub release from the tag.
+# Cut a release. Bumps the version, verifies, tags, and pushes; CI builds every
+# platform's binary and publishes the GitHub release from the tag.
 #
 #   ./release.sh 0.2.0
 #   DRY_RUN=1 ./release.sh 0.2.0     rehearse without committing or pushing
@@ -31,56 +31,33 @@ git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1 && die "$tag alre
 # The tag has to point at a commit containing the workflow that builds it: a
 # tag-triggered run uses the workflow file as of the tagged commit.
 echo "==> setting version to $version"
-python3 - "$version" <<'PY'
-import pathlib, re, sys
-path = pathlib.Path("pyproject.toml")
-text = path.read_text()
-new, count = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{sys.argv[1]}"', text, count=1)
-if count != 1:
-    raise SystemExit("release: could not find a single version line in pyproject.toml")
-path.write_text(new)
-PY
-grep -q "^version = \"$version\"$" pyproject.toml || die "version bump did not apply"
-# The Rust build answers `loch --version` too, and the two must agree.
-python3 - "$version" <<'PY'
-import pathlib, re, sys
-path = pathlib.Path("rust/Cargo.toml")
-text = path.read_text()
-new, count = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{sys.argv[1]}"', text, count=1)
-if count != 1:
-    raise SystemExit("release: could not find a single version line in rust/Cargo.toml")
-path.write_text(new)
-PY
-(cd rust && cargo update -q -w --offline 2>/dev/null || cargo update -q -w)
+# The first `version = ` line is the package's; dependency tables come later.
+sed -i.bak "1,/^version = \".*\"$/s/^version = \".*\"$/version = \"$version\"/" Cargo.toml
+rm -f Cargo.toml.bak
+grep -q "^version = \"$version\"$" Cargo.toml || die "version bump did not apply"
 
-# Not asserting `loch --version` here: it reads installed package metadata,
-# which still holds the old number until the bumped project is reinstalled.
-# The release workflow smoke-tests it against a freshly built wheel instead.
 echo "==> verifying"
-poetry run ruff check
-poetry run ruff format --check
-poetry run mypy .
-poetry run pytest -q
-(cd rust && cargo fmt --check && cargo clippy -q --release --all-targets -- -D warnings \
-  && cargo test -q --release && cargo build -q --release)
-LOCH_RUST=rust/target/release/loch poetry run pytest -q test/test_equivalence.py test/test_equivalence_commands.py
+cargo fmt --check
+cargo clippy -q --release --all-targets -- -D warnings
+cargo test -q --release
+[ "$(cargo run -q --release -- --version)" = "loch $version" ] || die "--version disagrees"
 
 echo "==> tagging $tag"
-# pyproject may already hold this version — the first release, or a re-cut after
-# a deleted tag. An empty commit fails under `set -e`, so tag what's there.
+# Cargo.toml may already hold this version — the first release, or a re-cut
+# after a deleted tag. An empty commit fails under `set -e`, so tag what's there.
 if [ -n "$(git status --porcelain)" ]; then
-  run git add pyproject.toml rust/Cargo.toml rust/Cargo.lock
+  run git add Cargo.toml Cargo.lock
   run git commit -m "release: $tag"
 else
-  echo "  pyproject is already at $version; tagging the current commit"
+  echo "  Cargo.toml is already at $version; tagging the current commit"
 fi
 run git tag -a "$tag" -m "$tag"
 run git push origin "$BRANCH"
 run git push origin "$tag"
 
 if [ -n "$DRY_RUN" ]; then
-  git checkout -- pyproject.toml rust/Cargo.toml rust/Cargo.lock
-  echo "==> dry run: versions restored, nothing pushed"
+  git checkout -- Cargo.toml Cargo.lock
+  echo "==> dry run: version restored, nothing pushed"
   exit 0
 fi
 
@@ -89,5 +66,5 @@ cat <<EOF
 
 released $tag
   watch:   https://github.com/$slug/actions
-  install: uv tool install https://github.com/$slug/releases/download/$tag/loch-$version-py3-none-any.whl
+  assets:  https://github.com/$slug/releases/tag/$tag
 EOF

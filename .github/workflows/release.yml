@@ -1,49 +1,108 @@
 name: release
 
+# A tag builds every platform's binary, attaches them to a GitHub release and
+# assembles the npm packages beside them. Run by hand (workflow_dispatch) it
+# does everything but publish, which is how to rehearse a release.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   test:
     uses: ./.github/workflows/test.yml
 
-  release:
+  build:
     needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # musl, statically linked: one binary per architecture runs on any
+          # distribution, glibc or not, which is why npm has no -musl packages.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v7
-      # setup-uv stopped publishing floating major tags after v7, so `@v10`
-      # resolves to nothing — it has to be a full version.
-      - uses: astral-sh/setup-uv@v10.0.1
 
-      # A mismatch would publish v0.2.0 as an asset named loch-0.1.0, and the
+      # A mismatch would publish v0.2.0 as assets named after 0.1.0, and the
       # install path is a pinned asset URL, so it is not something to discover
       # afterwards.
-      - name: Check the tag against the packaged version
+      - name: Check the tag against the crate version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          packaged=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          packaged=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           if [ "${GITHUB_REF_NAME#v}" != "$packaged" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not match pyproject version ${packaged}" >&2
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${packaged}" >&2
             exit 1
           fi
 
-      # py3-none-any, so one build serves every platform and there is no
-      # matrix here. The build is byte-reproducible; keep it that way.
-      - run: uv build
+      # ring compiles C, and a static musl build needs musl's own compiler.
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Check the wheel installs and runs
+      - name: Check a Linux binary really is static
+        if: matrix.musl
+        run: file target/${{ matrix.target }}/release/loch | grep -q "statically linked"
+
+      - name: Package
         run: |
-          python3 -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install --quiet dist/*.whl
-          test "$(/tmp/smoke/bin/loch --version)" = "loch ${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          name=loch-$version-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          bin=loch; [[ "${{ matrix.target }}" == *windows* ]] && bin=loch.exe
+          cp "target/${{ matrix.target }}/release/$bin" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          (cd dist && tar czf "$name.tar.gz" "$name")
+          echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
 
-      # Both artifacts: the wheel is what `uv tool install` points at, the
-      # sdist is what anyone building from source needs.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loch-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble the npm packages
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          args=()
+          for archive in artifacts/*.tar.gz; do
+            target=$(basename "$archive" .tar.gz); target=${target#loch-$version-}
+            mkdir -p "unpacked/$target"
+            tar xzf "$archive" -C "unpacked/$target" --strip-components 1
+            args+=("$target=$(ls "unpacked/$target"/loch*)")
+          done
+          node npm/assemble.mjs "$version" npm-dist "${args[@]}"
+          for pkg in npm-dist/@ness-dev/*; do (cd "$pkg" && npm pack --pack-destination "$GITHUB_WORKSPACE/artifacts"); done
+
+      - run: (cd artifacts && sha256sum * > SHA256SUMS)
+
+      # Rehearsals stop here, with everything built and checked. Publishing to
+      # npm needs the @ness-dev org and a token, and is not wired up yet.
       - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --generate-notes

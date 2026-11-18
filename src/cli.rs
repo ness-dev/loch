@@ -2,6 +2,7 @@
 //! and prose together — and `main` renders it.
 
 use crate::argparse::{Exit, Nargs, Parser};
+use crate::attribution::{self, EditRecord};
 use crate::blame_html;
 use crate::bundle::{self, Bundle, BundleOrigin, BundleSession, BUNDLE_VERSION};
 use crate::claude::{
@@ -10,15 +11,16 @@ use crate::claude::{
 use crate::format;
 use crate::index::{self, IndexEntry, IndexError, BRANCH};
 use crate::ingest::{self, Origin};
-use crate::json::{Map, Value};
+use crate::json::Value;
 use crate::object;
 use crate::output::{fail, CommandError, Outcome, JSON_FLAG};
 use crate::py;
 use crate::redact;
 use crate::rewrite::{self, ForeignCwd, RewriteSpec};
+use crate::snapshot;
 use crate::store::{create_store, resolve_store_uri, Store, StoreError};
 use crate::sys;
-use crate::trace::{self, Link, Resolver, TraceError, UNCOMMITTED};
+use crate::trace::{self, Link, Resolver, TraceError};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -113,11 +115,6 @@ pub fn format_bytes(count: u64) -> String {
 fn right(text: &str, width: usize) -> String {
     let len = py::len(text);
     format!("{}{}", " ".repeat(width.saturating_sub(len)), text)
-}
-
-fn left(text: &str, width: usize) -> String {
-    let len = py::len(text);
-    format!("{}{}", text, " ".repeat(width.saturating_sub(len)))
 }
 
 fn describe(meta: &SessionMeta) -> String {
@@ -701,8 +698,23 @@ pub fn command_reindex(argv: &[String]) -> Run {
     p.option("--store");
     let args = p.parse(argv)?;
     let store = open_store(args.str("store").as_deref())?;
-    let result = index::reindex(store.as_ref())
-        .map_err(|e| index_error(&format!("could not reindex {}", store.describe()), e))?;
+    let described = format!("could not reindex {}", store.describe());
+    let result = index::reindex(store.as_ref()).map_err(|e| index_error(&described, e))?;
+    // The file index, re-derived from the edit records the same way, with
+    // entries no record accounts for removed.
+    let stale: std::collections::BTreeSet<String> = store
+        .list(&index::dimension_prefix(attribution::FILE))
+        .map_err(|e| store_error(&described, e))?
+        .into_iter()
+        .collect();
+    let written: std::collections::BTreeSet<String> = attribution::reindex_files(store.as_ref())
+        .map_err(|e| store_error(&described, e))?
+        .into_iter()
+        .collect();
+    let gone: Vec<&String> = stale.difference(&written).collect();
+    for key in &gone {
+        store.delete(key).map_err(|e| store_error(&described, e))?;
+    }
     Ok(Outcome::with(
         "reindex",
         object! {
@@ -710,13 +722,17 @@ pub fn command_reindex(argv: &[String]) -> Run {
             "bundles" => result.bundles,
             "entries" => result.entries,
             "removed" => result.removed,
+            "fileEntries" => written.len(),
+            "fileRemoved" => gone.len(),
         },
         format!(
-            "scanned {} bundle(s) in {}\nwrote {} index entries, removed {} stale\n",
+            "scanned {} bundle(s) in {}\nwrote {} index entries, removed {} stale\nwrote {} file entries, removed {} stale\n",
             result.bundles,
             store.describe(),
             result.entries,
-            result.removed
+            result.removed,
+            written.len(),
+            gone.len()
         ),
     ))
 }
@@ -864,12 +880,11 @@ pub fn command_install(argv: &[String]) -> Run {
     let mut p = parser("install");
     p.option("--cwd").flag("--local", None).option("--command");
     let args = p.parse(argv)?;
-    let root = trace::repo_root(
-        &args
-            .str("cwd")
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(sys::getcwd),
-    )?;
+    let cwd = args
+        .str("cwd")
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(sys::getcwd);
+    let root = snapshot::workspace_root(&cwd);
     let command = match args.str("command") {
         Some(command) => command,
         // A machine-specific path, which is why it only goes in the
@@ -884,27 +899,32 @@ pub fn command_install(argv: &[String]) -> Run {
         "settings.json"
     };
     let settings = sys::join(&sys::join(&root, ".claude"), name);
-    let added = trace::install_hooks(&settings, &command)
+    let installed = trace::install_hooks(&settings, &command)
         .map_err(|trace::InstallError::Internal(m)| Failure::Internal(m))?;
-    // Amend and rebase copy a commit's note to its replacement only when told
-    // to, and an amended commit is still the one the conversation made.
-    trace::git(&root, &["config", "notes.rewriteRef", trace::NOTES_REF])?;
-    let mut text = if added.is_empty() {
+    let mut text = if installed.added.is_empty() {
         format!("loch hooks already installed in {}\n", settings)
     } else {
         format!(
             "installed loch hooks ({}) in {}\n",
-            added.join(", "),
+            installed.added.join(", "),
             settings
         )
     };
-    text.push_str(&format!(
-        "restart Claude Code sessions in this repository to pick them up\nshare links with: git push <remote> {}\n",
-        trace::NOTES_REF
-    ));
+    if !installed.removed.is_empty() {
+        text.push_str(&format!(
+            "removed the old per-command hooks ({})\n",
+            installed.removed.join(", ")
+        ));
+    }
+    text.push_str("restart Claude Code sessions here to pick them up\n");
     Ok(Outcome::with(
         "install",
-        object! {"settings" => settings.as_str(), "command" => command.as_str(), "added" => strings(&added)},
+        object! {
+            "settings" => settings.as_str(),
+            "command" => command.as_str(),
+            "added" => strings(&installed.added),
+            "removed" => strings(&installed.removed),
+        },
         text,
     ))
 }
@@ -926,14 +946,8 @@ fn flat(text: &str, limit: usize) -> String {
 
 fn link_text(link: Option<&Link>) -> String {
     let Some(link) = link else {
-        return "no conversation recorded".into();
+        return "not written in a recorded turn".into();
     };
-    if link.transcript.is_none() {
-        return format!(
-            "session {} (transcript not available)",
-            py::truncate(&link.session_id, 8)
-        );
-    }
     let title = match &link.title {
         Some(t) if !t.is_empty() => format!(" \"{}\"", t),
         _ => String::new(),
@@ -942,11 +956,18 @@ fn link_text(link: Option<&Link>) -> String {
         Some(p) if !p.is_empty() => format!(" — asked: \"{}\"", flat(p, 72)),
         _ => String::new(),
     };
+    let missing = if link.transcript.is_none() {
+        " (transcript not available)"
+    } else {
+        ""
+    };
     format!(
-        "session {}{}{}",
+        "{}  session {}{}{}{}",
+        py::truncate(&link.ended, 10),
         py::truncate(&link.session_id, 8),
         title,
-        prompt
+        prompt,
+        missing
     )
 }
 
@@ -961,8 +982,111 @@ fn mark(index: usize) -> String {
     letters
 }
 
-fn resolve(resolver: &mut Resolver, commit: &str) -> std::result::Result<Option<Link>, Failure> {
-    resolver.resolve(commit).map_err(Failure::Internal)
+/// A file as attribution sees it: its text, and the project and relative path
+/// its turns were recorded under.
+struct Located {
+    text: String,
+    project: String,
+    relative: String,
+    records: Vec<EditRecord>,
+}
+
+/// Finds the records that wrote `file`. In a git checkout the root is the
+/// checkout and the project its root commit, so there is one answer. Anywhere
+/// else a session's root was the directory it ran in, which may be any
+/// ancestor of the file, so each is tried, nearest first, until one has
+/// records; with none, the nearest is the answer.
+fn locate(file: &str, store: Option<&dyn Store>) -> std::result::Result<Located, Failure> {
+    let absolute = sys::abspath(file);
+    let text = match fs::read(&absolute) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => {
+            return err(
+                "file-unreadable",
+                format!("{}: {}", file, sys::os_error(&error, file)),
+            )
+        }
+    };
+    let real = sys::realpath_strict(&absolute).unwrap_or(absolute);
+    let root = snapshot::workspace_root(&sys::dirname(&real));
+    let mut candidates = vec![root.clone()];
+    if !snapshot::has_git_marker(&root) {
+        let mut dir = sys::dirname(&root);
+        while dir.len() > 1 {
+            candidates.push(dir.clone());
+            dir = sys::dirname(&dir);
+        }
+    }
+    let mut first = None;
+    for candidate in candidates {
+        let project = attribution::project_id(&candidate);
+        let relative = sys::relpath(&real, &candidate);
+        let records = attribution::records_for(store, &project, &relative);
+        if !records.is_empty() {
+            return Ok(Located {
+                text,
+                project,
+                relative,
+                records,
+            });
+        }
+        first.get_or_insert((project, relative));
+    }
+    let (project, relative) = first.expect("there is always one candidate");
+    Ok(Located {
+        text,
+        project,
+        relative,
+        records: Vec::new(),
+    })
+}
+
+struct Blamed {
+    located: Located,
+    /// Per line, an index into `links`.
+    owners: Vec<Option<usize>>,
+    links: Vec<Link>,
+}
+
+fn blame_file(file: &str, store: Option<&dyn Store>) -> std::result::Result<Blamed, Failure> {
+    let located = locate(file, store)?;
+    let owners = attribution::attribute(&located.text, &located.relative, &located.records);
+    let mut resolver = Resolver::new(store);
+    let mut index_of: HashMap<attribution::TurnRef, usize> = HashMap::new();
+    let mut links = Vec::new();
+    let mut indices = Vec::with_capacity(owners.len());
+    for owner in &owners {
+        indices.push(match owner {
+            None => None,
+            Some(reference) => {
+                if !index_of.contains_key(reference) {
+                    let link = resolver
+                        .describe(&located.records[reference.record], reference.turn)
+                        .map_err(Failure::Internal)?;
+                    index_of.insert(*reference, links.len());
+                    links.push(link);
+                }
+                Some(index_of[reference])
+            }
+        });
+    }
+    Ok(Blamed {
+        located,
+        owners: indices,
+        links,
+    })
+}
+
+/// Consecutive lines with one owner, 1-based: (start, end, owner).
+fn runs(owners: &[Option<usize>]) -> Vec<(usize, usize, Option<usize>)> {
+    let mut runs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    for (i, owner) in owners.iter().enumerate() {
+        match runs.last_mut() {
+            Some(last) if last.2 == *owner => last.1 = i + 1,
+            _ => runs.push((i + 1, i + 1, *owner)),
+        }
+    }
+    runs
 }
 
 pub fn command_blame(argv: &[String]) -> Run {
@@ -974,121 +1098,61 @@ pub fn command_blame(argv: &[String]) -> Run {
         .option("--store");
     let args = p.parse(argv)?;
     let file = args.str("file").unwrap_or_default();
-    let absolute = sys::abspath(&file);
-    let cwd = {
-        let dir = sys::dirname(&absolute);
-        if dir.is_empty() {
-            sys::getcwd()
-        } else {
-            dir
-        }
-    };
-    let root = trace::repo_root(&cwd)?;
-    let hunks = trace::blame_hunks(&root, &sys::relpath(&absolute, &root))?;
     let store = store_or_none(args.str("store").as_deref());
-    let mut resolver = Resolver::new(&root, store.as_deref());
-    let mut links: indexmap::IndexMap<String, Option<Link>> = indexmap::IndexMap::new();
-    for hunk in &hunks {
-        if !links.contains_key(&hunk.commit) && hunk.commit != UNCOMMITTED {
-            let link = resolve(&mut resolver, &hunk.commit)?;
-            links.insert(hunk.commit.clone(), link);
-        }
-    }
+    let blamed = blame_file(&file, store.as_deref())?;
 
-    // One mark per request rather than per session, handed out in order of
-    // first appearance, so A is always the first conversation you read.
-    let mut marks: HashMap<(String, String), String> = HashMap::new();
-    let mut legend: Vec<Map> = Vec::new();
-    let mut mark_of: HashMap<String, String> = HashMap::new();
-    for hunk in &hunks {
-        if hunk.commit == UNCOMMITTED {
-            mark_of.insert(hunk.commit.clone(), "+".into());
-            continue;
-        }
-        let Some(Some(link)) = links.get(&hunk.commit) else {
-            mark_of.insert(hunk.commit.clone(), "·".into());
-            continue;
-        };
-        let key = (
-            link.session_id.clone(),
-            link.prompt
-                .clone()
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| link.call.clone()),
-        );
-        if !marks.contains_key(&key) {
-            let letter = mark(marks.len());
-            marks.insert(key.clone(), letter.clone());
-            let mut entry = object! {"mark" => letter};
-            entry.extend(link.payload());
-            entry.insert("commits".into(), Value::Array(Vec::new()));
-            legend.push(entry);
-        }
-        let letter = marks[&key].clone();
-        let entry = legend
-            .iter_mut()
-            .find(|e| e.get("mark").is_some_and(|m| m.is_str(&letter)))
-            .expect("the mark was just added");
-        if let Some(Value::Array(commits)) = entry.get_mut("commits") {
-            if !commits.iter().any(|c| c.is_str(&hunk.commit)) {
-                commits.push(hunk.commit.as_str().into());
-            }
-        }
-        mark_of.insert(hunk.commit.clone(), letter);
-    }
-
-    let rows: Vec<Value> = hunks
+    // One mark per turn, handed out in order of first appearance in the file,
+    // so A is always the first conversation you read.
+    let marks: Vec<String> = (0..blamed.links.len()).map(mark).collect();
+    let legend: Vec<Value> = blamed
+        .links
         .iter()
-        .map(|hunk| {
-            let link = links.get(&hunk.commit).and_then(Option::as_ref);
+        .zip(&marks)
+        .map(|(link, letter)| {
+            let mut entry = object! {"mark" => letter.as_str()};
+            entry.extend(link.payload());
+            Value::Object(entry)
+        })
+        .collect();
+    let spans = runs(&blamed.owners);
+    let rows: Vec<Value> = spans
+        .iter()
+        .map(|&(start, end, owner)| {
             Value::Object(object! {
-                "start" => hunk.start,
-                "end" => hunk.end,
-                "commit" => if hunk.commit == UNCOMMITTED { Value::Null } else { hunk.commit.as_str().into() },
-                "summary" => hunk.summary.as_str(),
-                "mark" => mark_of[&hunk.commit].as_str(),
-                "conversation" => link.map_or(Value::Null, |l| Value::Object(l.payload())),
+                "start" => start,
+                "end" => end,
+                "mark" => owner.map_or("·", |o| marks[o].as_str()),
+                "conversation" => owner.map_or(Value::Null, |o| Value::Object(blamed.links[o].payload())),
             })
         })
         .collect();
 
     let mut text = format!("{}\n", file);
-    for hunk in &hunks {
-        let span = if hunk.end > hunk.start {
-            format!("{}-{}", hunk.start, hunk.end)
+    for &(start, end, owner) in &spans {
+        let span = if end > start {
+            format!("{}-{}", start, end)
         } else {
-            hunk.start.to_string()
+            start.to_string()
         };
-        if hunk.commit == UNCOMMITTED {
-            text.push_str(&format!("  {}  uncommitted\n", right(&span, 9)));
-            continue;
-        }
-        let link = links.get(&hunk.commit).and_then(Option::as_ref);
         text.push_str(&format!(
-            "  {}  {}  {}\n",
+            "  {}  {}\n",
             right(&span, 9),
-            py::truncate(&hunk.commit, 7),
-            py::truncate(&hunk.summary, 60)
-        ));
-        text.push_str(&format!(
-            "  {}  {}  {}\n",
-            right("", 9),
-            left("", 7),
-            link_text(link)
+            link_text(owner.map(|o| &blamed.links[o]))
         ));
     }
-    let linked = links.values().filter(|l| l.is_some()).count();
+    let attributed = blamed.owners.iter().filter(|o| o.is_some()).count();
     text.push_str(&format!(
-        "\n{} of {} commit(s) linked to a conversation; follow one up with: loch ask {}:<line>\n",
-        linked,
-        links.len(),
+        "\n{} of {} line(s) written in a recorded turn; follow one up with: loch ask {}:<line>\n",
+        attributed,
+        blamed.owners.len(),
         file
     ));
 
-    let legend_values: Vec<Value> = legend.into_iter().map(Value::Object).collect();
     let mut payload = object! {
         "file" => file.as_str(),
-        "conversations" => legend_values.clone(),
+        "path" => blamed.located.relative.as_str(),
+        "project" => blamed.located.project.as_str(),
+        "conversations" => legend.clone(),
         "hunks" => rows.clone(),
     };
     if let Some(html) = args.str("html") {
@@ -1104,13 +1168,14 @@ pub fn command_blame(argv: &[String]) -> Run {
             },
             None => None,
         };
-        let mut lines: HashMap<usize, String> = HashMap::new();
-        for hunk in &hunks {
-            for (offset, line) in hunk.lines.iter().enumerate() {
-                lines.insert(hunk.start + offset, line.clone());
-            }
-        }
-        let page = blame_html::render(&file, &legend_values, &rows, &lines, visible.as_deref());
+        let lines: HashMap<usize, String> = blamed
+            .located
+            .text
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.to_string()))
+            .collect();
+        let page = blame_html::render(&file, &legend, &rows, &lines, visible.as_deref());
         let target = if html.is_empty() {
             sys::join(
                 &sys::gettempdir(),
@@ -1119,9 +1184,8 @@ pub fn command_blame(argv: &[String]) -> Run {
         } else {
             html
         };
-        let bytes =
-            py::encode_strict(&page).map_err(|_| Failure::Internal("unencodable page".into()))?;
-        fs::write(&target, bytes).map_err(|e| Failure::Internal(sys::os_error(&e, &target)))?;
+        fs::write(&target, page.as_bytes())
+            .map_err(|e| Failure::Internal(sys::os_error(&e, &target)))?;
         let absolute = sys::abspath(&target);
         text = format!("wrote {}\n", absolute);
         payload.insert("html".into(), absolute.as_str().into());
@@ -1149,7 +1213,7 @@ fn open_in_browser(path: &str) {
 }
 
 /// `file`, `file:105` or `file:100-120`; a path that exists wins outright.
-fn history_target(target: &str) -> std::result::Result<(String, Option<(usize, usize)>), Failure> {
+fn line_target(target: &str) -> std::result::Result<(String, Option<(usize, usize)>), Failure> {
     if Path::new(target).exists() {
         return Ok((target.into(), None));
     }
@@ -1177,182 +1241,129 @@ pub fn command_log(argv: &[String]) -> Run {
     let mut p = parser("log");
     p.positional("target", Nargs::One).option("--store");
     let args = p.parse(argv)?;
-    let (file, lines) = history_target(&args.str("target").unwrap_or_default())?;
-    let absolute = sys::abspath(&file);
-    let cwd = {
-        let dir = sys::dirname(&absolute);
-        if dir.is_empty() {
-            sys::getcwd()
-        } else {
-            dir
-        }
-    };
-    let root = trace::repo_root(&cwd)?;
-    let relative = sys::relpath(&absolute, &root);
+    let (file, lines) = line_target(&args.str("target").unwrap_or_default())?;
+    let store = store_or_none(args.str("store").as_deref());
+    let blamed = blame_file(&file, store.as_deref())?;
     if let Some((_, last)) = lines {
-        // -L past the end is a fatal git error with a worse message.
-        let length = trace::blame_hunks(&root, &relative)?
-            .iter()
-            .map(|h| h.end)
-            .max()
-            .unwrap_or(0);
-        if last > length {
+        if last > blamed.owners.len() {
             return err(
                 "usage",
-                format!("{} has {} lines, not {}", file, length, last),
+                format!("{} has {} lines, not {}", file, blamed.owners.len(), last),
             );
         }
     }
-    let changes = trace::history(&root, &relative, lines)?;
-    let store = store_or_none(args.str("store").as_deref());
-    let mut resolver = Resolver::new(&root, store.as_deref());
 
-    let mut conversations: Vec<Map> = Vec::new();
-    let mut keyed: HashMap<(String, String), usize> = HashMap::new();
-    let mut entries = Vec::new();
-    let mut text = String::new();
-    for change in &changes {
-        let link = resolve(&mut resolver, &change.commit)?;
-        let when = sys::utc_seconds(change.time);
-        entries.push(Value::Object(object! {
-            "commit" => change.commit.as_str(),
-            "time" => when.as_str(),
-            "summary" => change.summary.as_str(),
-            "conversation" => link.as_ref().map_or(Value::Null, |l| Value::Object(l.payload())),
-        }));
-        text.push_str(&format!(
-            "  {}  {}  {}\n  {}  {}  {}\n",
-            py::truncate(&change.commit, 7),
-            &when[..10],
-            py::truncate(&change.summary, 60),
-            left("", 7),
-            left("", 10),
-            link_text(link.as_ref())
-        ));
-        let Some(link) = link else { continue };
-        let key = (
-            link.session_id.clone(),
-            link.prompt
-                .clone()
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| link.call.clone()),
-        );
-        let index = *keyed.entry(key).or_insert_with(|| {
-            let mut entry = link.payload();
-            entry.insert("commits".into(), Value::Array(Vec::new()));
-            conversations.push(entry);
-            conversations.len() - 1
-        });
-        if let Some(Value::Array(commits)) = conversations[index].get_mut("commits") {
-            commits.push(change.commit.as_str().into());
+    // A range asks who wrote what is there now; a whole file asks every turn
+    // that ever changed it, including ones whose lines are gone.
+    let mut resolver = Resolver::new(store.as_deref());
+    let mut links: Vec<Link> = match lines {
+        Some((first, last)) => {
+            let mut seen = Vec::new();
+            for owner in blamed.owners[first - 1..last].iter().flatten() {
+                if !seen.contains(owner) {
+                    seen.push(*owner);
+                }
+            }
+            seen.into_iter().map(|o| blamed.links[o].clone()).collect()
         }
-    }
+        None => {
+            let mut all = Vec::new();
+            for record in &blamed.located.records {
+                for (index, turn) in record.turns.iter().enumerate() {
+                    if turn.files.iter().any(|f| f.path == blamed.located.relative) {
+                        all.push(
+                            resolver
+                                .describe(record, index)
+                                .map_err(Failure::Internal)?,
+                        );
+                    }
+                }
+            }
+            all
+        }
+    };
+    links.sort_by(|a, b| b.ended.cmp(&a.ended));
+
     let span = match lines {
         None => String::new(),
         Some((a, b)) if a == b => format!(":{}", a),
         Some((a, b)) => format!(":{}-{}", a, b),
     };
-    let header = format!(
-        "{}{}: {} commit(s) from {} conversation(s), newest first\n",
-        file,
-        span,
-        changes.len(),
-        conversations.len()
-    );
-    let footer = if conversations.is_empty() {
-        ""
-    } else {
-        "\nfollow one up with: loch ask <commit>\n"
-    };
+    let mut text = format!("{}{}: {} turn(s), newest first\n", file, span, links.len());
+    for link in &links {
+        text.push_str(&format!("  {}\n", link_text(Some(link))));
+    }
+    if !links.is_empty() {
+        text.push_str(&format!("\nfollow one up with: loch ask {}:<line>\n", file));
+    }
     Ok(Outcome::with(
         "log",
         object! {
             "file" => file.as_str(),
             "lines" => lines.map_or(Value::Null, |(a, b)| Value::Object(object! {"start" => a, "end" => b})),
-            "conversations" => conversations.into_iter().map(Value::Object).collect::<Vec<_>>(),
-            "commits" => entries,
+            "conversations" => links.iter().map(|l| Value::Object(l.payload())).collect::<Vec<_>>(),
         },
-        format!("{}{}{}", header, text, footer),
+        text,
     ))
-}
-
-fn resolve_commit(root: &str, target: &str) -> std::result::Result<String, Failure> {
-    if let Some((file, line)) = target.rsplit_once(':') {
-        if !file.is_empty() && py::is_digits(line) && Path::new(file).exists() {
-            let relative = sys::relpath(&sys::abspath(file), root);
-            let number: usize = line.parse().unwrap_or(0);
-            for hunk in trace::blame_hunks(root, &relative)? {
-                if hunk.start <= number && number <= hunk.end {
-                    if hunk.commit == UNCOMMITTED {
-                        return err("not-linked", format!("{} is not committed yet", target));
-                    }
-                    return Ok(hunk.commit);
-                }
-            }
-            return err("usage", format!("{} has no line {}", file, line));
-        }
-    }
-    let output = trace::git_unchecked(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "-q",
-            &format!("{}^{{commit}}", target),
-        ],
-    );
-    let commit = py::strip(&output);
-    if commit.is_empty() {
-        return err(
-            "usage",
-            format!("{} is neither a commit nor <file>:<line>", target),
-        );
-    }
-    Ok(commit.into())
 }
 
 pub fn command_ask(argv: &[String]) -> Run {
     let mut p = parser("ask");
     p.positional("target", Nargs::One)
         .positional("question", Nargs::Optional)
-        .flag("--at-commit", None)
+        .flag("--at-turn", None)
         .flag("--no-launch", None)
         .option("--store");
     let args = p.parse(argv)?;
     let as_json = json_requested();
-    let root = trace::repo_root(&sys::getcwd())?;
     let target = args.str("target").unwrap_or_default();
-    let commit = resolve_commit(&root, &target)?;
+    let (file, line) = match line_target(&target)? {
+        (file, Some((line, _))) => (file, line),
+        (_, None) => return err("usage", format!("{} is not <file>:<line>", target)),
+    };
     let store = store_or_none(args.str("store").as_deref());
-    let mut resolver = Resolver::new(&root, store.as_deref());
-    let Some(link) = resolve(&mut resolver, &commit)? else {
+    let blamed = blame_file(&file, store.as_deref())?;
+    if line > blamed.owners.len() {
+        return err(
+            "usage",
+            format!("{} has {} lines, not {}", file, blamed.owners.len(), line),
+        );
+    }
+    let Some(owner) = blamed.owners[line - 1] else {
         return err(
             "not-linked",
-            format!(
-                "no conversation is recorded for {}",
-                py::truncate(&commit, 7)
-            ),
+            format!("{} was not written in a recorded turn", target),
         );
     };
+    let link = blamed.links[owner].clone();
     let Some(transcript) = &link.transcript else {
         return err(
             "transcript-missing",
             format!(
-                "session {} is linked but its transcript is neither in {} nor in the store",
+                "session {} wrote it, but its transcript is neither in {} nor in the store",
                 link.session_id,
                 claude::projects_dir(None)
             ),
         );
     };
+    let at_turn = args.flag("at_turn");
+    let cwd = blamed
+        .located
+        .records
+        .iter()
+        .find(|r| r.session == link.session_id)
+        .map(|r| r.root.clone())
+        .filter(|root| Path::new(root).is_dir())
+        .unwrap_or_else(sys::getcwd);
     let fork = trace::fork_session(
         transcript,
-        &root,
-        if args.flag("at_commit") {
-            Some(link.call.as_str())
+        &cwd,
+        if at_turn {
+            link.end_uuid.as_deref()
         } else {
             None
         },
-        Some(&format!("loch ask {}", py::truncate(&commit, 7))),
+        Some(&format!("loch ask {}", target)),
     )
     .map_err(|e| match e {
         trace::ForkError::Trace(t) => Failure::from(t),
@@ -1368,7 +1379,7 @@ pub fn command_ask(argv: &[String]) -> Run {
         command.push(question);
     }
     let payload = object! {
-        "commit" => commit.as_str(),
+        "target" => target.as_str(),
         "conversation" => link.payload(),
         "fork" => object! {
             "sessionId" => fork.session_id.as_str(),
@@ -1376,15 +1387,15 @@ pub fn command_ask(argv: &[String]) -> Run {
             "cwd" => fork.cwd.as_str(),
             "records" => fork.records,
         },
-        "at" => if args.flag("at_commit") { "commit" } else { "end" },
+        "at" => if at_turn { "turn" } else { "end" },
         "launch" => strings(&command),
     };
     let text = format!(
-        "forked session {}, which made {}, {}: {} records, as {}\n",
+        "forked session {}, which wrote {}, {}: {} records, as {}\n",
         py::truncate(&fork.origin_session, 8),
-        py::truncate(&commit, 7),
-        if args.flag("at_commit") {
-            "just after it"
+        target,
+        if at_turn {
+            "at the end of that turn"
         } else {
             "to its end"
         },
@@ -1398,13 +1409,13 @@ pub fn command_ask(argv: &[String]) -> Run {
             format!(
                 "{}resume with: cd {} && {}\n",
                 text,
-                root,
+                fork.cwd,
                 command.join(" ")
             ),
         ));
     }
     eprint!("{}", text);
-    exec_claude(&root, &command)
+    exec_claude(&fork.cwd, &command)
 }
 
 #[cfg(unix)]
@@ -1414,10 +1425,11 @@ fn exec_claude(root: &str, command: &[String]) -> Run {
     let error = std::process::Command::new(&command[0])
         .args(&command[1..])
         .exec();
+    let code = error.raw_os_error().unwrap_or(0);
     Err(Failure::Internal(format!(
         "[Errno {}] {}: '{}'",
-        error.raw_os_error().unwrap_or(0),
-        sys::strerror(error.raw_os_error().unwrap_or(0)),
+        code,
+        sys::strerror(code),
         command[0]
     )))
 }
@@ -1430,85 +1442,6 @@ fn exec_claude(root: &str, command: &[String]) -> Run {
         .status()
         .map_err(|e| Failure::Internal(e.to_string()))?;
     std::process::exit(status.code().unwrap_or(1));
-}
-
-// -- backfill -------------------------------------------------------------------------
-
-fn stderr_is_tty() -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: isatty only inspects the descriptor.
-        unsafe { libc::isatty(2) == 1 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
-pub fn command_backfill(argv: &[String]) -> Run {
-    let mut p = parser("backfill");
-    // Branches rather than --all, which would walk refs/notes/loch too.
-    p.option("--cwd").option_default("--revision", "--branches");
-    let args = p.parse(argv)?;
-    let root = trace::repo_root(
-        &args
-            .str("cwd")
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(sys::getcwd),
-    )?;
-    let revision = args.str("revision").unwrap_or_default();
-
-    // A one-line counter for a person watching a terminal only; JSON mode and
-    // a pipe both get nothing.
-    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    let mut meter = |done: usize, total: usize, read: u64, size: u64| {
-        let now = std::time::Instant::now();
-        if done < total && now.duration_since(last).as_secs_f64() < 0.1 {
-            return;
-        }
-        last = now;
-        let percent = if size > 0 { 100 * read / size } else { 100 };
-        eprint!(
-            "\rscanning transcripts {}/{} ({} of {}, {}%)\x1b[K",
-            done,
-            total,
-            format_bytes(read),
-            format_bytes(size),
-            percent
-        );
-        if done == total {
-            eprintln!();
-        }
-    };
-    let progress: Option<trace::Progress> = if json_requested() || !stderr_is_tty() {
-        None
-    } else {
-        Some(&mut meter)
-    };
-    let linked = trace::backfill(&root, &revision, progress)?;
-    let rows: Vec<Value> = linked
-        .iter()
-        .map(|(sha, call)| {
-            Value::Object(object! {
-                "commit" => sha.as_str(),
-                "session" => call.session_id.as_str(),
-                "call" => call.call.as_str(),
-            })
-        })
-        .collect();
-    let mut text: String = linked
-        .iter()
-        .map(|(sha, call)| {
-            format!(
-                "  {}  session {}\n",
-                py::truncate(sha, 7),
-                py::truncate(&call.session_id, 8)
-            )
-        })
-        .collect();
-    text.push_str(&format!("linked {} commit(s)\n", linked.len()));
-    Ok(Outcome::with("backfill", object! {"linked" => rows}, text))
 }
 
 // -- help / version -----------------------------------------------------------------
@@ -1542,7 +1475,6 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "blame" => command_blame(argv),
         "ask" => command_ask(argv),
         "log" => command_log(argv),
-        "backfill" => command_backfill(argv),
         "hook" => command_hook(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),

@@ -127,7 +127,10 @@ fn invoke_json_env(
     let ran = invoke_env(tmp, home, env, argv);
     assert_eq!(ran.out.matches('\n').count(), 1, "stdout: {}", ran.out);
     let document = json::loads(&ran.out).expect("stdout is JSON");
-    assert_eq!(document.get("schema"), Some(&Value::int(1)));
+    assert_eq!(
+        document.get("schema"),
+        Some(&Value::int(loch::output::SCHEMA))
+    );
     (document, ran.err, ran.code)
 }
 

@@ -66,13 +66,45 @@ a reviewer wants one ref to pull. `save` filters by cwd/branch/session
 and packs everything matching.
 
 **Link at branch level, not per commit — for bundles.** A reviewer asks
-"what produced this PR," not "what produced commit abc123." Commit-level
-pointers would drag in squash-merge, rebase, and `post-rewrite` handling for
-no benefit. (Nothing writes git pointers yet — this is the intended shape.)
-The conversation graph is the exception: forking at a turn needs the disk
-state *at that turn*, so turns get per-commit pins kept alive by refs, which
-is precisely the squash/rebase problem this avoided, taken on deliberately
-(SPEC.md §10).
+"what produced this PR," not "what produced commit abc123," so bundles are
+filed by branch. Nothing writes git pointers for bundles.
+
+**Attribution by content, not by commit.** Which turn wrote a line is
+recorded by snapshotting the workspace at each turn's start and end and
+hashing the lines the turn added (`attribution.rs`, SPEC.md §10), never in
+git. The first design put a git note on each commit an agent made, and a
+squash merge destroyed every one of them: a note annotates one commit id, and
+a squash makes a new commit out of several, so #2's notes ended up on commits
+`main` doesn't contain. Rebases, cherry-picks and amends do the same thing
+more quietly. What should be remembered is "this text was written by this
+turn," which no history rewrite changes, so that is what is recorded, and the
+records live in the store, which also keeps them deletable (above). Four
+requirements fixed the rest of the design:
+
+- **Every edit counts, however it was made.** More than half of an agent's
+  edits go through the shell (`sed`, generators, formatters, scripts), and the
+  harness may have no edit tool to observe. So capture looks at the files, not
+  the tools: anything that lands on disk during a turn is the turn's.
+- **Per turn, not per tool call.** A turn is the unit anyone asks about, and
+  per-turn boundaries are available from far more harnesses (a turn-end hook,
+  or transcript timestamps) than per-call ones. Claude Code's
+  `UserPromptSubmit` and `Stop` hooks are the two moments needed. The old
+  pre/post-tool hooks, which ran twice per shell command, are gone, and
+  `install` removes them.
+- **No background process.** Snapshots are taken on demand with a stat cache,
+  the way git's index works: files whose size and mtime are unchanged aren't
+  read again. A harness with no hooks gets coarser attribution, never a
+  daemon.
+- **A person editing during a turn is not a concern.** Their changes in that
+  window are the turn's. Changes between turns are not, provided the prompt
+  hook ran.
+
+Git is still *read*, in two places: a project's identity is its root commit
+(the same on every clone and immune to history rewrites), and `list`'s
+default branch. Nothing loch records goes into git.
+
+**Forking at a turn needs the disk state *at that turn*.** That state is the
+turn's end snapshot. Restoring it is the unbuilt part (SPEC.md §10, pins).
 
 **No single index object.** A shared `index.json` would need
 read-modify-write on every save, so two machines saving concurrently would
@@ -153,15 +185,17 @@ binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
-│                 #   blame/log/ask/backfill/hook/help/version
+│                 #   blame/log/ask/hook/help/version
 ├── claude.rs     # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.rs     # bundle format, gzip, content-addressed ref
 ├── format.rs     # loch format: turn and content ids, derived files
 ├── ingest.rs     # Claude Code JSONL -> loch turns (the converter)
 ├── index.rs      # store key layout, derived index entries, delete and reindex
-├── trace.rs      # commit -> conversation notes, install, blame, log, backfill, ask's fork
-├── hook.rs       # `loch hook`: the Claude Code hooks
-├── git.rs        # git by subprocess, plus the hooks' native HEAD fast path
+├── snapshot.rs   # on-demand workspace snapshots with a stat cache, like git's index
+├── attribution.rs # per-turn added lines, edit records, and blame's matcher
+├── hook.rs       # `loch hook prompt|stop`: the turn boundaries
+├── trace.rs      # install, finding transcripts, describing turns, ask's fork
+├── git.rs        # git by subprocess: a project's root commit, the current branch
 ├── blame_html.rs # `blame --html`: self-contained page (blame_template.html)
 ├── output.rs     # result envelope, the two renderers, structured failures
 ├── redact.rs     # secret scrubbing, applied on save before packing
@@ -174,8 +208,8 @@ src/
 └── sys.rs        # paths, timestamps, OS error strings, hostname, uuid4
 tests/            # integration tests, one file per module plus cli.rs
 ├── derived_reader/ # a verifying reader for derived files, shared by three tests
-├── corpus.rs     # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
-└── git_fast_path.rs # the native HEAD answer equals git's, layout by layout
+├── trace.rs      # hooks, blame, log and ask end to end, squash and clone included
+└── corpus.rs     # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
 examples/bench_hook.rs # per-call wall clock of `loch hook`, any number of binaries
 npm/              # @ness-dev/loch and its per-platform packages
 ```
@@ -468,7 +502,7 @@ So every command takes `--json`, accepted either before or after the
 subcommand, and answers with exactly one document on stdout:
 
 ```json
-{"schema": 1, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
+{"schema": 2, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
 ```
 
 `schema` is the envelope version. It exists so a consumer can detect a
@@ -484,7 +518,7 @@ prose that describes it will rot the first time someone edits the prose.
 **Failures are documents, on stdout.**
 
 ```json
-{"schema": 1, "ok": false, "command": "restore", "code": "nothing-restored",
+{"schema": 2, "ok": false, "command": "restore", "code": "nothing-restored",
  "error": "nothing restored", "sessions": [{"status": "skipped", ...}]}
 ```
 
@@ -508,11 +542,10 @@ never a code. The set today:
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
 | `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
-| `not-a-repository` | `install`/`blame`/`log`/`ask`/`backfill` outside a git repository |
-| `not-linked` | `ask` on a commit with no conversation note, or an uncommitted line |
-| `transcript-missing` | the note exists but the transcript is in neither Claude's directory nor the store |
-| `call-not-found` | the transcript has no result for the noted tool call |
-| `git-failed` | a git command failed |
+| `file-unreadable` | `blame`/`log`/`ask` named a file that can't be read |
+| `not-linked` | `ask` on a line no recorded turn wrote |
+| `transcript-missing` | a turn wrote the line but its transcript is in neither Claude's directory nor the store |
+| `turn-not-found` | the transcript no longer holds the record a turn ended on |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -678,29 +711,13 @@ Known gaps:
 
 ## Performance
 
-**`loch hook`: 3ms a call.** The Python it replaced took ~73ms (measured
-with `examples/bench_hook.rs`, median of 60):
-
-| case | Python | Rust |
-| --- | --- | --- |
-| pre-tool | 72.9ms | 3.1ms |
-| post-tool, no commit | 72.4ms | 3.1ms |
-| post-tool, writing a note | 98.5ms | 27.3ms |
-
-The hooks run twice per agent shell command, so that is ~145ms of every
-Bash call down to ~6ms.
-
-Getting under the cost of spawning git (~8ms a process) is the fast path in
-`git.rs`: where the git directory is and what HEAD is are answered by
-reading `.git` (a worktree's `gitdir:` file, `commondir`, loose and packed
-refs) instead of spawning git. It answers only on layouts it fully
-understands and says "ask git" for anything else: a discovery-changing
-`GIT_*` variable, reftable, a repository owned by another user
-(`safe.directory`), a cwd inside `.git`, an unparseable ref, and Windows
-outright. **A gap there may only ever cost speed, never a different
-answer.** `tests/git_fast_path.rs` checks the native answer against git's on
-each layout. Writing a note still runs `git log` and `git notes`, which is
-the remaining 24ms, and that happens only when a call committed.
+**Hooks run twice per turn, not twice per shell command.** The git-notes
+design needed a hook around every Bash call (73ms each in Python, then 3ms in
+Rust with a native HEAD reader that is now gone). Attribution needs only the
+turn's start and end. Each of those is a snapshot: one walk of the
+workspace, a `stat` per file, and a read only of files whose size or mtime
+changed. A snapshot of a project's first turn reads everything once.
+`examples/bench_hook.rs` still measures any binary's hooks.
 
 **Redaction is most of `save`'s cost.** A backtracking engine tries all ten
 rules at every position, and `env-assignment` can begin at any capital: over
@@ -821,28 +838,32 @@ with a real integration.
 execution of the release path, including the six-target build matrix, and no
 release exists yet.
 
-**Blame and ask (`trace.rs`) are a working demo on this repository.** All 12
-commits whose sessions still existed were backfilled exactly; the 50 from
-August have no conversation left, because Claude Code had already deleted
-their transcripts (`cleanupPeriodDays`, default 30) — the reason the stop
-hook snapshots every session into the store. Backfill could not have used
-commit hashes from tool output: `git commit -q` prints none, which is why
-hooks capture links live. A fork made by `ask` was resumed with
-`claude --resume -p` and answered from the original conversation. Known gaps:
-the fork resumes in the current checkout rather than a worktree at the commit
-(a pin, §10); the transcript snapshot is one mutable key per session rather
-than content-addressed `raw/<hex>`; subagent sidecars aren't snapshotted;
-backfill reads every transcript on the machine (~25s on 750MB). The hook
-input's `tool_use_id` is used when present and otherwise recovered from the
-transcript by command; which one current Claude Code sends hasn't been
-observed, since hooks only load at session start.
+**Blame, log and ask run on content attribution.** Verified end to end in
+`tests/trace.rs`:
+- **Shell edits count.** Lines changed by `sed` and a file written by a
+  generator are attributed to the turn that ran them, with no edit tool
+  involved.
+- **History rewrites don't matter.** After a squash, a fresh clone with an
+  empty HOME and only the store in common blames the same lines to the same
+  turns, and finds the transcripts in the store.
+- **A person's text isn't the agent's.** A line someone later rewrote is
+  unattributed, a re-indented one keeps its turn, and a person's lone `}` is
+  not credited to the agent.
 
-**Squash merges drop every note today**, and that is a requirement to fix,
-not a workflow to avoid: loch has to support squash transparently in any
-repository that installs it. It bit #2 — its commits' notes now annotate
-commits `main` doesn't contain. A note annotates one object id, and a
-squash makes a new commit from many, so nothing carries them. The design is
-pending review and gets recorded here once settled.
+The notes written under the old design, on this repository only, are not
+migrated: they sit on commits `main` no longer contains.
+
+Known gaps:
+- **No fork at a turn.** The fork resumes in the session's recorded root,
+  not in the turn's snapshot.
+- **Snapshots stay local and are never pruned.** Content is deduplicated,
+  but manifests accumulate, two per turn.
+- **The file index keys on path,** so a file renamed after the turn that
+  wrote it is not found under its new name.
+- **Sessions running at once in one workspace** each record the other's
+  changes as their own.
+- **The transcript snapshot** is one mutable key per session rather than
+  content-addressed `raw/<hex>`, and subagent sidecars aren't snapshotted.
 
 The rename from lochy carried no compatibility shim: `LOCHY_STORE`,
 `LOCHY_S3_ENDPOINT`, `LOCHY_S3_REGION` and the `~/.lochy/store` default are

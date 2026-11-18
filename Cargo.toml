@@ -25,6 +25,11 @@ regex = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "libc"] } # flate2's backend, built from source and linked statically
 getrandom = "0.2"
+# Walks a workspace the way git sees it: .gitignore, nested ignores, the global
+# excludes file. Used by snapshots, which must skip what the user ignores.
+ignore = "0.4"
+# Line diffs between a turn's start and end snapshots.
+similar = "2"
 sha2 = "0.10"
 hmac = "0.12"
 # Blocking and rustls-only: no async runtime and no system OpenSSL, so the

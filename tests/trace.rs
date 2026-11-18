@@ -1,39 +1,33 @@
-//! Commit -> conversation tracing: hooks, install, snapshots, backfill, blame,
-//! log and the fork `ask` makes. Ported from test/test_trace.py.
+//! Turns, recorded by the hooks and found again by content: `install`, the
+//! `prompt`/`stop` hooks, and `blame`, `log` and `ask` on top of them.
 //!
-//! Hooks, blame and log run the binary as Claude Code and a user would. The
-//! library calls (backfill, Resolver, fork_session) read `HOME` from the
-//! process environment, so every test holds `LOCK` and sets it there.
+//! Everything runs through the binary, as the harness would run it, in a
+//! scratch HOME with its own store, so no test touches this machine's
+//! `~/.loch` or `~/.claude`.
 
-use loch::claude::transcript_path_for;
-use loch::json::{self, Map, Value};
-use loch::object;
-use loch::store::{FileStore, Store};
-use loch::trace;
-use std::collections::HashSet;
+use loch::json::{self, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 const SESSION: &str = "11111111-2222-3333-4444-555555555555";
-const CALL: &str = "toolu_commit";
 
-static LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-struct Env {
-    tmp: PathBuf,
+struct World {
+    root: PathBuf,
     home: PathBuf,
     repo: PathBuf,
-    _guard: MutexGuard<'static, ()>,
+    store: PathBuf,
+    transcript: PathBuf,
+    minute: usize,
 }
 
-impl Drop for Env {
+impl Drop for World {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.tmp);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -41,672 +35,561 @@ fn s(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn scratch() -> PathBuf {
-    let base = fs::canonicalize(std::env::temp_dir()).unwrap();
-    let dir = base.join(format!(
-        "loch-trace-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Everything a child process (and the library, for the calls it makes from
-/// this process) needs to see: a private HOME and git config, a fixed author.
-fn child_env(tmp: &Path, home: &Path) -> Vec<(String, String)> {
-    let mut vars = vec![
-        ("HOME".to_string(), s(home)),
-        ("GIT_CONFIG_GLOBAL".to_string(), s(&tmp.join("gitconfig"))),
-        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-    ];
-    for name in ["AUTHOR", "COMMITTER"] {
-        vars.push((format!("GIT_{}_NAME", name), "Test".into()));
-        vars.push((format!("GIT_{}_EMAIL", name), "test@example.com".into()));
+impl World {
+    fn new(git: bool) -> World {
+        let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join(format!(
+            "loch-test-trace-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let repo = root.join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(root.join("gitconfig"), "").unwrap();
+        let world = World {
+            transcript: home
+                .join(".claude/projects/-repo")
+                .join(format!("{}.jsonl", SESSION)),
+            store: root.join("store"),
+            root,
+            home,
+            repo,
+            minute: 0,
+        };
+        fs::create_dir_all(world.transcript.parent().unwrap()).unwrap();
+        if git {
+            world.git(&world.repo, &["init", "-q", "-b", "main"]);
+            world.git(
+                &world.repo,
+                &["commit", "-q", "--allow-empty", "-m", "initial"],
+            );
+        }
+        world
     }
-    vars
-}
 
-const REMOVED: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "LOCH_STORE",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_AUTHOR_DATE",
-    "GIT_COMMITTER_DATE",
-];
-
-fn env() -> Env {
-    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let tmp = scratch();
-    let home = tmp.join("home");
-    let repo = tmp.join("repo");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&repo).unwrap();
-    fs::write(tmp.join("gitconfig"), "").unwrap();
-    for (key, value) in child_env(&tmp, &home) {
-        std::env::set_var(key, value);
-    }
-    for key in REMOVED {
-        std::env::remove_var(key);
-    }
-    let env = Env {
-        tmp,
-        home,
-        repo,
-        _guard: guard,
-    };
-    run(&env, &env.repo, &["init", "-q", "-b", "main"], None);
-    env
-}
-
-fn run(env: &Env, repo: &Path, args: &[&str], date: Option<&str>) -> String {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repo).args(args);
-    for key in REMOVED {
-        command.env_remove(key);
-    }
-    command.envs(child_env(&env.tmp, &env.home));
-    if let Some(date) = date {
+    fn command(&self, program: &str, cwd: &Path) -> Command {
+        let mut command = Command::new(program);
         command
-            .env("GIT_AUTHOR_DATE", date)
-            .env("GIT_COMMITTER_DATE", date);
+            .current_dir(cwd)
+            .env("HOME", &self.home)
+            .env("LOCH_STORE", &self.store)
+            .env("GIT_CONFIG_GLOBAL", self.root.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("SOURCE_DATE_EPOCH");
+        command
     }
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {:?}: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
 
-fn commit(env: &Env, name: &str, text: &str, message: &str, date: Option<&str>) -> String {
-    let repo = &env.repo;
-    fs::write(repo.join(name), text).unwrap();
-    run(env, repo, &["add", name], None);
-    run(env, repo, &["commit", "-q", "-m", message], date);
-    run(env, repo, &["rev-parse", "HEAD"], None)
-}
-
-fn loch(env: &Env, cwd: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_loch"));
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for key in REMOVED {
-        command.env_remove(key);
+    fn git(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = self.command("git", cwd).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
-    command.envs(child_env(&env.tmp, &env.home));
-    let mut child = command.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
-}
 
-fn obj(value: Value) -> Map {
-    match value {
-        Value::Object(map) => map,
-        other => panic!("not an object: {:?}", other),
+    fn loch_in(&self, cwd: &Path, args: &[&str], stdin: &str) -> Output {
+        let mut child = self
+            .command(env!("CARGO_BIN_EXE_loch"), cwd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn loch(&self, args: &[&str]) -> Output {
+        self.loch_in(&self.repo, args, "")
+    }
+
+    fn json(&self, args: &[&str]) -> Value {
+        let mut args = args.to_vec();
+        args.push("--json");
+        let out = self.loch(&args);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(text.matches('\n').count(), 1, "one document: {}", text);
+        json::loads(text.trim()).unwrap()
+    }
+
+    fn record(&self, line: String) {
+        let mut existing = fs::read_to_string(&self.transcript).unwrap_or_default();
+        existing.push_str(&line);
+        existing.push('\n');
+        fs::write(&self.transcript, existing).unwrap();
+    }
+
+    fn event(&self) -> String {
+        format!(
+            r#"{{"session_id": "{}", "cwd": "{}", "transcript_path": "{}"}}"#,
+            SESSION,
+            s(&self.repo),
+            s(&self.transcript)
+        )
+    }
+
+    /// A prompt is submitted: its record is written and the hook runs.
+    fn prompt(&mut self, uuid: &str, text: &str) {
+        self.minute += 1;
+        self.record(format!(
+            r#"{{"type": "user", "uuid": "{}", "parentUuid": null, "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:{:02}:00.000Z", "message": {{"role": "user", "content": "{}"}}}}"#,
+            uuid,
+            SESSION,
+            s(&self.repo),
+            self.minute,
+            text
+        ));
+        let out = self.loch_in(&self.repo, &["hook", "prompt"], &self.event());
+        assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    /// The agent stops: its reply is written and the hook runs.
+    fn stop(&mut self, prompt_uuid: &str) {
+        self.record(format!(
+            r#"{{"type": "assistant", "uuid": "{}-end", "parentUuid": "{}", "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:{:02}:30.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "done"}}]}}}}"#,
+            prompt_uuid,
+            prompt_uuid,
+            SESSION,
+            s(&self.repo),
+            self.minute
+        ));
+        let out = self.loch_in(&self.repo, &["hook", "stop"], &self.event());
+        assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    /// What the agent's shell does: write files however it likes.
+    fn sh(&self, script: &str) {
+        let out = self
+            .command("sh", &self.repo)
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn write(&self, name: &str, text: &str) {
+        let path = self.repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
 }
 
-fn parse(text: &str) -> Value {
-    json::loads(text).unwrap_or_else(|_| panic!("not JSON: {}", text))
+/// Each line's owner, as prompt text or None.
+fn owners(blame: &Value) -> Vec<Option<String>> {
+    let mut lines = Vec::new();
+    for hunk in blame.get("hunks").unwrap().as_array().unwrap() {
+        let start = hunk.get("start").unwrap().as_i64().unwrap();
+        let end = hunk.get("end").unwrap().as_i64().unwrap();
+        let prompt = hunk
+            .get("conversation")
+            .and_then(|c| c.get("prompt"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        for _ in start..=end {
+            lines.push(prompt.clone());
+        }
+    }
+    lines
 }
 
-/// human prompt -> assistant Bash call -> its result, as Claude writes it.
-fn records(repo: &Path, command: &str, prompt: &str) -> Vec<Map> {
-    let cwd = s(repo);
-    let user = object! {
-        "type" => "user",
-        "uuid" => "u1",
-        "parentUuid" => Value::Null,
-        "sessionId" => SESSION,
-        "cwd" => cwd.as_str(),
-        "timestamp" => "2026-01-01T00:00:00.000Z",
-        "message" => object! {"role" => "user", "content" => prompt},
-    };
-    let assistant = object! {
-        "type" => "assistant",
-        "uuid" => "a1",
-        "parentUuid" => "u1",
-        "sessionId" => SESSION,
-        "cwd" => cwd.as_str(),
-        "timestamp" => "2026-01-01T00:00:10.000Z",
-        "message" => object! {
-            "id" => "msg1",
-            "role" => "assistant",
-            "content" => vec![Value::Object(object! {
-                "type" => "tool_use",
-                "id" => CALL,
-                "name" => "Bash",
-                "input" => object! {"command" => command},
-            })],
-        },
-    };
-    let result = object! {
-        "type" => "user",
-        "uuid" => "r1",
-        "parentUuid" => "a1",
-        "sessionId" => SESSION,
-        "cwd" => cwd.as_str(),
-        "timestamp" => "2026-01-01T00:00:20.000Z",
-        "message" => object! {
-            "role" => "user",
-            "content" => vec![Value::Object(object! {
-                "type" => "tool_result", "tool_use_id" => CALL, "content" => "ok",
-            })],
-        },
-    };
-    vec![user, assistant, result]
+fn some(text: &str) -> Option<String> {
+    Some(text.to_string())
 }
 
-fn jsonl(records: &[Map]) -> String {
-    records
-        .iter()
-        .map(|r| json::dumps(&Value::Object(r.clone()), json::DEFAULT) + "\n")
-        .collect()
-}
-
-fn transcript(env: &Env, command: &str, prompt: &str) -> String {
-    let path = transcript_path_for(&s(&env.repo), SESSION, Some(&s(&env.home)));
-    fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
-    fs::write(&path, jsonl(&records(&env.repo, command, prompt))).unwrap();
-    path
-}
-
-fn event(repo: &Path, call: &str) -> String {
-    let event = object! {
-        "session_id" => SESSION,
-        "cwd" => s(repo),
-        "tool_name" => "Bash",
-        "tool_use_id" => call,
-        "tool_input" => object! {"command" => "git commit"},
-    };
-    json::dumps(&Value::Object(event), json::DEFAULT)
-}
-
-fn hook(env: &Env, name: &str, call: &str) {
-    let output = loch(env, &env.repo, &["hook", name], &event(&env.repo, call));
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-}
-
-fn noted(env: &Env) -> HashSet<String> {
-    trace::noted_commits(&s(&env.repo))
-}
-
-fn read_note(env: &Env, commit: &str) -> Option<Map> {
-    trace::read_note(&s(&env.repo), commit)
+fn calculator_world() -> World {
+    let mut w = World::new(true);
+    w.write("notes.txt", "written by a person before loch\n");
+    w.prompt("p1", "write the calculator");
+    w.sh("cat > calc.py <<'EOF'\ndef add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\nEOF");
+    w.stop("p1");
+    w.prompt("p2", "make sub safer and generate the table");
+    w.sh("sed -i.bak 's/return a - b/return max(a - b, 0)/' calc.py && rm calc.py.bak");
+    w.sh("for i in 0 1 2; do echo \"row_$i = $((i * i))\"; done > table.py");
+    w.stop("p2");
+    w
 }
 
 #[test]
-fn hooks_note_exactly_the_commits_a_call_made() {
-    let env = env();
-    let old = commit(
-        &env,
-        "a.txt",
-        "a\n",
-        "old work",
-        Some("2020-01-01T00:00:00Z"),
-    );
-    run(&env, &env.repo, &["checkout", "-q", "-b", "side"], None);
-    let other = commit(
-        &env,
-        "b.txt",
-        "b\n",
-        "someone else",
-        Some("2020-01-02T00:00:00Z"),
-    );
-    run(&env, &env.repo, &["checkout", "-q", "main"], None);
-
-    hook(&env, "pre-tool", CALL);
-    let made = commit(&env, "c.txt", "c\n", "agent work", None);
-    hook(&env, "post-tool", CALL);
-    assert_eq!(noted(&env), HashSet::from([made.clone()]));
-    let expected = object! {
-        "agent" => "claude-code",
-        "call" => CALL,
-        "captured" => "hook",
-        "loch" => 1i64,
-        "session" => SESSION,
-    };
-    // IndexMap equality ignores order, as dict equality does.
-    assert_eq!(read_note(&env, &made).unwrap(), expected);
-
-    // Moving HEAD onto commits someone else made is not making them.
-    hook(&env, "pre-tool", "toolu_checkout");
-    run(&env, &env.repo, &["checkout", "-q", "side"], None);
-    hook(&env, "post-tool", "toolu_checkout");
-    assert_eq!(noted(&env), HashSet::from([made]));
-    assert!(read_note(&env, &other).is_none());
-    assert!(read_note(&env, &old).is_none());
-}
-
-#[test]
-fn a_call_that_leaves_head_alone_notes_nothing() {
-    let env = env();
-    commit(&env, "a.txt", "a\n", "first", None);
-    hook(&env, "pre-tool", CALL);
-    hook(&env, "post-tool", CALL);
-    assert!(noted(&env).is_empty());
-    // The post hook consumed the pending state either way.
-    let pending = env.repo.join(".git/loch/pending");
-    assert_eq!(fs::read_dir(pending).unwrap().count(), 0);
-}
-
-#[test]
-fn hook_command_never_fails() {
-    let env = env();
-    let output = loch(&env, &env.repo, &["hook", "post-tool"], "not json");
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-}
-
-#[test]
-fn install_is_idempotent_and_keeps_existing_settings() {
-    let env = env();
-    let settings = env.tmp.join(".claude").join("settings.json");
+fn install_writes_the_two_turn_hooks_and_keeps_existing_settings() {
+    let w = World::new(false);
+    let settings = w.repo.join(".claude/settings.json");
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::write(
         &settings,
-        r#"{"model": "x", "hooks": {"Stop": [{"hooks": []}]}}"#,
+        r#"{"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other"}]}]}}"#,
     )
     .unwrap();
-    let path = s(&settings);
+    // No repository is needed: the hooks record files, not commits.
+    let first = w.json(&["install"]);
     assert_eq!(
-        trace::install_hooks(&path, "loch").unwrap(),
-        vec!["PreToolUse", "PostToolUse", "Stop"]
+        first.get("added").unwrap(),
+        &json::loads(r#"["UserPromptSubmit", "Stop"]"#).unwrap()
     );
-    assert!(trace::install_hooks(&path, "loch").unwrap().is_empty());
-    let written = parse(&fs::read_to_string(&settings).unwrap());
+    let again = w.json(&["install"]);
+    assert_eq!(again.get("added").unwrap(), &Value::Array(vec![]));
+    let written = json::loads(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert!(written.get("model").unwrap().is_str("x"));
-    let hooks = written.get("hooks").unwrap();
-    let pre = hooks.get("PreToolUse").unwrap().as_array().unwrap();
-    assert!(pre[0].get("matcher").unwrap().is_str("Bash"));
-    assert_eq!(hooks.get("Stop").unwrap().as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn stop_snapshots_the_transcript() {
-    let env = env();
-    let path = transcript(&env, "git commit -m 'x'", "please add the file");
-    let store = FileStore::new(s(&env.tmp.join("store")));
-    let event = object! {"session_id" => SESSION, "transcript_path" => path.as_str()};
-    let Ok(Some(key)) = loch::hook::snapshot_transcript(&event, &store) else {
-        panic!("no snapshot taken");
-    };
-    assert_eq!(store.get(&key).unwrap(), fs::read(&path).unwrap());
-}
-
-#[test]
-fn stop_hook_snapshots_through_the_binary() {
-    let env = env();
-    let path = transcript(&env, "git commit -m 'x'", "please add the file");
-    let stdin = json::dumps(
-        &Value::Object(object! {"session_id" => SESSION, "transcript_path" => path.as_str()}),
-        json::DEFAULT,
-    );
-    let output = loch(&env, &env.repo, &["hook", "stop"], &stdin);
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    // With no LOCH_STORE the snapshot lands in the default store under HOME.
-    let store = FileStore::new(s(&env.home.join(".loch").join("store")));
-    let keys = store.list(&trace::transcripts_prefix()).unwrap();
-    assert_eq!(keys.len(), 1);
-    assert_eq!(store.get(&keys[0]).unwrap(), fs::read(&path).unwrap());
-}
-
-#[test]
-fn a_deleted_transcript_is_found_in_the_store() {
-    let env = env();
-    let path = transcript(&env, "git commit -m 'add a'", "please add the file");
-    hook(&env, "pre-tool", CALL);
-    let sha = commit(&env, "a.txt", "a\n", "add a", None);
-    hook(&env, "post-tool", CALL);
-    let store = FileStore::new(s(&env.tmp.join("store")));
-    let event = object! {"session_id" => SESSION, "transcript_path" => path.as_str()};
-    assert!(matches!(
-        loch::hook::snapshot_transcript(&event, &store),
-        Ok(Some(_))
-    ));
-    fs::remove_file(&path).unwrap();
-
-    let link = trace::Resolver::new(&s(&env.repo), Some(&store))
-        .resolve(&sha)
+    let stop = written
+        .get("hooks")
         .unwrap()
-        .expect("the commit resolves");
-    assert!(link.transcript.is_some());
-    assert_eq!(link.prompt.as_deref(), Some("please add the file"));
-}
-
-#[test]
-fn backfill_links_only_an_exact_match() {
-    let env = env();
-    // The transcript's call ran 00:00:10-00:00:20; these straddle it.
-    let inside = commit(&env, "a.txt", "a\n", "add a", Some("2026-01-01T00:00:15Z"));
-    let outside = commit(&env, "b.txt", "b\n", "add a", Some("2026-01-01T05:00:00Z"));
-    let unnamed = commit(&env, "c.txt", "c\n", "add c", Some("2026-01-01T00:00:15Z"));
-    transcript(
-        &env,
-        r#"git add a.txt && git commit -m "add a""#,
-        "please add the file",
-    );
-
-    let repo = s(&env.repo);
-    let mut seen: Vec<(usize, usize, u64, u64)> = Vec::new();
-    let mut progress = |a: usize, b: usize, c: u64, d: u64| seen.push((a, b, c, d));
-    let linked = trace::backfill(&repo, "HEAD", Some(&mut progress)).unwrap();
+        .get("Stop")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(
-        linked
-            .iter()
-            .map(|(sha, _)| sha.clone())
-            .collect::<Vec<_>>(),
-        vec![inside.clone()]
+        stop.len(),
+        2,
+        "the existing Stop hook is kept beside loch's"
     );
-    // One step per transcript, ending with everything read.
-    let last = *seen.last().expect("progress was reported");
-    assert!(last.0 == last.1 && last.2 == last.3 && last.3 > 0);
-    let note = read_note(&env, &inside).unwrap();
-    assert!(note.get("captured").unwrap().is_str("backfill"));
-    assert!(read_note(&env, &outside).is_none());
-    assert!(read_note(&env, &unnamed).is_none());
-    assert!(trace::backfill(&repo, "HEAD", None).unwrap().is_empty());
 }
 
 #[test]
-fn blame_names_the_prompt_behind_each_line() {
-    let env = env();
-    commit(&env, "f.txt", "human line\n", "by hand", None);
-    transcript(&env, "git commit -am 'agent'", "make it two lines");
-    hook(&env, "pre-tool", CALL);
-    let sha = commit(&env, "f.txt", "human line\nagent line\n", "agent", None);
-    hook(&env, "post-tool", CALL);
-
-    let output = loch(&env, &env.repo, &["blame", "f.txt", "--json"], "");
-    assert!(output.status.success());
-    let result = parse(&String::from_utf8(output.stdout).unwrap());
-    let hunks = result.get("hunks").unwrap().as_array().unwrap();
-    let shape: Vec<(i64, bool)> = hunks
-        .iter()
-        .map(|h| {
-            (
-                h.get("start").unwrap().as_i64().unwrap(),
-                matches!(h.get("conversation"), Some(Value::Null)),
-            )
-        })
-        .collect();
-    assert_eq!(shape, vec![(1, true), (2, false)]);
-    assert!(hunks[1].get("commit").unwrap().is_str(&sha));
-    let conversation = hunks[1].get("conversation").unwrap();
-    assert!(conversation
-        .get("prompt")
-        .unwrap()
-        .is_str("make it two lines"));
-    assert!(conversation
-        .get("turn")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
+fn install_retires_the_per_command_hooks_it_used_to_write() {
+    let w = World::new(true);
+    let settings = w.repo.join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        &settings,
+        r#"{"hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "loch hook pre-tool 2>/dev/null || true"}]}],
+            "PostToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "loch hook post-tool 2>/dev/null || true"},
+                {"type": "command", "command": "keep-me"}]}]}}"#,
+    )
+    .unwrap();
+    let result = w.json(&["install"]);
+    assert_eq!(
+        result.get("removed").unwrap(),
+        &json::loads(r#"["PreToolUse", "PostToolUse"]"#).unwrap()
+    );
+    let hooks = json::loads(&fs::read_to_string(&settings).unwrap()).unwrap();
+    let hooks = hooks.get("hooks").unwrap();
+    assert!(
+        hooks.get("PreToolUse").is_none(),
+        "an emptied event is dropped"
+    );
+    let post = hooks.get("PostToolUse").unwrap().as_array().unwrap();
+    assert_eq!(post[0].get("hooks").unwrap().as_array().unwrap().len(), 1);
 }
 
 #[test]
-fn log_finds_conversations_blame_has_painted_over() {
-    let env = env();
-    let first = commit(&env, "f.txt", "one\nother\n", "by hand", None);
-    transcript(&env, "git commit -am 'agent'", "reword line one");
-    hook(&env, "pre-tool", CALL);
-    let agent = commit(&env, "f.txt", "uno\nother\n", "agent", None);
-    hook(&env, "post-tool", CALL);
-    let last = commit(&env, "f.txt", "ONE\nother\n", "by hand again", None);
-    commit(&env, "f.txt", "ONE\nelse\n", "only line two", None);
+fn edits_made_by_shell_commands_are_attributed_to_their_turn() {
+    let w = calculator_world();
+    let blame = w.json(&["blame", "calc.py"]);
+    assert_eq!(
+        owners(&blame),
+        vec![
+            some("write the calculator"),
+            some("write the calculator"),
+            some("write the calculator"),
+            some("write the calculator"),
+            // Changed by `sed` in the second turn.
+            some("make sub safer and generate the table"),
+        ]
+    );
+    // Written by a generator the agent ran, not by any edit tool.
+    let table = w.json(&["blame", "table.py"]);
+    assert_eq!(
+        owners(&table),
+        vec![some("make sub safer and generate the table"); 3]
+    );
+}
 
-    let log = |target: &str| -> Value {
-        let output = loch(&env, &env.repo, &["log", target, "--json"], "");
-        assert!(output.status.success());
-        parse(&String::from_utf8(output.stdout).unwrap())
-    };
+#[test]
+fn a_person_s_edits_between_turns_are_not_the_agent_s() {
+    let mut w = calculator_world();
+    w.sh("echo 'def mul(a, b): return a * b' >> calc.py");
+    w.prompt("p3", "say hello");
+    w.stop("p3");
+    let lines = owners(&w.json(&["blame", "calc.py"]));
+    assert_eq!(lines.last().unwrap(), &None);
+    // And what existed before loch was installed belongs to nobody.
+    assert_eq!(owners(&w.json(&["blame", "notes.txt"])), vec![None]);
+}
 
-    // blame of line 1 sees only `last`; its history still holds the agent.
-    let line = log("f.txt:1");
-    let commits = line.get("commits").unwrap().as_array().unwrap();
-    let shas: Vec<&str> = commits
-        .iter()
-        .map(|c| c.get("commit").unwrap().as_str().unwrap())
+#[test]
+fn the_link_survives_a_squash_and_a_fresh_clone() {
+    let w = calculator_world();
+    w.git(&w.repo, &["add", "-A"]);
+    w.git(&w.repo, &["commit", "-q", "-m", "squashed"]);
+    let clone = w.root.join("teammate");
+    w.git(&w.root, &["clone", "-q", &s(&w.repo), &s(&clone)]);
+    // Another machine: its own empty HOME, only the store in common.
+    let other_home = w.root.join("other-home");
+    fs::create_dir_all(&other_home).unwrap();
+    let out = w
+        .command(env!("CARGO_BIN_EXE_loch"), &clone)
+        .args(["blame", "calc.py", "--json"])
+        .env("HOME", &other_home)
+        .output()
+        .unwrap();
+    let blame = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    assert_eq!(
+        owners(&blame)[4],
+        some("make sub safer and generate the table")
+    );
+    let first = &blame.get("conversations").unwrap().as_array().unwrap()[0];
+    assert!(
+        first.get("available").unwrap().truthy(),
+        "the transcript comes from the store"
+    );
+}
+
+#[test]
+fn reformatting_keeps_the_link_and_rewriting_loses_it() {
+    let w = calculator_world();
+    w.sh("sed -i.bak 's/^    return a + b/        return a + b/' calc.py && rm calc.py.bak");
+    w.sh("sed -i.bak 's/^def add(a, b):/def add(x, y):/' calc.py && rm calc.py.bak");
+    let lines = owners(&w.json(&["blame", "calc.py"]));
+    assert_eq!(lines[0], None, "rewritten by hand, so no longer the turn's");
+    assert_eq!(
+        lines[1],
+        some("write the calculator"),
+        "re-indented, still the turn's"
+    );
+}
+
+#[test]
+fn stopping_twice_for_one_prompt_is_one_turn() {
+    let mut w = World::new(true);
+    w.prompt("p1", "two steps");
+    w.write("a.py", "first = 1\n");
+    w.stop("p1");
+    w.write("a.py", "first = 1\nsecond = 2\n");
+    // Claude Code stops again for the same prompt.
+    let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
+    assert!(out.status.success());
+    let log = w.json(&["log", "a.py"]);
+    assert_eq!(
+        log.get("conversations").unwrap().as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        owners(&w.json(&["blame", "a.py"])),
+        vec![some("two steps"); 2]
+    );
+}
+
+#[test]
+fn a_turn_with_no_baseline_attributes_nothing_and_becomes_one() {
+    let mut w = World::new(true);
+    w.write("old.py", "existing_code = True\n");
+    // A stop with no prompt hook before it and no earlier snapshot.
+    w.record(
+        r#"{"type": "user", "uuid": "p0", "message": {"content": "hooks just installed"}}"#.into(),
+    );
+    let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
+    assert!(out.status.success());
+    assert_eq!(owners(&w.json(&["blame", "old.py"])), vec![None]);
+    // The next turn measures from that snapshot.
+    w.prompt("p1", "change it");
+    w.write("old.py", "existing_code = False\n");
+    w.stop("p1");
+    assert_eq!(
+        owners(&w.json(&["blame", "old.py"])),
+        vec![some("change it")]
+    );
+}
+
+#[test]
+fn ignored_files_are_not_recorded() {
+    let mut w = World::new(true);
+    w.write(".gitignore", "build/\n");
+    w.prompt("p1", "build it");
+    w.write("build/out.txt", "generated artifact line\n");
+    w.write("src.py", "source_line = 1\n");
+    w.stop("p1");
+    let records: Vec<_> = fs::read_dir(w.store.join("index/file"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(shas, vec![last.as_str(), agent.as_str(), first.as_str()]);
-    let unlinked: Vec<bool> = commits
-        .iter()
-        .map(|c| matches!(c.get("conversation"), Some(Value::Null)))
-        .collect();
-    assert_eq!(unlinked, vec![true, false, true]);
-    let lines = line.get("lines").unwrap();
-    assert_eq!(obj(lines.clone()).len(), 2);
-    assert_eq!(lines.get("start").unwrap().as_i64(), Some(1));
-    assert_eq!(lines.get("end").unwrap().as_i64(), Some(1));
-    let conversations = line.get("conversations").unwrap().as_array().unwrap();
-    let prompts: Vec<&str> = conversations
+    assert!(records.iter().any(|name| name.ends_with("src.py")));
+    assert!(
+        !records.iter().any(|name| name.contains("build")),
+        "{:?}",
+        records
+    );
+}
+
+#[test]
+fn a_session_in_the_home_directory_is_not_snapshotted() {
+    let w = World::new(false);
+    let event = format!(
+        r#"{{"session_id": "{}", "cwd": "{}", "transcript_path": "{}"}}"#,
+        SESSION,
+        s(&w.home),
+        s(&w.transcript)
+    );
+    for name in ["prompt", "stop"] {
+        let out = w.loch_in(&w.home, &["hook", name], &event);
+        assert!(out.status.success() && out.stdout.is_empty());
+    }
+    assert!(!w.home.join(".loch/objects").exists());
+}
+
+#[test]
+fn hooks_never_fail_and_never_print() {
+    let w = World::new(true);
+    for (name, stdin) in [
+        ("prompt", "not json"),
+        ("stop", "[1, 2]"),
+        ("stop", "{}"),
+        ("prompt", r#"{"session_id": "../escape"}"#),
+        ("pre-tool", "{}"),
+        ("bogus", "{}"),
+    ] {
+        let out = w.loch_in(&w.repo, &["hook", name], stdin);
+        assert!(out.status.success(), "{} {}", name, stdin);
+        assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    }
+}
+
+#[test]
+fn stop_snapshots_the_transcript_into_the_store() {
+    let mut w = World::new(true);
+    w.prompt("p1", "anything");
+    w.stop("p1");
+    let key = w
+        .store
+        .join("transcripts/claude-code/-repo")
+        .join(format!("{}.jsonl", SESSION));
+    assert_eq!(fs::read(key).unwrap(), fs::read(&w.transcript).unwrap());
+}
+
+#[test]
+fn log_lists_every_turn_that_changed_a_file_or_a_range() {
+    let w = calculator_world();
+    let whole = w.json(&["log", "calc.py"]);
+    let prompts: Vec<&str> = whole
+        .get("conversations")
+        .unwrap()
+        .as_array()
+        .unwrap()
         .iter()
         .map(|c| c.get("prompt").unwrap().as_str().unwrap())
         .collect();
-    assert_eq!(prompts, vec!["reword line one"]);
     assert_eq!(
-        conversations[0].get("commits").unwrap(),
-        &Value::Array(vec![Value::str(agent.as_str())])
+        prompts,
+        vec![
+            "make sub safer and generate the table",
+            "write the calculator"
+        ]
     );
+    let range = w.json(&["log", "calc.py:1-2"]);
     assert_eq!(
-        log("f.txt")
-            .get("commits")
+        range
+            .get("conversations")
             .unwrap()
             .as_array()
             .unwrap()
             .len(),
-        4
+        1
     );
-
-    let output = loch(&env, &env.repo, &["log", "f.txt:9", "--json"], "");
-    assert!(!output.status.success());
-    let failure = parse(&String::from_utf8(output.stdout).unwrap());
-    assert!(failure.get("code").unwrap().is_str("usage"));
-}
-
-fn set_path(record: &mut Map, path: &[&str], index: Option<usize>, key: &str, value: &str) {
-    let mut node = record;
-    for part in path {
-        node = match node.get_mut(*part) {
-            Some(Value::Object(next)) => next,
-            _ => panic!("no object at {}", part),
-        };
-    }
-    let node = match index {
-        Some(i) => match node.get_mut("content") {
-            Some(Value::Array(items)) => match &mut items[i] {
-                Value::Object(item) => item,
-                _ => panic!("not an object"),
-            },
-            _ => panic!("no content"),
-        },
-        None => node,
-    };
-    node.insert(key.into(), Value::str(value));
-}
-
-fn read_jsonl(path: &str) -> Vec<Map> {
-    fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| obj(parse(line)))
-        .collect()
-}
-
-fn with(record: &Map, fields: &[(&str, Value)]) -> Map {
-    let mut copy = record.clone();
-    for (key, value) in fields {
-        copy.insert(key.to_string(), value.clone());
-    }
-    copy
-}
-
-fn uuids(records: &[Map]) -> Vec<Option<&str>> {
-    records
-        .iter()
-        .map(|r| r.get("uuid").and_then(Value::as_str))
-        .collect()
+    let past = w.json(&["log", "calc.py:9"]);
+    assert!(past.get("code").unwrap().is_str("usage"));
 }
 
 #[test]
-fn fork_cuts_after_the_whole_round_and_leaves_the_original() {
-    let env = env();
-    let path = transcript(&env, "git commit", "please add the file");
-    let records = read_jsonl(&path);
-    // A parallel second call in the same message, with its result after ours,
-    // then the conversation carrying on past the commit.
-    let mut second = with(
-        &records[1],
-        &[("uuid", "a2".into()), ("parentUuid", "a1".into())],
-    );
-    set_path(&mut second, &["message"], Some(0), "id", "toolu_other");
-    let result_one = with(&records[2], &[("parentUuid", "a2".into())]);
-    let mut result_two = with(
-        &records[2],
-        &[("uuid", "r2".into()), ("parentUuid", "r1".into())],
-    );
-    set_path(
-        &mut result_two,
-        &["message"],
-        Some(0),
-        "tool_use_id",
-        "toolu_other",
-    );
-    let later = with(
-        &records[0],
-        &[
-            ("uuid", "u2".into()),
-            ("parentUuid", "r2".into()),
-            ("message", Value::Object(object! {"content" => "more"})),
-        ],
-    );
-    let lines = vec![
-        records[0].clone(),
-        records[1].clone(),
-        second,
-        result_one,
-        result_two,
-        later,
-    ];
-    let original = jsonl(&lines);
-    fs::write(&path, &original).unwrap();
-
-    let target = env.tmp.join("elsewhere");
-    fs::create_dir_all(&target).unwrap();
-    let Ok(fork) = trace::fork_session(&path, &s(&target), Some(CALL), None) else {
-        panic!("fork failed");
-    };
-
-    assert_eq!(fs::read_to_string(&path).unwrap(), original);
-    let forked = read_jsonl(&fork.path);
-    assert_eq!(
-        uuids(&forked),
-        vec![
-            Some("u1"),
-            Some("a1"),
-            Some("a2"),
-            Some("r1"),
-            Some("r2"),
-            None
-        ]
-    );
-    let sessions: HashSet<&str> = forked
-        .iter()
-        .map(|r| r.get("sessionId").unwrap().as_str().unwrap())
-        .collect();
-    assert_eq!(sessions, HashSet::from([fork.session_id.as_str()]));
-    let cwds: HashSet<&str> = forked
-        .iter()
-        .filter_map(|r| r.get("cwd"))
-        .map(|c| c.as_str().unwrap())
-        .collect();
-    let target_text = s(&target);
-    assert_eq!(cwds, HashSet::from([target_text.as_str()]));
-    assert!(forked
-        .last()
-        .unwrap()
-        .get("type")
-        .unwrap()
-        .is_str("custom-title"));
-    assert_eq!(
-        fork.path,
-        transcript_path_for(&target_text, &fork.session_id, None)
-    );
+fn ask_forks_at_the_end_of_the_turn_that_wrote_the_line() {
+    let w = calculator_world();
+    let asked = w.json(&["ask", "calc.py:5", "--at-turn"]);
+    assert!(asked.get("ok").unwrap().truthy());
+    assert!(asked.get("at").unwrap().is_str("turn"));
+    let fork = asked.get("fork").unwrap();
+    let path = fork.get("path").unwrap().as_str().unwrap();
+    let text = fs::read_to_string(path).unwrap();
+    // Cut at the second turn's last record, so its prompt and reply are in
+    // and nothing after them is.
+    assert!(text.contains("p2-end"));
+    assert!(text.contains("\"customTitle\""));
+    let unlinked = w.json(&["ask", "notes.txt:1"]);
+    assert!(unlinked.get("code").unwrap().is_str("not-linked"));
 }
 
 #[test]
-fn fork_without_a_call_runs_to_the_end_of_the_conversation() {
-    let env = env();
-    let path = transcript(&env, "git commit", "please add the file");
-    let mut records = read_jsonl(&path);
-    let later = with(
-        &records[0],
-        &[
-            ("uuid", "u2".into()),
-            ("parentUuid", "r1".into()),
-            ("message", Value::Object(object! {"content" => "more"})),
-        ],
-    );
-    records.push(later);
-    fs::write(&path, jsonl(&records)).unwrap();
-
-    let Ok(fork) = trace::fork_session(&path, &s(&env.repo), None, None) else {
-        panic!("fork failed");
-    };
-    let forked = read_jsonl(&fork.path);
-    assert_eq!(
-        uuids(&forked),
-        vec![Some("u1"), Some("a1"), Some("r1"), Some("u2"), None]
-    );
+fn ask_finds_a_deleted_transcript_in_the_store_or_says_it_is_missing() {
+    let w = calculator_world();
+    fs::remove_file(&w.transcript).unwrap();
+    assert!(w.json(&["ask", "calc.py:1"]).get("ok").unwrap().truthy());
+    fs::remove_dir_all(w.store.join("transcripts")).unwrap();
+    fs::remove_dir_all(w.home.join(".loch/cache")).unwrap();
+    let missing = w.json(&["ask", "calc.py:1"]);
+    assert!(missing.get("code").unwrap().is_str("transcript-missing"));
 }
 
 #[test]
-fn blame_html_marks_every_line_with_its_conversation() {
-    let env = env();
-    commit(&env, "f.txt", "human line\n", "by hand", None);
-    transcript(&env, "git commit -am 'agent'", "make it <two> lines");
-    hook(&env, "pre-tool", CALL);
-    commit(&env, "f.txt", "human line\nagent line\n", "agent", None);
-    hook(&env, "post-tool", CALL);
-    fs::write(
-        env.repo.join("f.txt"),
-        "human line\nagent line\nwork in progress\n",
-    )
-    .unwrap();
+fn reindex_rebuilds_the_file_index_from_the_records() {
+    let w = calculator_world();
+    fs::remove_dir_all(w.store.join("index/file")).unwrap();
+    let result = w.json(&["reindex"]);
+    assert_eq!(result.get("fileEntries").unwrap().as_i64(), Some(2));
+    // Blame from a machine with no local records relies on that index.
+    fs::remove_dir_all(w.home.join(".loch/edits")).unwrap();
+    assert_eq!(owners(&w.json(&["blame", "table.py"])).len(), 3);
+    assert!(owners(&w.json(&["blame", "table.py"]))[0].is_some());
+}
 
-    let page = env.tmp.join("blame.html");
-    let output = loch(
-        &env,
-        &env.repo,
-        &["blame", "f.txt", "--html", &s(&page), "--no-open"],
-        "",
-    );
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("wrote {}\n", s(&page))
-    );
-    let html = fs::read_to_string(&page).unwrap();
-    assert!(html.contains(r#"<tr data-mark="·" data-line="1""#));
-    assert!(html.contains(r#"<tr data-mark="A" data-line="2""#));
-    assert!(html.contains(r#"<tr data-mark="+" data-line="3""#));
-    assert!(html.contains("make it &lt;two&gt; lines"));
-    assert!(!html.split("<script>").next().unwrap().contains("<two>"));
+#[test]
+fn blame_html_writes_one_self_contained_page() {
+    let w = calculator_world();
+    let page = w.root.join("page.html");
+    let result = w.json(&["blame", "calc.py", "--html", &s(&page), "--no-open"]);
+    assert!(result.get("ok").unwrap().truthy());
+    let html = fs::read_to_string(page).unwrap();
+    assert!(html.contains("write the calculator"));
+    assert!(!html.contains("<script src"), "no external assets");
+}
+
+#[test]
+fn a_workspace_without_git_is_attributed_too() {
+    let mut w = World::new(false);
+    w.prompt("p1", "plain directory");
+    w.write("sub/x.txt", "plain directory content\n");
+    w.stop("p1");
+    let out = w.loch_in(&w.repo.join("sub"), &["blame", "x.txt", "--json"], "");
+    let blame = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    assert_eq!(owners(&blame), vec![some("plain directory")]);
+    assert!(blame
+        .get("project")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .starts_with("dir:"));
+}
+
+#[test]
+fn a_person_s_lone_brace_is_not_credited_to_the_agent() {
+    let mut w = World::new(true);
+    w.prompt("p1", "write a block");
+    w.write("a.js", "function go() {\n  return compute();\n}\n");
+    w.stop("p1");
+    // Written by hand afterwards: the same text as the agent's closing
+    // brace, but on its own it proves nothing.
+    w.sh("printf 'const other = 1;\\n}\\n' >> a.js");
+    let lines = owners(&w.json(&["blame", "a.js"]));
+    assert_eq!(lines[..3], vec![some("write a block"); 3][..]);
+    assert_eq!(lines[3..], [None, None]);
 }

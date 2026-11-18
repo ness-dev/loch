@@ -3,7 +3,7 @@
 use crate::json::{self, Map, Value};
 use std::io::Write;
 
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 pub const JSON_FLAG: &str = "--json";
 

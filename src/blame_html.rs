@@ -163,14 +163,7 @@ pub fn render(
             }
             _ => "(no prompt recorded)".into(),
         };
-        let commits: Vec<String> = entry
-            .get("commits")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(|c| py::truncate(c, 7).to_string())
-            .collect();
+        let ended = entry.get("ended").and_then(Value::as_str).unwrap_or("");
         let session = entry.get("session").and_then(Value::as_str).unwrap_or("");
         key.push_str(&format!(
             "<li data-mark=\"{}\" style=\"--c:{}\"><span class=\"chip\">{}</span><span class=\"asked\">“{}”</span><span class=\"meta\">session {} · {}</span></li>",
@@ -179,7 +172,7 @@ pub fn render(
             escape(&mark),
             escape(&asked),
             escape(py::truncate(session, 8)),
-            escape(&commits.join(", "))
+            escape(py::truncate(ended, 10))
         ));
     }
 

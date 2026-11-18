@@ -10,14 +10,13 @@ Usage:
   loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
-  loch install  [--local] [--command <loch>]
+  loch install [--local] [--command <loch>]
   loch blame   <file> [--html [<path>] [--lines <ranges>] [--no-open]]
                [--store <uri>]
   loch log     <file>[:<line>[-<end>]] [--store <uri>]
-  loch ask     <commit | file:line> [<question>] [--at-commit] [--no-launch]
+  loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
                [--store <uri>]
-  loch backfill [--revision <rev>]   (default: every branch)
-  loch hook    pre-tool | post-tool | stop      (run by Claude Code)
+  loch hook    prompt | stop      (run by the agent's harness)
   loch --version
 
 Every command takes --json, which replaces the text below with one machine-
@@ -36,10 +35,10 @@ Environment:
 
 Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 
-`install` adds Claude Code hooks to a repository that note, on every commit an
-agent makes, the conversation and tool call that made it (git notes on
-refs/notes/loch), and snapshot each session's transcript into the store.
-`blame` shows which conversation wrote each line, `log` every conversation
-that changed a file or line range over its history; `ask` forks that
-conversation and resumes it in Claude Code — from its end, or with
---at-commit from just after the commit.
+`install` adds Claude Code hooks that snapshot the workspace when a prompt is
+submitted and when the agent stops, and record which lines each turn added —
+however it added them — in the store, along with the session's transcript.
+Nothing is written to git, so squashes and rebases don't lose anything.
+`blame` shows which turn wrote each line, `log` every turn that changed a file
+or line range; `ask` forks that conversation and resumes it in Claude Code —
+from its end, or with --at-turn from the end of the turn that wrote the line.

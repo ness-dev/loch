@@ -241,8 +241,10 @@ pub fn delete_bundle(store: &dyn Store, ref_: &str) -> Result<Vec<String>, Index
     Ok(removed)
 }
 
+/// Rebuilds the branch dimension from the bundles. Other dimensions are
+/// derived from other sources (`file`, from edit records) and are left alone.
 pub fn reindex(store: &dyn Store) -> Result<ReindexResult, IndexError> {
-    let stale: BTreeSet<String> = store.list(INDEX_PREFIX)?.into_iter().collect();
+    let stale: BTreeSet<String> = store.list(&dimension_prefix(BRANCH))?.into_iter().collect();
     let mut bundles = 0;
     let mut written: BTreeSet<String> = BTreeSet::new();
     for key in store.list(BUNDLES_PREFIX)? {

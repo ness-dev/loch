@@ -277,40 +277,95 @@ content/<hex>    content object
 turns/<hex>      turn core
 ```
 
-## 10. Git pins (partly implemented)
+## 10. Workspace attribution (implemented) and pins
 
-**Implemented: commit to turn.** A git note on `refs/notes/loch` links a
-commit to the tool call that made it:
+Which turn wrote which lines of a project, recorded without git and found
+again by content, so that squashing, rebasing, cherry-picking and cloning
+lose nothing.
+
+**Capture.** At the start and end of each turn the workspace is snapshotted.
+The turn's changes are what differs between the two, however the agent made
+them: an edit tool, a shell command, a generator, a formatter it ran.
+- **The workspace root** is the nearest ancestor of the session's cwd holding a
+  `.git` entry, read as a marker only, or the cwd itself where there is none.
+  Symlinks are resolved first.
+- **What counts as a file:** every regular file the user's ignore rules let
+  through (`.gitignore`, nested ignores, the global excludes file), with or
+  without a repository; `.git` itself is never one.
+- **Roots that are refused:** `/`, the home directory, and any root holding
+  more than 100,000 files.
+- **Snapshots are content-addressed and local.** A snapshot's id is the
+  SHA-256 of its manifest, one `<content sha256>\t<size>\t<path>` line per
+  file, sorted by path.
+- **Turn boundaries** come from the harness: Claude Code's `UserPromptSubmit`
+  and `Stop` hooks. A harness with only an end-of-turn signal uses each
+  turn's end snapshot as the next turn's start. With no signal at all, a
+  change is attributed to the span between two snapshots.
+- **Repeated stops are one turn.** Claude Code can stop more than once for one
+  prompt; those stops are one turn, measured from where it began.
+
+**What a turn added.** For each file whose content changed, a line diff
+(Myers) from the start to the end snapshot gives the inserted and replaced
+lines. Consecutive ones form a hunk. A new file contributes all of its
+lines; a binary file (any NUL, or not UTF-8) and a deleted file contribute
+none.
+
+**Line hash.** The first 8 bytes of SHA-256 over the line with surrounding
+whitespace removed, as 16 lowercase hex digits. Whitespace is excluded so a
+formatter re-indenting a turn's code doesn't sever the link.
+
+**Edit record.** One JSON document per session holds every turn's hunks:
 
 ```json
-{"loch": 1, "agent": "claude-code", "session": "<session id>", "call": "<tool call id>", "captured": "hook"}
+{"loch": 1, "agent": "claude-code", "session": "<id>",
+ "project": "git:<root commit>", "root": "<workspace path on that machine>",
+ "turns": [{"promptUuid": "<record>", "endUuid": "<record>",
+            "started": "<ISO-8601>", "ended": "<ISO-8601>",
+            "prompt": "<first 120 characters, redacted>",
+            "startSnapshot": "<id>", "endSnapshot": "<id>",
+            "files": [{"path": "<relative, / separated>",
+                       "hunks": [{"start": 12, "lines": ["<line hash>", ...]}]}]}]}
 ```
 
-`captured` is `hook` when Claude Code hooks recorded it as the commit was made
-(HEAD before and after each Bash call, bounded by commit time so a checkout
-isn't mistaken for authorship), or `backfill` when it was matched afterwards:
-exactly one Bash call whose command holds the commit's subject and whose run
-brackets the commit's author or committer time. The note names the agent's own
-ids, not a turn id, because it is written before any ingest; a reader resolves
-it to the turn holding that `tool-call`. Notes carry no transcript text, so they
-are envelopes in the §9 sense. `notes.rewriteRef` makes amend and rebase carry
-them over.
+- **What it carries:** hashes, plus the one field of transcript content `list`
+  already carries (the prompt's first 120 characters, redacted). No code.
+- **Where each turn begins and ends:** `promptUuid` and `endUuid` name the
+  agent's own transcript records.
+- **`project`** is the same on every clone and worktree. For a git repository
+  it is `git:` plus the repository's root commit (the smallest, if there are
+  several): read once, and immune to anything later history does. Anywhere
+  else it is `dir:` plus the root's directory name, which is weaker.
 
-The rest is the original design, not yet built.
+**Store layout:**
 
-A pin links a turn to the commit the working tree was at:
-
-```json
-{"pin": "sha256:<turn>", "repo": "<remote url or null>", "commit": "<sha>"}
+```
+edits/<agent>/<session>.json                       the record, rewritten each turn
+index/file/<percent-encoded project:path>/<session> derived: which sessions touched a file
 ```
 
-- **Pins are annotations, not part of the core.** Pinning a turn later
-  doesn't change its id.
-- **Each pinned commit is kept alive by a ref**
-  (`refs/loch/pins/<turn-hex>`), so a squash or rebase can't garbage-collect
-  the disk state a fork would check out.
-- Forking at a turn is: check out its pin in a new worktree, emit the
-  transcript up to that turn, resume.
+The index is derived, like every index entry (§9's rules for the store
+apply): `reindex` rebuilds it from the records.
+
+**Matching.** To attribute a file's current lines:
+1. **Gather candidates.** Every turn of every record that changed this
+   project-relative path.
+2. **Hash** each current line as above.
+3. **Claim runs.** A hunk claims a maximal run of the current file's
+   consecutive lines whose hashes equal consecutive hunk lines, provided at
+   least one line in the run is not *weak*. A weak line has fewer than three
+   alphanumeric characters: a brace, a blank, `end`. A run is what
+   attributes; one `}` matching proves nothing.
+4. **Apply oldest first.** Turns are applied in order of `ended`, so the most
+   recent turn to write a line's text owns it.
+
+A line no hunk claims was not written by a recorded turn. That includes a
+line someone rewrote after the agent wrote it, which is the intended answer.
+
+**Not yet built: pins.** Forking at a turn should resume against the files as
+they stood when the turn ended. That state is exactly the turn's
+`endSnapshot`. Restoring it into a fresh directory, and keeping the snapshots
+a pin needs from being pruned, is what remains. Snapshot objects stay local
+today, so a fork on another machine would need them uploaded first.
 
 ## 11. Native turns (not yet implemented)
 

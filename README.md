@@ -80,21 +80,20 @@ sessions produces a single ref.
 ## Blame a line back to its conversation
 
 ```sh
-loch install          # once per repo: Claude Code hooks, committed in .claude/
-loch backfill         # link commits made before the hooks, where it can be exact
+loch install          # once per project: Claude Code hooks, committed in .claude/
 
-loch blame loch/format.py
-#   102-112  6eb7b0d  Canonicalize per RFC 8785, fold agent events into facts
-#                     session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
-loch blame --html loch/format.py   # the whole file in a browser, tinted by conversation
+loch blame src/format.rs
+#     102-112  2026-11-18  session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"
+#     113-120  not written in a recorded turn
+loch blame --html src/format.rs   # the whole file in a browser, tinted by conversation
 
-loch log loch/format.py:105        # every conversation that ever changed line 105
-loch log loch/format.py:90-120     # ...or a range, followed through edits and moves
-loch log loch/format.py            # ...or the whole file, followed through renames
+loch log src/format.rs:105        # the turns that wrote what line 105 says now
+loch log src/format.rs:90-120     # ...or a range
+loch log src/format.rs            # ...or every turn that ever changed the file
 
-loch ask loch/format.py:105 "why not just json.dumps?"
+loch ask src/format.rs:105 "why not just json.dumps?"
 # forks the conversation that wrote line 105 and resumes it in Claude Code,
-# from where it ended; --at-commit stops it just after the commit instead
+# from where it ended; --at-turn stops it at the end of the turn that wrote it
 ```
 
 `blame --html` writes the same thing as a page and opens it: every line of the
@@ -102,13 +101,19 @@ file tinted by the conversation that wrote it, a key of what each one asked,
 and a line's `loch ask` command a click away. `--lines 1-20,90-120` limits it
 to an excerpt.
 
-With the hooks installed, every commit an agent makes gets a git note on
-`refs/notes/loch` naming the session and tool call that made it, and every
-session's transcript is copied into the store when it stops — Claude Code
-deletes its own after 30 days. Notes hold no transcript text; share them with
-`git push origin refs/notes/loch`. `ask` never touches the original session:
-it writes a new one holding the conversation, filed under
-the current checkout, so the follow-up sees today's code, not the commit's.
+**How it knows.** The hooks snapshot the project's files when you send a
+prompt and again when the agent stops, and record which lines the turn added —
+whether it used an edit tool, `sed`, a code generator or a formatter, since all
+of them land on disk the same way. Those records go to the store as hashes of
+the lines, not the code, and blame finds a line's turn by matching the text in
+front of it. Nothing is written to git, so a squash merge, a rebase or a
+cherry-pick loses nothing, and a teammate pointed at the same store sees the
+same answers in their own clone. A line someone later rewrites by hand is, by
+design, no longer the agent's. Each session's transcript is copied into the
+store too — Claude Code deletes its own after 30 days.
+
+`ask` never touches the original session: it writes a new one holding the
+conversation, so the follow-up sees today's code.
 
 ## Scripting it
 
@@ -117,7 +122,7 @@ document on stdout instead of the text above:
 
 ```sh
 loch save --json --branch feature/checkout-flow --store /tmp/outbound
-# {"schema":1,"ok":true,"command":"save","ref":"10482276...","bytes":4712,
+# {"schema":2,"ok":true,"command":"save","ref":"10482276...","bytes":4712,
 #  "redacted":2,"sessions":[{"sessionId":"e71cdcb1-...","branch":"feature/checkout-flow",
 #  "redactions":{"aws-access-key":1,"jwt":1}}],"indexed":[...]}
 
@@ -125,14 +130,14 @@ ref=$(loch save --json --store /tmp/outbound | jq -r .ref)
 loch restore --json "$ref" --into /path/to/repo --store /tmp/outbound
 
 loch --version --json
-# {"schema":1,"ok":true,"command":"version","version":"0.1.0"}
+# {"schema":2,"ok":true,"command":"version","version":"0.1.0"}
 ```
 
 Failures are documents too, on stdout, so one stream carries both outcomes:
 
 ```sh
 loch restore --json deadbeef --store /tmp/outbound; echo "exit $?"
-# {"schema":1,"ok":false,"command":"restore","code":"bundle-not-found",
+# {"schema":2,"ok":false,"command":"restore","code":"bundle-not-found",
 #  "error":"could not read deadbeef from /tmp/outbound: ..."}
 # exit 1
 ```

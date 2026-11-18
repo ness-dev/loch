@@ -52,6 +52,13 @@ impl Value {
         }
     }
 
+    pub fn as_object_mut(&mut self) -> Option<&mut Map> {
+        match self {
+            Value::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&Vec<Value>> {
         match self {
             Value::Array(items) => Some(items),

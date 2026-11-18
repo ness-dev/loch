@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod argparse;
+pub mod attribution;
 pub mod blame_html;
 pub mod bundle;
 pub mod claude;
@@ -20,6 +21,7 @@ pub mod py;
 pub mod redact;
 pub mod rewrite;
 pub mod s3;
+pub mod snapshot;
 pub mod store;
 pub mod sys;
 pub mod trace;

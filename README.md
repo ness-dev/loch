@@ -40,12 +40,23 @@ uv tool install "loch[s3] @ https://github.com/ness-dev/loch/releases/download/v
 Without it, an `s3://` store fails with `code: "s3-extra-missing"` rather than
 looking like a network problem.
 
+**A native build** lives in `rust/`: one static binary with the same
+commands, output and exit codes, S3 included, and a hook that costs 3ms a
+call rather than ~73ms. It isn't released yet; to use it now:
+
+```sh
+cd rust && cargo build --release      # target/release/loch
+```
+
 For development:
 
 ```sh
 poetry install       # brings boto3, so the S3 backend is covered by the tests
 poetry run loch --help
 poetry run pytest
+# the Rust build, held to the Python one output for output:
+(cd rust && cargo build --release)
+LOCH_RUST=rust/target/release/loch poetry run pytest test/test_equivalence*.py
 ```
 
 ## Use

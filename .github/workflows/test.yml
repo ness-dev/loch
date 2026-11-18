@@ -41,7 +41,7 @@ jobs:
       - run: poetry run mypy .
       - run: poetry run pytest
 
-  # The Rust build, held to the Python reference by test/test_equivalence.py.
+  # The Rust build, held to the Python reference by test/test_equivalence*.py.
   # Linux and macOS because the hooks' native git fast path is Unix-only and
   # its filesystem details (realpath, ownership) differ between the two.
   rust:
@@ -72,7 +72,7 @@ jobs:
       - run: pipx install poetry
       - run: poetry env use python && poetry install
         working-directory: .
-      - run: poetry run pytest -q test/test_equivalence.py
+      - run: poetry run pytest -q test/test_equivalence.py test/test_equivalence_commands.py
         working-directory: .
         env:
           LOCH_RUST: rust/target/release/loch

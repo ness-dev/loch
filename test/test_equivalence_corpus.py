@@ -11,6 +11,7 @@ directory, the command, and a byte offset or a hash.
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -54,51 +55,73 @@ def test_no_transcript_uses_the_surrogate_mapping_range() -> None:
     assert not hits, f"{len(hits)} transcripts use the reserved range: {hits[:5]}"
 
 
+def check_directory(root: Path, cwd: str) -> str | None:
+    """Both builds over one project directory; None if they agree."""
+    real = {"HOME": REAL_HOME, "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR")}
+
+    def scenario(w: World, loch) -> list[Run]:  # type: ignore[no-untyped-def]
+        store = str(w.root / "store")
+        runs = [
+            loch("list", "--cwd", cwd, env=real),
+            loch("list", "--cwd", cwd, "--json", env=real),
+            loch("save", "--cwd", cwd, "--store", store, "--json", env=real),
+            loch(
+                "ingest",
+                "--cwd",
+                cwd,
+                "--out",
+                str(w.root / "derived"),
+                "--json",
+                env=real,
+            ),
+        ]
+        bundles = sorted((w.root / "store" / "bundles").glob("*.loch"))
+        if bundles:
+            target = w.root / "target"
+            target.mkdir()
+            # The temporary home: a different machine, and nowhere real.
+            runs.append(
+                loch(
+                    "restore",
+                    bundles[0].stem,
+                    "--store",
+                    store,
+                    "--into",
+                    str(target),
+                    "--json",
+                )
+            )
+        return runs
+
+    try:
+        twin(root, scenario, quiet=True)
+    except AssertionError as error:
+        return str(error)
+    finally:
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
+    return None
+
+
 def test_every_project_directory_matches(tmp_path: Path) -> None:
+    """In parallel — LOCH_CORPUS_JOBS, default every core — since the
+    reference's redaction makes a serial run over a busy machine take hours."""
     cases = project_cwds()
     assert cases, "no Claude Code sessions on this machine"
-    mismatched: list[str] = []
-    real = {"HOME": REAL_HOME, "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR")}
-    for index, (directory, cwd) in enumerate(cases):
-
-        def scenario(w: World, loch, _cwd: str = cwd) -> list[Run]:
-            store = str(w.root / "store")
-            runs = [
-                loch("list", "--cwd", _cwd, env=real),
-                loch("list", "--cwd", _cwd, "--json", env=real),
-                loch("save", "--cwd", _cwd, "--store", store, "--json", env=real),
-                loch(
-                    "ingest",
-                    "--cwd",
-                    _cwd,
-                    "--out",
-                    str(w.root / "derived"),
-                    "--json",
-                    env=real,
-                ),
-            ]
-            bundles = sorted((w.root / "store" / "bundles").glob("*.loch"))
-            if bundles:
-                target = w.root / "target"
-                target.mkdir()
-                # The temporary home: a different machine, and nowhere real.
-                runs.append(
-                    loch(
-                        "restore",
-                        bundles[0].stem,
-                        "--store",
-                        store,
-                        "--into",
-                        str(target),
-                        "--json",
-                    )
-                )
-            return runs
-
-        try:
-            twin(tmp_path / str(index), scenario, quiet=True)
-        except AssertionError as error:
-            mismatched.append(f"{directory}: {error}")
+    jobs = int(os.environ.get("LOCH_CORPUS_JOBS", str(os.cpu_count() or 1)))
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(
+            pool.map(
+                lambda item: check_directory(tmp_path / str(item[0]), item[1][1]),
+                enumerate(cases),
+            )
+        )
+    mismatched = [
+        f"{directory}: {result}"
+        for (directory, _), result in zip(cases, results)
+        if result is not None
+    ]
     assert not mismatched, (
         f"{len(mismatched)}/{len(cases)} directories differ:\n" + "\n".join(mismatched)
     )

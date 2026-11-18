@@ -165,10 +165,11 @@ loch/
 └── store.py     # Store interface + local-fs and S3-compatible backends
 test/
 ├── test_corpus.py  # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
-├── test_equivalence.py  # opt-in, Rust build vs Python (LOCH_RUST=<binary>)
+├── equivalence.py       # the harness: run both builds, compare everything
+├── test_equivalence*.py # opt-in, Rust vs Python (LOCH_RUST=<binary>)
 └── test_*.py       # one module per source module
 rust/               # the Rust build: one crate, binary `loch` (see "The Rust build")
-├── src/            # main, output, hook, git, store, s3, claude
+├── src/            # one module per Python module, plus argparse/json/py/sys
 ├── bench/hook.py   # per-call wall clock of `loch hook`, any number of binaries
 └── rust-toolchain.toml
 npm/                # @ness-dev/loch and its per-platform packages
@@ -506,7 +507,6 @@ never a code. The set today:
 | `git-failed` | a git command failed |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
-| `not-ported` | the Rust build was asked for a command only the Python one has yet |
 | `internal` | an unexpected exception |
 
 The four store-facing codes — `bundle-not-found`, `store-unreachable`,
@@ -613,82 +613,201 @@ publishing.
 ## The Rust build
 
 The goal is one static binary that Ness, a VS Code extension and the Claude
-Code hooks can ship and run, with no Python on the machine. **The Python
-package stays the reference implementation** until the port is complete: a
-command moves to Rust only once `test/test_equivalence.py` holds the two to
-the same output and side effects, and the Python suite has to keep passing
-on its own throughout.
+Code hooks can ship and run, with no Python on the machine. **Every command
+is ported**, and each is held to the Python by the equivalence harness. The
+Python package is still the reference until it is deleted. Until then a
+behaviour change lands in Python first, with the harness carrying it to Rust,
+and the Python suite keeps passing on its own.
 
 **Layout: `rust/`, one crate, not a root workspace.** The repository root
 belongs to Poetry (pyproject, the `loch` package, `release.sh`), and a root
 `Cargo.toml` would mean two build systems claiming the same directory and a
-`target/` beside the wheel's sources. One crate with modules mirroring the
-Python ones (`hook.rs` ↔ the hook half of `trace.py`, `output.rs` ↔
-`output.py`, …) is enough until something needs splitting into a library a
-second binary links; that is the point to make `rust/` a workspace, and
-nothing outside it would have to move.
+`target/` beside the wheel's sources. The modules mirror the Python ones
+(`cli.rs` ↔ `cli.py`, `rewrite.rs` ↔ `rewrite.py`, `hook.rs` ↔ the hook half
+of `trace.py`, …) plus four that Python gets from its standard library:
+`argparse.rs`, `json.rs`, `py.rs` (string semantics) and `sys.rs`
+(`os.path`, `datetime`, `OSError` strings). One crate is enough until a
+second binary needs a library; that is the point to make `rust/` a
+workspace, and nothing outside it moves.
 
 The toolchain is pinned in `rust/rust-toolchain.toml` (1.91.0), scoped to
 `rust/` so it never changes anyone's default. 1.83, which was installed,
-can't build today's `url`/`idna`, and pinning half the dependency tree
-backwards to stay on it would have been a standing cost for nothing.
+can't build today's `url`/`idna`.
 
-Unported commands answer `not-ported` rather than `unknown-command`: the
-command exists, and the fix is the Python install, not a typo.
+### What "equivalent" had to mean, and what it cost
 
-**The equivalence harness** builds each scenario twice at the same path with
-pinned git dates, so commit hashes, note blobs and even the notes-ref commit
-come out byte-identical, then drives one copy with `python -m loch.cli` and
-the other with the binary. It compares stdout, stderr and exit status
-byte-for-byte — `output.rs` reproduces `json.dumps` exactly, `", "`
-separators, `ensure_ascii` and float `repr` included, so that a comparison
-can be on bytes rather than on parsed values — plus the notes ref, the
-pending-state directory and the store. It also runs *mixed*: pre hook under
-one build, post hook under the other, which is what happens the moment a
-machine switches over mid-session; that is why the pending file's name and
-JSON shape are part of the contract between the two. With `LOCH_CORPUS=1`
-it adds the one hook path that reads a transcript (recovering a call id
-when the payload lacks one) on 150 of this machine's real sessions by
-default; their content exists only in a temp directory, failures name
-session ids, and it asserts a note was written so that two builds agreeing
-on nothing can't pass. Mutating the Rust (a wrong `captured` value, a
-loosened time bound, a corrupted signing key) fails it; that was checked.
+Byte-for-byte, on stdout, stderr, exit status and every file written — the
+standard the harness enforces — rules out leaning on Rust's libraries
+wherever Python's behaviour is the specification. In the order they bit:
 
-**`loch hook` is ported, and costs 3ms a call instead of ~73ms.** Measured
-with `rust/bench/hook.py` against the `uv tool` install: pre-tool 72.9 →
-3.1ms, post-tool with no commit 72.4 → 3.1ms, post-tool writing a note
-98.5 → 27.3ms (median of 60). The hooks run twice per agent shell command,
-so that is ~145ms of every Bash call down to ~6ms. Python's cost was ~50ms
-of imports — `importlib.metadata` alone is 19ms — and ~8ms per `git`
-process, of which the hot path ran two.
+- **JSON is Python's, not serde's.** `json.rs` parses as `json.loads` does
+  (duplicate keys keep their first position and last value, integers stay
+  exact at any size, `NaN`/`Infinity` accepted) and writes every flavour loch
+  uses (`ensure_ascii`, compact, sorted, `indent=2`, float `repr`) plus RFC
+  8785. serde_json refuses lone surrogates, and **five transcripts on one
+  machine hold them** (`\ud83d` cut from its pair by truncation).
+- **Lone surrogates are mapped into U+10F800..U+10FFFF** (`py.rs`), since a
+  Rust `String` can't hold one. That covers both the JSON escape and
+  `surrogateescape`'s undecodable bytes. They are mapped back wherever Python
+  would write them, and they sort, escape and canonicalize as the surrogate.
+  The cost: a transcript holding those private-use code points literally
+  would be misread. The corpus check asserts none on this machine does.
+- **Python's whitespace is not Rust's.** `str.isspace` (and so `\s`,
+  `split()`, `strip()`) includes U+001C..U+001F, which Unicode White_Space
+  doesn't. `py::is_space` is the 29 code points Python says, and every
+  ported pattern spells `\s` out as that set.
+- **argparse is ported, not approximated** (`argparse.rs`, from 3.12.10). Its
+  usage errors and `-h` text are output, so the A/O/- pattern matching,
+  abbreviation, `--opt=value`, `--`, the help formatter's wrapping at
+  `COLUMNS` and the 3.12.10 rule that stops a `nargs="?"` positional being
+  consumed empty before an option all had to match. The harness runs every
+  command through fifteen bad command lines at four widths.
+- **zlib's own deflate**, through flate2's zlib backend (memLevel 8, raw
+  window 15, which is `zlib.compressobj(9, DEFLATED, -15, 8, 0)`), because
+  the ref is a hash of the gzip bytes and miniz_oxide compresses differently.
+  zlib is built from source and linked statically.
+- **The rewrite and redaction regexes are run by hand** where a regex crate
+  couldn't express them: `rewrite.rs` executes the one-alternation `re.sub`
+  as an explicit scan with per-alternative guards (and, as in Python, a
+  source repeated with two targets maps to the last). `redact.rs` is
+  described below.
+- **Error strings are Python's**: `str(OSError)` (`[Errno 2] No such file or
+  directory: '/x'`), binascii's strict-mode base64 messages, botocore's
+  `An error occurred (Code) when calling the Op operation: Message`,
+  `gzip`'s `Not a gzipped file (b'ga')`. They reach the `error` field.
+- **boto3's request shapes**: a listing sends `encoding-type=url` and
+  decodes the keys, in boto3's parameter order, because the URL appears in a
+  connection error.
 
-Getting under the git floor is the fast path in `git.rs`: the two
-questions asked on every call — where is the git directory, what is HEAD —
-are answered by reading `.git` (including a worktree's `gitdir:` file,
-`commondir`, loose and packed refs) instead of spawning git. It answers
-only on layouts it fully understands and returns "ask git" for anything
-else: any discovery-changing `GIT_*` variable, reftable, a repository owned
-by another user (git's `safe.directory` would refuse it), a cwd inside
-`.git`, an unparseable ref, and Windows outright. **A gap there may only
-ever cost speed, never a different answer**, which the harness checks by
-having reftable, `GIT_DIR`, worktree, packed-refs, detached, unborn and
-symlinked-subdirectory scenarios. The note-writing path still runs `git log`
-and `git notes`, which is the remaining 24ms; it runs only when a call
-actually committed.
+**Three bugs in the reference turned up and were fixed in Python first**,
+because the rule is that the reference stays the reference:
 
-**S3 in Rust is SigV4 by hand over `ureq`/rustls**, not the AWS SDK — one
-signed PUT doesn't justify an async runtime and several MB. Its credential
-chain is `AWS_*` variables, then the shared credentials and config files for
-`AWS_PROFILE`; **SSO, `credential_process`, assumed roles and instance
-metadata are not read**, so a machine relying on them keeps the Python
-hook for now. The signer is pinned to AWS's published worked example, and
-the harness runs both builds against a moto server with IAM auth on, so a
-bad signature is refused rather than waved through. moto's verifier itself
-rejects boto3's correct signatures on keys holding a space or `+`, and on a
-`ListObjectsV2` prefix holding `/`; the test works around both, and a
-failure that looks like a signing bug in exactly those cases is moto's.
-A stop hook against a store that doesn't answer gives up after 20s rather
-than holding the turn.
+- **Bundle refs depended on the Python version and the platform.** From 3.11
+  `gzip.compress` lets zlib write the header's OS byte, 19 on macOS and 3 on
+  Linux, where 3.10 wrote 255. So the same sessions packed to a different
+  ref per machine. The header is now written by hand, byte-identical to
+  3.10's everywhere. Bundles saved before keep their refs, but a re-save of
+  the same sessions from 3.11+ gets a new one.
+- **One undecodable byte took down `list`** for the whole directory, since
+  `read_session_meta` caught `OSError` only. Metadata now decodes with
+  replacement, and `save` refuses such a session as `transcript-unreadable`
+  instead of with a traceback.
+- **`save` wasn't reproducible**, since `createdAt` is part of the hashed
+  bytes. `SOURCE_DATE_EPOCH` now fixes it in both builds. That is the
+  reproducible-builds convention, and it is what lets the harness compare
+  two builds' refs at all.
+
+**Divergences that remain, deliberately:**
+
+- An unexpected exception is a traceback in Python and `loch: internal
+  error: …` in Rust. JSON mode matches, both being `code: "internal"`.
+- A naive (offset-less) ISO timestamp is local time to Python and UTC to
+  Rust. Transcripts always carry `Z`.
+- Unicode digits (`int("١٢")`) are accepted by a few of Python's parses and
+  by none of Rust's.
+- The S3 credential chain stops at env and the shared files. SSO,
+  `credential_process`, assumed roles and instance metadata are not read.
+- Windows compiles in principle and has never been built.
+
+While the port was partial, unported commands answered `not-ported`. With
+nothing left unported that code is gone, and an unknown name is
+`unknown-command` in both builds.
+
+### The harness
+
+`test/equivalence.py` is the machinery, and three modules use it:
+`test_equivalence.py` (hooks), `test_equivalence_commands.py` (everything
+else, including an S3 run against moto) and `test_equivalence_corpus.py`
+(real transcripts). All are opt-in with `LOCH_RUST=<binary>`, and the corpus
+also needs `LOCH_CORPUS=1`.
+
+How a scenario runs:
+- **Twice, identically.** Each scenario is built twice at the same path with
+  pinned git dates, session mtimes and `SOURCE_DATE_EPOCH`. Python drives
+  one copy and the binary the other.
+- **Everything is compared.** That means every file under the scratch root
+  (git's own churn aside) plus the notes ref, HEAD and `notes.rewriteRef`.
+- **Generated values are renamed.** v4 UUIDs, which `--new-id` and `ask`'s
+  fork mint, become `UUID-n` in order of first appearance. Fixture ids are
+  deliberately not v4.
+- **Mixed runs.** The hook scenarios also run pre-tool under one build and
+  post-tool under the other, which is what a machine switching over
+  mid-session does. That is why the pending file's shape is a contract
+  between the two.
+
+**Planted bugs fail it.** That was checked, not assumed: a changed redaction
+token, a loosened path guard, the home-is-root rule, an argparse message, a
+float exponent boundary, a prose string, the prompt walk in `trace`, the
+percent-encoding of index segments, a converter fact name, a wrong
+`captured` value, a loosened hook time bound and a corrupted signing key
+each fail at least one scenario. Each of those first came back *green*
+until a scenario exercised it. The float one needed floats added to the
+fixtures, which is the reason to keep doing this whenever a scenario is
+added.
+
+**The corpus check** lists, saves, restores (onto a temporary HOME) and
+ingests every project directory on the machine with both builds, in
+parallel (`LOCH_CORPUS_JOBS`). It is read-only towards `~/.claude`, and a
+failure names a directory and a byte offset or hash, never content.
+
+### Performance
+
+**`loch hook`: 3ms a call instead of ~73ms.** Measured with
+`rust/bench/hook.py` against the `uv tool` install, median of 60:
+
+| case | Python | Rust |
+| --- | --- | --- |
+| pre-tool | 72.9ms | 3.1ms |
+| post-tool, no commit | 72.4ms | 3.1ms |
+| post-tool, writing a note | 98.5ms | 27.3ms |
+
+The hooks run twice per agent shell command, so that is ~145ms of every
+Bash call down to ~6ms. Python's cost was ~50ms of imports
+(`importlib.metadata` alone is 19ms) and ~8ms per `git` process, of which
+the hot path ran two.
+
+Getting under the git floor is the fast path in `git.rs`: where the git
+directory is and what HEAD is are answered by reading `.git` (a worktree's
+`gitdir:` file, `commondir`, loose and packed refs) instead of spawning git.
+It answers only on layouts it fully understands and says "ask git" for
+anything else: a discovery-changing `GIT_*` variable, reftable, a repository
+owned by another user (`safe.directory`), a cwd inside `.git`, an
+unparseable ref, and Windows outright. **A gap there may only ever cost
+speed, never a different answer.** The harness checks that with reftable,
+`GIT_DIR`, worktree, packed-refs, detached, unborn and symlinked scenarios.
+Writing a note still runs `git log` and `git notes`, which is the remaining
+24ms, and it happens only when a call committed.
+
+**Redaction was most of `save`'s cost in both builds**: 150s in Python and
+264s in Rust (first cut, fancy-regex) over 15 project directories. A
+backtracking engine tries all ten rules at every position, and
+`env-assignment` can begin at any capital. `redact.rs` gives the same
+answers with a restructured search:
+- **The nine prefixed rules** become plain `regex` crate searches, linear and
+  with leftmost-first semantics equal to backtracking. Their one-character
+  START/END checks are made by hand.
+- **`env-assignment`** is tried, anchored, only at the start of an
+  `[A-Z0-9_]` run that holds a keyword. Every way it could match from inside
+  the run is also a way from the run's start, so that is the only candidate.
+- **The next match** is the earliest position any rule matches at, ties going
+  to rule order.
+
+That brought it to 15s. The full Python alternation stays in the tests as an
+oracle, fuzzed against the fast path over 40k generated strings that
+exercise every rule (the test asserts each rule matched, so the fuzz can't
+pass vacuously). **Python's redaction is still the slow one**, which is why
+the corpus check runs in parallel. It is the reference, so it was left
+alone.
+
+**S3 is SigV4 by hand over `ureq`/rustls**, not the AWS SDK; four request
+kinds don't justify an async runtime and several MB. The signer is pinned to
+AWS's two published examples (a header-signed GET and a signed query
+string). The stop hook is checked against a moto server with IAM auth on, so
+a bad signature is refused. moto's verifier itself rejects boto3's correct
+signatures on keys holding a space or `+` and on prefixed listings, so the
+command-level S3 test runs with auth off; a failure that looks like a
+signing bug in exactly those cases is moto's. A store that doesn't answer
+fails after 20s rather than holding a turn.
 
 ### Packaging
 
@@ -721,7 +840,7 @@ should write the binary's absolute path with `loch install --local
 rather than rely on PATH.
 
 **`uv tool install` users** have a working install of the reference, so
-nothing changes for them until the port is complete. The intended switch is
+nothing has to change for them while the Python exists. The intended switch is
 to ship the Rust binary as platform wheels too — maturin's `bindings =
 "bin"`, the way ruff and uv ship — attached to the GitHub release next to
 today's pure-Python wheel, so the switch is the same `uv tool install
@@ -892,7 +1011,11 @@ agree is a one-line property test.
   `poetry run pytest`. Touching `rust/` adds `cargo fmt --check`,
   `cargo clippy --release --all-targets -- -D warnings`, `cargo test` there,
   and `LOCH_RUST=rust/target/release/loch poetry run pytest
-  test/test_equivalence.py` after a `cargo build --release`.
+  test/test_equivalence.py test/test_equivalence_commands.py` after a
+  `cargo build --release`. A change to how either build reads transcripts
+  adds the corpus check (`LOCH_CORPUS=1`).
+- A behaviour change goes into both builds in one commit, with a scenario
+  that would have told them apart.
 - A command is ported when the harness covers it, not when it compiles. Port
   behaviour exactly, quirks included, and fix a quirk in Python first if it
   is a bug, so the reference stays the reference.

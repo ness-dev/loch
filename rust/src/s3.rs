@@ -91,10 +91,14 @@ impl S3Store {
             &region,
             now,
         );
-        let url = if query_string.is_empty() {
+        let url = if query.is_empty() {
             target.url()
         } else {
-            format!("{}?{}", target.url(), query_string)
+            let in_order: Vec<String> = query
+                .iter()
+                .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
+                .collect();
+            format!("{}?{}", target.url(), in_order.join("&"))
         };
         let mut request = ureq::AgentBuilder::new()
             .timeout(TIMEOUT)
@@ -184,16 +188,20 @@ impl Store for S3Store {
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
         loop {
+            // boto3's order, which is the order the URL in an error shows;
+            // signing sorts its own copy. encoding-type=url is what boto3
+            // asks for too, so a key with any character survives the XML.
             let mut query = vec![("list-type", "2"), ("prefix", full.as_str())];
             if let Some(token) = &token {
                 query.push(("continuation-token", token.as_str()));
             }
+            query.push(("encoding-type", "url"));
             let response = self.request("GET", None, &query, b"", "ListObjectsV2")?;
             let text = String::from_utf8_lossy(&response.body).into_owned();
             let _ = response.status;
             for contents in xml_blocks(&text, "Contents") {
                 for key in xml_values(contents, "Key") {
-                    keys.push(self.relative_key(&key));
+                    keys.push(self.relative_key(&crate::index::unquote(&key)));
                 }
             }
             let truncated =

@@ -760,3 +760,82 @@ SCENARIOS: list[Scenario] = [
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.__name__)
 def test_command_matches_python(tmp_path: Path, scenario: Scenario) -> None:
     twin(tmp_path, scenario)
+
+
+def test_s3_store_matches_python(tmp_path: Path) -> None:
+    """The bundle commands against an S3 endpoint rather than a directory:
+    both builds' requests go to one moto server, reset between them. Auth is
+    off, because moto's verifier rejects boto3's own correct signatures on
+    the prefixed listings these commands make; signing is pinned to AWS's
+    published examples in s3.rs instead, and checked with auth on by the
+    stop-hook test."""
+    import urllib.request
+
+    import boto3
+    from equivalence import first_difference, normalized
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0)
+    server.start()
+    host, port = server.get_host_and_port()
+    endpoint = f"http://{host}:{port}"
+    credentials = {
+        "AWS_ACCESS_KEY_ID": "testing",
+        "AWS_SECRET_ACCESS_KEY": "testing",
+        "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+        "AWS_CONFIG_FILE": os.devnull,
+        "LOCH_S3_ENDPOINT": endpoint,
+        "LOCH_S3_REGION": "us-east-1",
+        "LOCH_STORE": "s3://loch-test/team/",
+    }
+    outcomes = []
+    try:
+        for impl in ("py", "rs"):
+            urllib.request.urlopen(
+                urllib.request.Request(f"{endpoint}/moto-api/reset", b"")
+            )
+            boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                region_name="us-east-1",
+                aws_access_key_id="testing",
+                aws_secret_access_key="testing",
+            ).create_bucket(Bucket="loch-test")
+            root = tmp_path / "world"
+            if root.exists():
+                import shutil
+
+                shutil.rmtree(root)
+            w = World(root)
+            cwd = rich_sessions(w)
+
+            def loch(*args: str, _w: World = w, _impl: str = impl, **kw: Any) -> Run:
+                env = {**credentials, **kw.pop("env", {})}
+                return _w.loch(_impl, *args, env=env, **kw)
+
+            runs = [*both(loch, "save", "--cwd", cwd)]
+            listed = json.loads(loch("list", "--all", "--json").stdout)
+            ref = listed["entries"][0]["ref"]
+            target = w.root / "target"
+            target.mkdir()
+            runs += [
+                *both(loch, "list", "--all"),
+                *both(loch, "list", "--remote", "--branch", "feature/x"),
+                *both(loch, "restore", ref, "--into", str(target)),
+                *both(loch, "restore", "0" * 64),
+                *both(loch, "reindex"),
+                *both(loch, "delete", ref),
+                *both(loch, "delete", ref),
+                *both(loch, "list", "--all"),
+                *both(loch, "save", "--cwd", cwd, env={"AWS_ACCESS_KEY_ID": ""}),
+                *both(
+                    loch,
+                    "list",
+                    "--all",
+                    env={"LOCH_S3_ENDPOINT": "http://127.0.0.1:9"},
+                ),
+            ]
+            outcomes.append(normalized(runs, w.observe()))
+    finally:
+        server.stop()
+    assert outcomes[0] == outcomes[1], first_difference(outcomes[0], outcomes[1])

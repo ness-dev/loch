@@ -63,7 +63,7 @@ poetry run mypy .
 poetry run pytest -q
 (cd rust && cargo fmt --check && cargo clippy -q --release --all-targets -- -D warnings \
   && cargo test -q --release && cargo build -q --release)
-LOCH_RUST=rust/target/release/loch poetry run pytest -q test/test_equivalence.py
+LOCH_RUST=rust/target/release/loch poetry run pytest -q test/test_equivalence.py test/test_equivalence_commands.py
 
 echo "==> tagging $tag"
 # pyproject may already hold this version — the first release, or a re-cut after

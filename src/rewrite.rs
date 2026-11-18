@@ -1,4 +1,4 @@
-//! Path rewriting, as in `loch/rewrite.py` — the load-bearing logic.
+//! Path rewriting — the load-bearing logic.
 //!
 //! Python builds one alternation regex of escaped literals, each followed by a
 //! zero-width guard, and runs one `re.sub`. This is that regex executed by

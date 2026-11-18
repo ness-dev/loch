@@ -1,9 +1,9 @@
 //! `loch hook`, run by Claude Code around every Bash call and at every stop —
-//! the hook half of `loch/trace.py`.
+//! the half of the commit links that runs live.
 //!
-//! The pending-state file is shared across implementations — a session can
-//! start its Bash call under one and finish it under the other while a machine
-//! switches over — so its name and JSON shape must stay exactly Python's.
+//! The pending-state file is the one piece of state a hook call leaves between
+//! its two halves. A session can start a Bash call under one loch and finish it
+//! under another while a machine upgrades, so keep its name and shape stable.
 
 use crate::git::{self, GitError};
 use crate::json::{self, Map, Value};

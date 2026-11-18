@@ -1,5 +1,5 @@
-//! `loch blame --html`, as in `loch/blame_html.py`: the annotated file as one
-//! self-contained page. `blame_template.html` is the Python module's
+//! `loch blame --html`: the annotated file as one
+//! self-contained page. `blame_template.html` was the Python module's
 //! `TEMPLATE`, extracted verbatim, so it is filled the way `str.format` would
 //! fill it: `{{`/`}}` are literal braces and `{name}` a field.
 
@@ -65,7 +65,7 @@ fn format_template(fields: &[(&str, &str)]) -> String {
     out
 }
 
-/// One conversation or hunk as `cli.py` builds it, in JSON form.
+/// Conversations and hunks as `cli::command_blame` builds them, in JSON form.
 pub fn render(
     file: &str,
     conversations: &[Value],

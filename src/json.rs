@@ -622,7 +622,7 @@ pub struct NotJson;
 /// RFC 8785, exactly as `format.canonical` writes it: keys by UTF-16 code
 /// unit, strings escaped as JSON.stringify does (a lone surrogate as
 /// `\uXXXX`), numbers as ECMAScript prints them — except that an integer
-/// prints exactly at any size, the departure format.py documents.
+/// prints exactly at any size, so a 63-bit id inside a tool result is kept.
 pub fn canonical(value: &Value) -> Result<Vec<u8>, NotJson> {
     let mut out = String::new();
     write_canonical(&mut out, value)?;

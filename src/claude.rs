@@ -1,4 +1,4 @@
-//! The Claude Code adapter, as in `loch/claude.py`: where sessions live, how
+//! The Claude Code adapter: where sessions live, how
 //! their directory is named, and what a session's metadata is.
 
 use crate::json::{self, Value};
@@ -90,7 +90,7 @@ fn first_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// claude.py's `_records`: each line stripped, then parsed; dicts only.
+/// Each line stripped, then parsed; dicts only.
 pub fn records(raw: &str) -> impl Iterator<Item = json::Map> + '_ {
     raw.split('\n').filter_map(|line| {
         let line = py::strip(line);
@@ -157,7 +157,7 @@ pub fn display_summary(text: Option<&str>) -> Option<String> {
 
 pub fn read_session_meta(path: &str) -> Option<SessionMeta> {
     let meta = fs::metadata(path).ok()?;
-    // Replacing rather than strict, as claude.py now does: one undecodable
+    // Replacing rather than strict: one undecodable
     // byte must not take down a listing.
     let raw = py::decode_replace(&fs::read(path).ok()?);
     let file = path.rsplit('/').next().unwrap_or(path);

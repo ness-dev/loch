@@ -1,4 +1,4 @@
-//! Every command, as in `loch/cli.py`: each builds one `Outcome` — payload
+//! Every command: each builds one `Outcome` — payload
 //! and prose together — and `main` renders it.
 
 use crate::argparse::{Exit, Nargs, Parser};
@@ -33,7 +33,7 @@ pub fn json_requested() -> bool {
 pub enum Failure {
     Error(CommandError),
     Help(String),
-    /// What Python's uncaught exception would say: `internal` in JSON mode.
+    /// A bug rather than a failure a caller can act on: `internal`.
     Internal(String),
 }
 
@@ -217,7 +217,7 @@ fn session_payload(meta: &SessionMeta) -> Value {
     })
 }
 
-/// Deliberately not index.py's stored shape: a storage format and a wire
+/// Deliberately not index.rs's stored shape: a storage format and a wire
 /// contract change for different reasons.
 fn entry_payload(entry: &IndexEntry) -> Value {
     Value::Object(object! {
@@ -269,7 +269,7 @@ pub fn command_list(argv: &[String]) -> Run {
     ))
 }
 
-fn current_branch(cwd: &str) -> Option<String> {
+pub fn current_branch(cwd: &str) -> Option<String> {
     let out = trace::git_unchecked(cwd, &["symbolic-ref", "--short", "HEAD"]);
     let branch = py::strip(&out);
     (!branch.is_empty()).then(|| branch.to_string())

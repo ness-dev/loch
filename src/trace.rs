@@ -1,5 +1,5 @@
 //! Which conversation made which commit, and getting back into it — as in
-//! `loch/trace.py`, less the hooks, which live in `hook.rs`.
+//! less the hooks, which live in `hook.rs`.
 //!
 //! A commit is linked to the turn that made it by a git note on
 //! `refs/notes/loch` naming the session and the tool call that ran
@@ -225,8 +225,8 @@ pub fn install_hooks(
 
 // -- transcripts ----------------------------------------------------------------
 
-/// trace.py's `_records_of`: a line is skipped when blank, but parsed
-/// unstripped — unlike claude.py's reader, which strips first.
+/// A line is skipped when blank but parsed unstripped — unlike
+/// `claude::records`, which strips first.
 pub fn records_of(raw: &str) -> Vec<Map> {
     raw.split('\n')
         .filter(|line| !py::strip(line).is_empty())

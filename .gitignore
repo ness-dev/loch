@@ -2,3 +2,6 @@ target/
 .DS_Store
 .claude/settings.local.json
 *.loch
+# Python tooling a contributor might still run beside the repo.
+__pycache__/
+.venv/

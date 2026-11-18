@@ -1,4 +1,4 @@
-//! The bundle format, as in `loch/bundle.py`. The ref is the SHA-256 of the
+//! The bundle format. The ref is the SHA-256 of the
 //! packed bytes, so two things here must never drift: the JSON is compact and
 //! unescaped (`separators=(",", ":")`, `ensure_ascii=False`) with absent
 //! metadata omitted rather than null, and the gzip stream is zlib's own
@@ -68,12 +68,12 @@ fn bundle_json(bundle: &Bundle) -> Value {
     })
 }
 
-/// bundle.py's fixed header: OS byte 255 whatever the platform, XFL 2 for
+/// A fixed header: OS byte 255 whatever the platform, XFL 2 for
 /// level 9, mtime 0.
 const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x02, 0xff];
 
 /// Raw deflate at level 9, window 15, memLevel 8, default strategy — the
-/// `zlib.compressobj(9, DEFLATED, -15, 8, 0)` bundle.py uses — through zlib
+/// `zlib.compressobj(9, DEFLATED, -15, 8, 0)` the Python build used — through zlib
 /// itself (flate2's zlib backend initialises exactly that), since no other
 /// deflate reproduces zlib's bytes. zlib's output doesn't depend on how the
 /// input is chunked, so streaming it is the same as one call.
@@ -148,7 +148,7 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The error string is what bundle.py's exception would print, for the
+/// The error string is what the Python build's exception printed, for the
 /// failures the harness exercises; anything stranger reads generically.
 pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
     let raw = gunzip(data)?;
@@ -237,7 +237,7 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
 mod tests {
     use super::*;
 
-    /// The same check bundle.py's test makes: 3.10's gzip.compress output.
+    /// Python 3.10's gzip.compress output, which refs were defined by.
     #[test]
     fn packing_matches_python_310() {
         let mut data = b"{\"a\":\"".to_vec();

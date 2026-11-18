@@ -1,7 +1,6 @@
 //! `loch`: one static binary for Ness, the VS Code extension and the Claude
 //! Code hooks to ship.
 
-
 use loch::cli::{self, Failure};
 use loch::output::{emit, emit_error, CommandError, Outcome, JSON_FLAG};
 

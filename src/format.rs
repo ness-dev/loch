@@ -1,4 +1,4 @@
-//! The loch format's ids and derived files, as in `loch/format.py`. Every id
+//! The loch format's ids and derived files. Every id
 //! is a SHA-256 over `json::canonical` (RFC 8785, integers exact).
 
 use crate::json::{self, Map, Value};

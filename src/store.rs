@@ -1,4 +1,4 @@
-//! The store interface, as in `loch/store.py`: a local directory or any
+//! The store interface: a local directory or any
 //! S3-compatible endpoint behind the same five operations.
 
 use crate::claude::home_dir;

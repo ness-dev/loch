@@ -1,4 +1,4 @@
-//! Secret scrubbing, as in `loch/redact.py` — best-effort pattern matching
+//! Secret scrubbing — best-effort pattern matching
 //! and nothing more. The patterns are the Python ones with one translation:
 //! Python's `\s` (`str.isspace`, which includes U+001C..U+001F) is spelled out,
 //! since the `regex` crate's `\s` is Unicode White_Space and differs from it.
@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 
 /// The rule names, in priority order: anthropic-key before openai-key, which
 /// would otherwise claim the same `sk-` prefix.
-const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 10] = [
     "aws-access-key",
     "github-token",
     "slack-token",
@@ -285,7 +285,7 @@ pub fn summarize(counts: &IndexMap<String, usize>) -> String {
 mod tests {
     use super::*;
 
-    /// redact.py's one alternation, verbatim but for `\s`: the oracle.
+    /// The rules as one alternation, as the Python build ran them: the oracle.
     fn oracle() -> fancy_regex::Regex {
         let start = r"(?<![A-Za-z0-9_-])";
         let end = r"(?![A-Za-z0-9_-])";

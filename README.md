@@ -15,48 +15,36 @@ Currently supports Claude Code.
 
 ## Install
 
+loch is a single static binary. Take the one for your platform from
+[GitHub releases](https://github.com/ness-dev/loch/releases), for example:
+
 ```sh
-uv tool install https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-py3-none-any.whl
+curl -L https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-aarch64-apple-darwin.tar.gz \
+  | tar xz --strip-components 1 -C ~/.local/bin loch-0.1.0-aarch64-apple-darwin/loch
 loch --version
 ```
 
-The wheel is `py3-none-any`, and [uv](https://docs.astral.sh/uv/) is a static
-binary that brings its own CPython, so this needs no Python on the machine and
-no PyPI account behind it. Releases are attached to
-[GitHub releases](https://github.com/ness-dev/loch/releases) as a wheel
-and an sdist.
+Builds exist for macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), Linux
+(`aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl`, static, so any
+distribution) and Windows (`aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc`).
+S3 support is built in. The only runtime requirement is `git`, for the
+commands that work on a repository.
 
-Python 3.10 or newer if you'd rather install it yourself — `pipx install`,
-`pip install`, whatever puts a console script on `PATH`.
-
-**An S3 store needs the `s3` extra**, which a default install does not pull
-in. The backend imports boto3 lazily, so a `file://` store never loads it and
-paying 27MB for a dependency most installs never reach isn't worth it:
+From source, with a Rust toolchain:
 
 ```sh
-uv tool install "loch[s3] @ https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-py3-none-any.whl"
+cargo install --git https://github.com/ness-dev/loch --locked
 ```
 
-Without it, an `s3://` store fails with `code: "s3-extra-missing"` rather than
-looking like a network problem.
-
-**A native build** lives in `rust/`: one static binary with the same
-commands, output and exit codes, S3 included, and a hook that costs 3ms a
-call rather than ~73ms. It isn't released yet; to use it now:
-
-```sh
-cd rust && cargo build --release      # target/release/loch
-```
+**If you installed the old Python version** with `uv tool install`, remove it
+first (`uv tool uninstall loch`), or whichever `loch` comes first on PATH is
+the one your hooks run.
 
 For development:
 
 ```sh
-poetry install       # brings boto3, so the S3 backend is covered by the tests
-poetry run loch --help
-poetry run pytest
-# the Rust build, held to the Python one output for output:
-(cd rust && cargo build --release)
-LOCH_RUST=rust/target/release/loch poetry run pytest test/test_equivalence*.py
+cargo build --release      # target/release/loch
+cargo test --release
 ```
 
 ## Use
@@ -151,12 +139,12 @@ loch restore --json deadbeef --store /tmp/outbound; echo "exit $?"
 
 Branch on `code`, not on `error` — the codes are stable
 (`no-sessions`, `redaction-failed`, `missing-ref`, `bundle-not-found`,
-`store-unreachable`, `s3-extra-missing`, `bundle-unreadable`,
+`store-unreachable`, `bundle-unreadable`, `transcript-unreadable`,
 `nothing-restored`, `unknown-command`, `usage`, `internal`), the messages are
 prose and will get reworded. A ref that isn't there is `bundle-not-found`, a
-store that didn't answer is `store-unreachable`, and an install without the
-`s3` extra is `s3-extra-missing` — so a caller knows which is worth retrying
-and which needs a reinstall.
+store that didn't answer is `store-unreachable`, and bytes that arrived but
+won't unpack are `bundle-unreadable` — so a caller knows which is worth
+retrying.
 `schema` versions the envelope.
 An empty result is `{"sessions": []}` with `ok: true`, not a failure, and
 `restore` reports each session as `restored` or `skipped` with its own

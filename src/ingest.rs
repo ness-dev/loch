@@ -1,4 +1,4 @@
-//! Claude Code JSONL → loch turns, as in `loch/ingest.py` (the converter).
+//! Claude Code JSONL → loch turns (the converter).
 //!
 //! Normalizing goes through `rewrite::compile`, the same single pass with the
 //! same guards restore uses, fed placeholders instead of another machine's
@@ -22,11 +22,11 @@ pub fn converter() -> Map {
 }
 
 const PLACEHOLDER_PREFIX: &str = "{{loch:";
-const ESCAPE: &str = "{{loch:esc}}";
-const ROOT: &str = "{{loch:root}}";
-const HOME: &str = "{{loch:home}}";
-const ROOT_SLUG: &str = "{{loch:root-slug}}";
-const SESSION: &str = "{{loch:session}}";
+pub const ESCAPE: &str = "{{loch:esc}}";
+pub const ROOT: &str = "{{loch:root}}";
+pub const HOME: &str = "{{loch:home}}";
+pub const ROOT_SLUG: &str = "{{loch:root-slug}}";
+pub const SESSION: &str = "{{loch:session}}";
 
 /// Record fields that place a record rather than say anything; excluded from
 /// the hashed payload of system and attachment turns.

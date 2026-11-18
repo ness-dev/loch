@@ -146,42 +146,47 @@ public API. Re-verify if something breaks.
 
 ## Layout
 
-Python 3.10 through 3.13, Poetry, boto3 behind an extra.
+One Rust crate at the root: a library holding every module, and the `loch`
+binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 
 ```
-loch/
-├── cli.py       # entry point, arg parsing, list/save/restore/delete/reindex/ingest
-├── claude.py    # Claude Code adapter: path encoding, session discovery, metadata
-├── bundle.py    # bundle format, gzip, content-addressed ref
-├── format.py    # loch format: canonical JSON, turn and content ids, derived files
-├── ingest.py    # Claude Code JSONL -> loch turns (the converter)
-├── index.py     # store key layout, derived index entries, delete and reindex
-├── trace.py     # commit -> conversation notes, hooks, blame, log, backfill, ask's fork
-├── blame_html.py # `blame --html`: self-contained page, no external assets
-├── git.py       # current branch of a checkout, for the list default
-├── output.py    # result envelope, the two renderers, structured failures
-├── redact.py    # secret scrubbing, applied on save before packing
-├── rewrite.py   # path rewriting (the load-bearing logic)
-└── store.py     # Store interface + local-fs and S3-compatible backends
-test/
-├── test_corpus.py  # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
-├── equivalence.py       # the harness: run both builds, compare everything
-├── test_equivalence*.py # opt-in, Rust vs Python (LOCH_RUST=<binary>)
-└── test_*.py       # one module per source module
-rust/               # the Rust build: one crate, binary `loch` (see "The Rust build")
-├── src/            # one module per Python module, plus argparse/json/py/sys
-├── bench/hook.py   # per-call wall clock of `loch hook`, any number of binaries
-└── rust-toolchain.toml
-npm/                # @ness-dev/loch and its per-platform packages
+src/
+├── main.rs       # argv handling, dispatch, the two renderers' entry point
+├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
+│                 #   blame/log/ask/backfill/hook/help/version
+├── claude.rs     # Claude Code adapter: path encoding, session discovery, metadata
+├── bundle.rs     # bundle format, gzip, content-addressed ref
+├── format.rs     # loch format: turn and content ids, derived files
+├── ingest.rs     # Claude Code JSONL -> loch turns (the converter)
+├── index.rs      # store key layout, derived index entries, delete and reindex
+├── trace.rs      # commit -> conversation notes, install, blame, log, backfill, ask's fork
+├── hook.rs       # `loch hook`: the Claude Code hooks
+├── git.rs        # git by subprocess, plus the hooks' native HEAD fast path
+├── blame_html.rs # `blame --html`: self-contained page (blame_template.html)
+├── output.rs     # result envelope, the two renderers, structured failures
+├── redact.rs     # secret scrubbing, applied on save before packing
+├── rewrite.rs    # path rewriting (the load-bearing logic)
+├── store.rs      # Store interface + local-fs backend
+├── s3.rs         # the S3-compatible backend, SigV4 by hand
+├── json.rs       # JSON reading and writing, RFC 8785 canonical form
+├── argparse.rs   # command-line parsing, usage errors and -h
+├── py.rs         # string semantics: whitespace, lone surrogates, ordering
+└── sys.rs        # paths, timestamps, OS error strings, hostname, uuid4
+tests/            # integration tests, one file per module plus cli.rs
+├── derived_reader/ # a verifying reader for derived files, shared by three tests
+├── corpus.rs     # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
+└── git_fast_path.rs # the native HEAD answer equals git's, layout by layout
+examples/bench_hook.rs # per-call wall clock of `loch hook`, any number of binaries
+npm/              # @ness-dev/loch and its per-platform packages
 ```
 
-`ingest.py` normalizes with `rewrite.py`'s machinery rather than its own:
-`compile_replacements` is the same single pass with the same guards, fed
+`ingest.rs` normalizes with `rewrite.rs`'s machinery rather than its own:
+`rewrite::compile` is the same single pass with the same guards, fed
 placeholder targets (`{{loch:root}}`, `{{loch:home}}`, …) instead of another
 machine's paths. That sharing is what makes a turn id survive `restore` — a
 copy rewritten by one set of pairs normalizes back through the same set — so
 a change to the guards changes both behaviours at once, which is the point.
-`test_corpus.py` is the check that it still holds on real data: 3809 of 3810
+`tests/corpus.rs` is the check that it still holds on real data: 3809 of 3810
 sessions keep every turn id across a simulated move, and the one that doesn't
 is a transcript that already contains the destination paths (SPEC.md §14.1).
 
@@ -222,8 +227,8 @@ before the bundle, since the entries are derived from it and losing the
 bundle first would strand them. `Store.delete` on an absent key succeeds,
 which is what lets either repair run.
 
-`claude.py` decides **which** cwd a session gets, and everything in
-`rewrite.py` is downstream of that answer: `SessionMeta.cwd` becomes the
+`claude.rs` decides **which** cwd a session gets, and everything in
+`rewrite.rs` is downstream of that answer: `SessionMeta.cwd` becomes the
 bundle manifest's cwd and then `RewriteSpec.origin_cwd`, so one wrong
 value poisons the whole rewrite. Because a session can hold several cwds
 (see above), it is chosen by comparing `encode_path` of each against the
@@ -272,13 +277,16 @@ Optimise the per-file path if this ever matters. Reinstating a cap would
 buy back a fraction of a second on one anomalous directory in exchange
 for being silently wrong again.
 
-`rewrite.py` is where correctness actually lives. It does a **single
+`rewrite.rs` is where correctness actually lives. It does a **single
 left-to-right pass** with longest-match-first alternation, so a
 substitution's output can never be re-matched by a later pair. The hazard
 it guards against: a cwd nested under a home directory getting
 half-rewritten if the pairs were applied sequentially. Keep the
-single-pass property if you touch it — one alternation regex, one
-`re.sub`, never a loop of `str.replace` calls.
+single-pass property if you touch it — one scan that tries every source at
+each position, never a loop of `replace` calls. The scan is written by
+hand (`Replacer::apply`) because the guards are lookaheads, which the
+`regex` crate doesn't have; a source repeated with two targets maps to the
+last one.
 
 The second property is a **boundary rule**: a path is only substituted
 where the match ends on a path-component boundary. Without it a sibling
@@ -288,7 +296,7 @@ became the target path with its own tail duplicated. That failure was
 **silent**, and that is the part worth remembering: the corrupted string
 no longer contains the origin, so `residual_origin_paths` reported a clean
 rewrite across 239 bad values in one restored session. The guards are
-per-alternative zero-width lookaheads, which is what keeps them compatible
+per-alternative zero-width lookaheads (`Guard`), which is what keeps them compatible
 with the single pass — an alternative that fails its guard falls through
 to a shorter one, so `/Users/mike/projector` still gets its home rewritten
 after the cwd pair declines.
@@ -350,7 +358,7 @@ a known non-chosen session cwd" is an exact match against a small known
 set, needs nothing from the far side, and fits the single pass — an
 identity pair sorts ahead of the shorter home pair by length, matches,
 and consumes the string, so the home pair never sees it.
-`_apply_replacements` filters identity pairs out via `source != dest` and
+`rewrite::compile` filters identity pairs out via `source != dest` and
 would have to admit them deliberately, which is a small change rather
 than a fight with the design. It is not built because reporting is
 sufficient and `--map` supersedes it: a mapping makes those records
@@ -365,7 +373,7 @@ directories can have *every* one of them land somewhere real instead of
 one landing right and the rest being counted. It is the natural
 successor to `foreignCwds`: the report tells a caller which directories
 came out wrong, and the flag is how they say what those should become.
-Nothing in `rewrite.py` needs to change to accept it — pairs already
+Nothing in `rewrite.rs` needs to change to accept it — pairs already
 carry their own boundary guard and are already sorted longest-first, and
 **that sort must keep being by length rather than by caller order**: the
 single-pass guarantee depends on a nested path matching before the
@@ -383,7 +391,7 @@ it is the one value nothing on either side can derive. Note the
 destination worktree must be `realpath`'d: git reports canonical paths,
 so `/tmp/...` comes back as `/private/tmp/...` and a lookup keyed on the
 uncanonical form silently misses. That is the same symlink resolution
-`claude.py` does, for the same reason.
+`claude.rs` does, for the same reason.
 
 The encoded slug takes a stricter rule for a reason that can't be fixed:
 `encode_path` maps every non-alphanumeric to `-`, so `<repo>/sub` and
@@ -394,7 +402,7 @@ limitation, and the false negative is the deliberate half of it — don't
 "fix" it by loosening the guard, that reintroduces the corruption. The
 session-id pair is a UUID rather than a path and carries no guard.
 
-`redact.py` scrubs secrets out of a transcript on `save`, before packing.
+`redact.rs` scrubs secrets out of a transcript on `save`, before packing.
 It is **best-effort pattern matching and nothing more.** It finds
 credentials with distinctive structure (AWS/GitHub/Slack/Stripe/
 Anthropic/OpenAI/Google keys, JWTs, PEM blocks) plus one context rule for
@@ -409,12 +417,13 @@ they fire on every hash, UUID, and base64 blob in a transcript.
 
 Three properties it has to keep:
 
-- **The local transcript is never modified.** `cli.py` reads, redacts the
+- **The local transcript is never modified.** `cli.rs` reads, redacts the
   in-memory copy, packs that. Redaction changes the packed bytes and
   therefore the ref; that is correct, the redacted bundle is the artifact.
-- **Single pass, same discipline as `rewrite.py`** — one alternation of
-  named groups, one `re.sub` — so no rule can match inside another rule's
-  replacement. The `env-assignment` value carries a `(?!\[REDACTED:)`
+- **Single pass, same discipline as `rewrite.rs`** — one left-to-right
+  scan in which the next match is the earliest any rule makes, ties to rule
+  order — so no rule can match inside another rule's replacement. How that
+  scan is made fast without changing an answer is under Performance. The `env-assignment` value carries a `(?!\[REDACTED:)`
   lookahead for the same reason: without it, re-scanning
   `TOKEN=[REDACTED:env-assignment]` matches all over again.
 - **Redacted output is re-scanned, and a surviving match aborts the
@@ -428,8 +437,8 @@ Three properties it has to keep:
 Counts are reported per session by rule name. **Never print the match**,
 not even truncated — `save`'s stdout lands in the next agent's transcript.
 
-`save` is not the only path transcript content escapes on, so `claude.py`
-scrubs the `list` summary too, in `_display_summary`. That summary is the
+`save` is not the only path transcript content escapes on, so `claude.rs`
+scrubs the `list` summary too, in `display_summary`. That summary is the
 first user message, it reaches a picker row and a pasted bug report without
 a `save` in between, and it is the only such field. Two ordering points:
 redact *before* truncating, since a cut can leave a secret's tail matching
@@ -444,7 +453,7 @@ value needs a parser, so that failure mode stays — it mangles a line of
 code in the packed copy, it doesn't leak. The prefixed-key rules match
 nothing in that corpus, which is the point of the word boundaries.
 
-Two smaller things `bundle.py` has to keep doing, because the ref is a
+Two smaller things `bundle.rs` has to keep doing, because the ref is a
 hash of the packed bytes and any drift changes a bundle's identity: JSON
 is packed compactly (`separators=(",", ":")`, `ensure_ascii=False`), and
 absent session metadata is omitted rather than serialized as `null`.
@@ -496,7 +505,6 @@ never a code. The set today:
 | `missing-ref` | `restore`/`delete` called without a ref |
 | `bundle-not-found` | the store answered and the ref isn't there |
 | `store-unreachable` | the store didn't answer |
-| `s3-extra-missing` | an `s3://` store on an install without the `s3` extra |
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
 | `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
@@ -509,30 +517,28 @@ never a code. The set today:
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
 
-The four store-facing codes — `bundle-not-found`, `store-unreachable`,
-`s3-extra-missing`, `bundle-unreadable` — are one failure to a human and four
-different affordances to a caller: don't retry, retry, reinstall, report
-corruption. Telling them apart is why `store.py` raises typed
-`MissingObject` and `MissingDependency` exceptions — a bare `except Exception`
-around a store call can only produce the union, and `s3-extra-missing` was
-`store-unreachable` until boto3 became optional, which told a caller to retry
-a network problem that was really a missing package. The `store_errors` block
-wraps the store call *alone*, since anything wider would relabel a bug in
-this process as a failure of the store.
+The three store-facing codes — `bundle-not-found`, `store-unreachable`,
+`bundle-unreadable` — are one failure to a human and three different
+affordances to a caller: don't retry, retry, report corruption. Telling them
+apart is why `StoreError` has `Missing` and `Unreachable` variants and an
+unpack failure is its own error: a catch-all around a store call can only
+produce the union. Map the store call *alone* to a store code, since
+anything wider would relabel a bug in this process as a failure of the
+store. (`s3-extra-missing` existed while S3 needed an optional Python
+package; the binary carries its client, so it can't arise and is gone.)
 
-**Exactly one document per invocation, including the paths argparse owns.**
-argparse answers `-h` and a bad flag itself, writing prose and exiting
-before a command ever runs, so `_Parser` routes both back through `main()`.
-An unexpected exception becomes `code: "internal"` in JSON mode and stays a
-traceback without the flag, since a traceback is the most useful thing a
-human can get and the one thing a consumer can't parse.
+**Exactly one document per invocation, including parse failures.**
+`argparse.rs` returns `-h` and a bad flag as `Exit` values rather than
+printing and exiting, so `main()` renders both in the mode asked for. A bug
+becomes `code: "internal"`, which in text mode is `loch: internal error: …`
+on stderr.
 
 **Raw values, not renderings.** `format_bytes` and the fixed-width columns
 of `describe`/`describe_entry` belong to the text mode alone: the payload
 carries the integer and the ISO-8601 `...Z` timestamp. An empty result is
 `{"sessions": []}` with `ok: true`, never an error.
 
-The `list --remote` payload is deliberately *not* `index.py`'s stored entry
+The `list --remote` payload is deliberately *not* `index.rs`'s stored entry
 shape even though the fields line up. One is a storage format, the other is
 a versioned wire contract, and they change for different reasons.
 
@@ -553,207 +559,127 @@ plus a `redacted` total, exactly as much as the prose summary carries and no
 more — `save`'s stdout lands in the next agent's transcript. The one field
 holding transcript content is `list`'s `summary` (the first 120 characters of
 the first user message, which the text output already prints), and it is
-scrubbed in `claude.py` before it ever becomes a `SessionMeta`. It should
+scrubbed in `claude.rs` before it ever becomes a `SessionMeta`. It should
 stay the only such field.
 
 ## Packaging and release
 
-The distribution path is `uv tool install <release wheel URL>`: uv is a static
-binary that brings its own CPython, so a machine being bootstrapped over SSH
-needs no Python toolchain and there is no PyPI account in the loop. That
-constrains three things.
+loch is one static binary, built for six targets: macOS arm64 and x64, Linux
+arm64 and x64 (musl, statically linked, so one build runs on any
+distribution, glibc or not) and Windows arm64 and x64. Its only runtime
+dependency is `git` on PATH, for the commands that touch a repository.
+zlib and rustls are compiled in.
 
-**Supported range is 3.10 through 3.13, with no upper bound.** The old
-`>=3.12,<3.13` was pinning copied from an unrelated backend, and it is what
-made `pipx install` fail on both ends — Ubuntu 22.04 ships 3.10, and a 3.13
-box failed the cap. Never reintroduce a ceiling: the next Python breaks the
-install before it breaks the code. 3.10 is the floor because PEP 604 `X | None`
-unions are pervasive and 3.9 would mean rewriting every annotation. One line
-actually needed 3.12 — a backslash inside an f-string expression, PEP 701
-syntax — so keep interpolations backslash-free. `[tool.mypy] python_version`
-is pinned to the floor rather than following the running interpreter, so a
-3.11+ API fails on a 3.13 laptop and not only in CI.
+**Releasing** is `./release.sh <version>`, which bumps `Cargo.toml`, runs
+the checks, commits, tags and pushes. It refuses a dirty tree, a branch
+behind origin, or an existing tag, because a bad tag is expensive to undo: a
+tag-triggered run uses the workflow file *as of the tagged commit*, so a
+broken workflow can't be repaired by re-running the tag. The tag has to be
+deleted from the remote and re-cut.
 
-**boto3 is an optional `[s3]` extra.** What makes that safe is the lazy import
-in `S3Store._client`: the `file://` backend loads nothing third-party at
-runtime, so the SDK was only ever an install-time cost — 8 packages and 27MB,
-of which botocore alone is 24MB against loch's own 172KB. A default install
-is one package and 184KB. Keep the import inside the method, and keep any new
-`botocore` import *after* the `_client()` call that would have failed first,
-or the SDK's absence surfaces as a bare `ImportError` and gets mislabelled
-`store-unreachable`. The dev group still carries boto3, moto and the stubs, so
-the S3 backend stays fully covered by the suite.
+`release.yml` calls `test.yml` first, so an untested tag can't publish. It
+then refuses a tag that disagrees with `Cargo.toml`, builds the matrix,
+checks the Linux binaries really are static, and attaches a tarball per
+target, the npm packages and `SHA256SUMS` to the GitHub release. Run by hand
+(`workflow_dispatch`), it does all of that except publishing, which is how
+to rehearse. Actions must be pinned to versions that exist: `setup-uv`
+stopped publishing floating major tags after `v7`, and `@v10` failed the
+first release attempt.
 
-**`loch --version` reads package metadata**, so pyproject is the only place
-the number is set. `importlib.metadata` raises `PackageNotFoundError` in a
-source checkout that was never installed, which reports `"unknown"` — pyproject
-can't be read as a fallback, since `tomllib` arrived in 3.11 and the floor is
-3.10. It is a `Result` like every other command, so `--version --json` is an
-envelope.
+**npm, the way Claude Code is shipped:** `@ness-dev/loch` with
+`optionalDependencies` on `@ness-dev/loch-{darwin,linux,win32}-{arm64,x64}`,
+each declaring `os`/`cpu` and holding one binary, so npm installs only the
+host's. `npm/platforms.json` maps target triples to packages, and
+`npm/assemble.mjs` lays out a release's packages from built binaries. The
+release workflow builds the tarballs but **doesn't publish to npm yet**:
+that needs the `@ness-dev` org and a token. Assembling, `npm pack` and a
+global install were dry-run locally for darwin-arm64.
 
-CI lives in `.github/workflows/`. `test.yml` runs ruff, mypy and pytest across
-3.10/3.12/3.13 — the floor and the ceiling are where breakage appears — and
-`release.yml` calls it via `workflow_call` rather than repeating it, so an
-untested tag cannot publish. Releasing is `./release.sh <version>`, which bumps
-pyproject, runs the same four checks, commits, tags and pushes. It refuses a
-dirty tree, a branch behind origin, or an existing tag, because a bad tag is
-expensive to undo: a tag-triggered run uses the workflow file *as of the tagged
-commit*, so a broken workflow can't be repaired by re-running the tag — the tag
-has to be deleted from the remote and re-cut. Actions must be pinned to versions
-that exist; `setup-uv` stopped publishing floating major tags after `v7`, and
-`@v10` failed the first release attempt. The workflow independently refuses a
-tag that disagrees with pyproject, since the install path is a pinned asset URL
-and a wheel named after the wrong version is not something to discover
-afterwards. `uv build` emits a
-`py3-none-any` wheel — universal, hence no platform matrix — plus an sdist, and
-both are attached to the GitHub release. The build is byte-reproducible; don't
-introduce anything timestamp-dependent into it. There is deliberately no PyPI
-publishing.
+Linux packages aren't split by libc, which differs from Claude Code's.
+Ness's resolver adds `-musl` on musl hosts, so it must not do that for loch.
 
-## The Rust build
+**Embedders spawn the platform binary, never a Node shim.** Measured: going
+through the wrapper's Node launcher costs ~24ms a call (27ms against 3ms),
+which hands most of the hooks' speed back on every Bash call.
+- **The path:** `index.js` exports `binaryPath()`, the same `createRequire`
+  plus `app.asar` → `app.asar.unpacked` resolution Ness already uses for
+  Claude Code.
+- **Electron:** an app must `asarUnpack` `**/node_modules/@ness-dev/loch-*/**`.
+- **Global installs:** for `npm install -g`, the postinstall replaces
+  `bin/loch` with a hardlink to the native binary, so the `loch` on PATH is
+  the binary itself. With `--ignore-scripts`, or on Windows, where npm runs
+  bins through a `.cmd` wrapper anyway, the shim remains and still works.
+- **Hooks:** Ness should write the binary's absolute path with `loch install
+  --local --command <path>` (settings.local.json, since the path is
+  machine-specific) rather than rely on PATH.
 
-The goal is one static binary that Ness, a VS Code extension and the Claude
-Code hooks can ship and run, with no Python on the machine. **Every command
-is ported**, and each is held to the Python by the equivalence harness. The
-Python package is still the reference until it is deleted. Until then a
-behaviour change lands in Python first, with the harness carrying it to Rust,
-and the Python suite keeps passing on its own.
+**Builds reproduce.** `SOURCE_DATE_EPOCH` fixes `save`'s `createdAt`, the
+one clock in a bundle's bytes, so the same sessions pack to the same ref.
 
-**Layout: `rust/`, one crate, not a root workspace.** The repository root
-belongs to Poetry (pyproject, the `loch` package, `release.sh`), and a root
-`Cargo.toml` would mean two build systems claiming the same directory and a
-`target/` beside the wheel's sources. The modules mirror the Python ones
-(`cli.rs` ↔ `cli.py`, `rewrite.rs` ↔ `rewrite.py`, `hook.rs` ↔ the hook half
-of `trace.py`, …) plus four that Python gets from its standard library:
-`argparse.rs`, `json.rs`, `py.rs` (string semantics) and `sys.rs`
-(`os.path`, `datetime`, `OSError` strings). One crate is enough until a
-second binary needs a library; that is the point to make `rust/` a
-workspace, and nothing outside it moves.
+**`uv tool install` is gone.** loch used to ship as a pure-Python wheel; a
+machine that installed it that way has a `loch` on PATH that predates this
+binary. It should `uv tool uninstall loch` and take a release tarball or the
+npm package instead. Hook lines written by `install` name plain `loch`, so
+PATH order decides which one the hooks run until the old one is removed.
 
-The toolchain is pinned in `rust/rust-toolchain.toml` (1.91.0), scoped to
-`rust/` so it never changes anyone's default. 1.83, which was installed,
-can't build today's `url`/`idna`.
+## Why some of the code looks the way it does
 
-### What "equivalent" had to mean, and what it cost
+loch was written in Python first and ported to Rust. Before the Python was
+deleted, the port was held to it **byte for byte**: stdout, stderr, exit
+status and every file written, over 51 synthetic scenarios and every project
+directory on one machine (472, all identical). That standard is why several
+modules reimplement things a crate would normally provide. Nothing requires
+that compatibility any more, so change them freely, but know what each was
+protecting:
 
-Byte-for-byte, on stdout, stderr, exit status and every file written — the
-standard the harness enforces — rules out leaning on Rust's libraries
-wherever Python's behaviour is the specification. In the order they bit:
-
-- **JSON is Python's, not serde's.** `json.rs` parses as `json.loads` does
-  (duplicate keys keep their first position and last value, integers stay
-  exact at any size, `NaN`/`Infinity` accepted) and writes every flavour loch
-  uses (`ensure_ascii`, compact, sorted, `indent=2`, float `repr`) plus RFC
-  8785. serde_json refuses lone surrogates, and **five transcripts on one
-  machine hold them** (`\ud83d` cut from its pair by truncation).
+- **`json.rs` instead of serde_json.** serde refuses lone surrogates, and
+  **five transcripts on one machine hold them** (a `\ud83d` cut from its pair
+  by truncation). It also rounds integers wider than 64 bits and rejects
+  `NaN`. Every turn id is a hash over `json::canonical`, so how a transcript
+  parses decides every id.
 - **Lone surrogates are mapped into U+10F800..U+10FFFF** (`py.rs`), since a
-  Rust `String` can't hold one. That covers both the JSON escape and
-  `surrogateescape`'s undecodable bytes. They are mapped back wherever Python
-  would write them, and they sort, escape and canonicalize as the surrogate.
-  The cost: a transcript holding those private-use code points literally
-  would be misread. The corpus check asserts none on this machine does.
-- **Python's whitespace is not Rust's.** `str.isspace` (and so `\s`,
-  `split()`, `strip()`) includes U+001C..U+001F, which Unicode White_Space
-  doesn't. `py::is_space` is the 29 code points Python says, and every
-  ported pattern spells `\s` out as that set.
-- **argparse is ported, not approximated** (`argparse.rs`, from 3.12.10). Its
-  usage errors and `-h` text are output, so the A/O/- pattern matching,
-  abbreviation, `--opt=value`, `--`, the help formatter's wrapping at
-  `COLUMNS` and the 3.12.10 rule that stops a `nargs="?"` positional being
-  consumed empty before an option all had to match. The harness runs every
-  command through fifteen bad command lines at four widths.
+  Rust `String` can't hold one. That covers both JSON escapes and
+  `surrogateescape`d undecodable bytes. They are mapped back wherever they
+  are written, and they sort, escape and canonicalize as the surrogate. The
+  cost: a transcript holding those private-use code points literally would
+  be misread. The corpus check asserts none on this machine does.
+- **Whitespace is `py::is_space`**, the 29 code points that include
+  U+001C..U+001F, not Unicode White_Space. Redaction's `\s` uses the same
+  set.
+- **`argparse.rs`** reproduces Python's argparse: abbreviation,
+  `--opt=value`, `--`, the A/O/- matching that decides what a `nargs="?"`
+  positional takes, and the help formatter's wrapping at `COLUMNS`. Usage
+  errors exit 2.
 - **zlib's own deflate**, through flate2's zlib backend (memLevel 8, raw
-  window 15, which is `zlib.compressobj(9, DEFLATED, -15, 8, 0)`), because
-  the ref is a hash of the gzip bytes and miniz_oxide compresses differently.
-  zlib is built from source and linked statically.
-- **The rewrite and redaction regexes are run by hand** where a regex crate
-  couldn't express them: `rewrite.rs` executes the one-alternation `re.sub`
-  as an explicit scan with per-alternative guards (and, as in Python, a
-  source repeated with two targets maps to the last). `redact.rs` is
-  described below.
-- **Error strings are Python's**: `str(OSError)` (`[Errno 2] No such file or
-  directory: '/x'`), binascii's strict-mode base64 messages, botocore's
-  `An error occurred (Code) when calling the Op operation: Message`,
-  `gzip`'s `Not a gzipped file (b'ga')`. They reach the `error` field.
-- **boto3's request shapes**: a listing sends `encoding-type=url` and
-  decodes the keys, in boto3's parameter order, because the URL appears in a
-  connection error.
+  window 15), behind a fixed gzip header (OS byte 255, XFL 2). The ref is a
+  hash of those bytes, and miniz_oxide compresses differently. Changing
+  either changes the ref of every bundle.
+- **Error strings** follow Python's conventions: `[Errno 2] No such file or
+  directory: '/x'`, botocore's `An error occurred (Code) when calling the Op
+  operation: Message`. They reach the `error` field, which consumers
+  shouldn't parse anyway.
 
-**Three bugs in the reference turned up and were fixed in Python first**,
-because the rule is that the reference stays the reference:
+Three defects in the Python turned up during the port and were fixed in both
+builds before it was deleted:
+- **Refs that varied by platform.** From 3.11, Python let zlib write the gzip
+  OS byte, so the same sessions got a different ref on macOS and Linux. That
+  is why the header is fixed now.
+- **One bad byte took down a listing.** An undecodable byte took down `list`
+  for a whole directory, which is why metadata decodes with replacement and
+  `save` refuses such a session as `transcript-unreadable`.
+- **`save` wasn't reproducible**, which is why `SOURCE_DATE_EPOCH` exists.
 
-- **Bundle refs depended on the Python version and the platform.** From 3.11
-  `gzip.compress` lets zlib write the header's OS byte, 19 on macOS and 3 on
-  Linux, where 3.10 wrote 255. So the same sessions packed to a different
-  ref per machine. The header is now written by hand, byte-identical to
-  3.10's everywhere. Bundles saved before keep their refs, but a re-save of
-  the same sessions from 3.11+ gets a new one.
-- **One undecodable byte took down `list`** for the whole directory, since
-  `read_session_meta` caught `OSError` only. Metadata now decodes with
-  replacement, and `save` refuses such a session as `transcript-unreadable`
-  instead of with a traceback.
-- **`save` wasn't reproducible**, since `createdAt` is part of the hashed
-  bytes. `SOURCE_DATE_EPOCH` now fixes it in both builds. That is the
-  reproducible-builds convention, and it is what lets the harness compare
-  two builds' refs at all.
-
-**Divergences that remain, deliberately:**
-
-- An unexpected exception is a traceback in Python and `loch: internal
-  error: …` in Rust. JSON mode matches, both being `code: "internal"`.
-- A naive (offset-less) ISO timestamp is local time to Python and UTC to
-  Rust. Transcripts always carry `Z`.
-- Unicode digits (`int("١٢")`) are accepted by a few of Python's parses and
-  by none of Rust's.
-- The S3 credential chain stops at env and the shared files. SSO,
+Known gaps:
+- **S3 credentials:** the chain reads env and the shared files only. SSO,
   `credential_process`, assumed roles and instance metadata are not read.
-- Windows compiles in principle and has never been built.
+- **Timestamps:** a naive (offset-less) ISO timestamp is read as UTC.
+  Transcripts always carry `Z`.
+- **Windows** has never been built.
 
-While the port was partial, unported commands answered `not-ported`. With
-nothing left unported that code is gone, and an unknown name is
-`unknown-command` in both builds.
+## Performance
 
-### The harness
-
-`test/equivalence.py` is the machinery, and three modules use it:
-`test_equivalence.py` (hooks), `test_equivalence_commands.py` (everything
-else, including an S3 run against moto) and `test_equivalence_corpus.py`
-(real transcripts). All are opt-in with `LOCH_RUST=<binary>`, and the corpus
-also needs `LOCH_CORPUS=1`.
-
-How a scenario runs:
-- **Twice, identically.** Each scenario is built twice at the same path with
-  pinned git dates, session mtimes and `SOURCE_DATE_EPOCH`. Python drives
-  one copy and the binary the other.
-- **Everything is compared.** That means every file under the scratch root
-  (git's own churn aside) plus the notes ref, HEAD and `notes.rewriteRef`.
-- **Generated values are renamed.** v4 UUIDs, which `--new-id` and `ask`'s
-  fork mint, become `UUID-n` in order of first appearance. Fixture ids are
-  deliberately not v4.
-- **Mixed runs.** The hook scenarios also run pre-tool under one build and
-  post-tool under the other, which is what a machine switching over
-  mid-session does. That is why the pending file's shape is a contract
-  between the two.
-
-**Planted bugs fail it.** That was checked, not assumed: a changed redaction
-token, a loosened path guard, the home-is-root rule, an argparse message, a
-float exponent boundary, a prose string, the prompt walk in `trace`, the
-percent-encoding of index segments, a converter fact name, a wrong
-`captured` value, a loosened hook time bound and a corrupted signing key
-each fail at least one scenario. Each of those first came back *green*
-until a scenario exercised it. The float one needed floats added to the
-fixtures, which is the reason to keep doing this whenever a scenario is
-added.
-
-**The corpus check** lists, saves, restores (onto a temporary HOME) and
-ingests every project directory on the machine with both builds, in
-parallel (`LOCH_CORPUS_JOBS`). It is read-only towards `~/.claude`, and a
-failure names a directory and a byte offset or hash, never content.
-
-### Performance
-
-**`loch hook`: 3ms a call instead of ~73ms.** Measured with
-`rust/bench/hook.py` against the `uv tool` install, median of 60:
+**`loch hook`: 3ms a call.** The Python it replaced took ~73ms (measured
+with `examples/bench_hook.rs`, median of 60):
 
 | case | Python | Rust |
 | --- | --- | --- |
@@ -762,97 +688,49 @@ failure names a directory and a byte offset or hash, never content.
 | post-tool, writing a note | 98.5ms | 27.3ms |
 
 The hooks run twice per agent shell command, so that is ~145ms of every
-Bash call down to ~6ms. Python's cost was ~50ms of imports
-(`importlib.metadata` alone is 19ms) and ~8ms per `git` process, of which
-the hot path ran two.
+Bash call down to ~6ms.
 
-Getting under the git floor is the fast path in `git.rs`: where the git
-directory is and what HEAD is are answered by reading `.git` (a worktree's
-`gitdir:` file, `commondir`, loose and packed refs) instead of spawning git.
-It answers only on layouts it fully understands and says "ask git" for
-anything else: a discovery-changing `GIT_*` variable, reftable, a repository
-owned by another user (`safe.directory`), a cwd inside `.git`, an
-unparseable ref, and Windows outright. **A gap there may only ever cost
-speed, never a different answer.** The harness checks that with reftable,
-`GIT_DIR`, worktree, packed-refs, detached, unborn and symlinked scenarios.
-Writing a note still runs `git log` and `git notes`, which is the remaining
-24ms, and it happens only when a call committed.
+Getting under the cost of spawning git (~8ms a process) is the fast path in
+`git.rs`: where the git directory is and what HEAD is are answered by
+reading `.git` (a worktree's `gitdir:` file, `commondir`, loose and packed
+refs) instead of spawning git. It answers only on layouts it fully
+understands and says "ask git" for anything else: a discovery-changing
+`GIT_*` variable, reftable, a repository owned by another user
+(`safe.directory`), a cwd inside `.git`, an unparseable ref, and Windows
+outright. **A gap there may only ever cost speed, never a different
+answer.** `tests/git_fast_path.rs` checks the native answer against git's on
+each layout. Writing a note still runs `git log` and `git notes`, which is
+the remaining 24ms, and that happens only when a call committed.
 
-**Redaction was most of `save`'s cost in both builds**: 150s in Python and
-264s in Rust (first cut, fancy-regex) over 15 project directories. A
-backtracking engine tries all ten rules at every position, and
-`env-assignment` can begin at any capital. `redact.rs` gives the same
-answers with a restructured search:
-- **The nine prefixed rules** become plain `regex` crate searches, linear and
+**Redaction is most of `save`'s cost.** A backtracking engine tries all ten
+rules at every position, and `env-assignment` can begin at any capital: over
+15 project directories that was 150s in Python and 264s in a first Rust cut
+with fancy-regex. `redact.rs` gives the same answers with a restructured
+search, 15s:
+- **The nine prefixed rules** are plain `regex` crate searches, linear and
   with leftmost-first semantics equal to backtracking. Their one-character
-  START/END checks are made by hand.
+  boundary checks are made by hand.
 - **`env-assignment`** is tried, anchored, only at the start of an
   `[A-Z0-9_]` run that holds a keyword. Every way it could match from inside
   the run is also a way from the run's start, so that is the only candidate.
 - **The next match** is the earliest position any rule matches at, ties going
   to rule order.
 
-That brought it to 15s. The full Python alternation stays in the tests as an
-oracle, fuzzed against the fast path over 40k generated strings that
-exercise every rule (the test asserts each rule matched, so the fuzz can't
-pass vacuously). **Python's redaction is still the slow one**, which is why
-the corpus check runs in parallel. It is the reference, so it was left
-alone.
+The full alternation stays in the unit tests as an oracle, fuzzed against
+the fast path over 40k generated strings that exercise every rule. The test
+asserts each rule matched, so it can't pass vacuously.
 
-**S3 is SigV4 by hand over `ureq`/rustls**, not the AWS SDK; four request
+**S3 is SigV4 by hand over `ureq`/rustls**, not the AWS SDK: four request
 kinds don't justify an async runtime and several MB. The signer is pinned to
 AWS's two published examples (a header-signed GET and a signed query
-string). The stop hook is checked against a moto server with IAM auth on, so
-a bad signature is refused. moto's verifier itself rejects boto3's correct
-signatures on keys holding a space or `+` and on prefixed listings, so the
-command-level S3 test runs with auth off; a failure that looks like a
-signing bug in exactly those cases is moto's. A store that doesn't answer
-fails after 20s rather than holding a turn.
-
-### Packaging
-
-**npm, the way Claude Code is shipped:** `@ness-dev/loch` with
-`optionalDependencies` on `@ness-dev/loch-{darwin,linux,win32}-{arm64,x64}`,
-each declaring `os`/`cpu` and holding one binary, so npm installs only the
-host's. `npm/platforms.json` is the target-triple → package map,
-`npm/assemble.mjs` lays out a release's packages from built binaries, and
-`.github/workflows/rust-binaries.yml` (manual, publish-free, **never run**)
-builds all six targets and assembles them. Assembling, `npm pack` and a
-global install were dry-run locally for darwin-arm64.
-
-Linux binaries are static musl, so one package per architecture serves
-glibc and musl alike. That is a deliberate difference from Claude Code's
-packages, and Ness's resolver adds `-musl` on musl hosts, so it must not do
-that for loch.
-
-**Embedders spawn the platform binary, never a Node shim.** Measured: going
-through the wrapper's Node launcher costs ~24ms a call (27ms against 3ms),
-which hands most of the port's win back on every hook. So `index.js`
-exports `binaryPath()` — the same `createRequire` + `app.asar` →
-`app.asar.unpacked` resolution Ness already uses for Claude Code — and an
-Electron app must `asarUnpack` `**/node_modules/@ness-dev/loch-*/**`. For a
-global `npm install -g`, the postinstall replaces `bin/loch` with a hardlink
-to the native binary, so the `loch` on PATH is the binary itself; with
-`--ignore-scripts`, or on Windows where npm runs bins through a `.cmd`
-wrapper anyway, the shim remains and still works. For hooks, Ness
-should write the binary's absolute path with `loch install --local
---command <path>` (settings.local.json, since the path is machine-specific)
-rather than rely on PATH.
-
-**`uv tool install` users** have a working install of the reference, so
-nothing has to change for them while the Python exists. The intended switch is
-to ship the Rust binary as platform wheels too — maturin's `bindings =
-"bin"`, the way ruff and uv ship — attached to the GitHub release next to
-today's pure-Python wheel, so the switch is the same `uv tool install
---force <wheel URL>` people already run. Platform wheels make that URL
-per-platform. `uv tool install loch --find-links
-https://github.com/ness-dev/loch/releases/expanded_assets/<tag>` would let uv
-pick the right one without PyPI, **but it hasn't been tried** against a real
-release page. Until then, a `uv tool` install and an npm global install both
-put a `loch` on PATH and whichever comes first wins; the settings files
-written by `install` name `loch`, so it is PATH order that decides which
-build the hooks run. That is fine while the two are equivalent, which is
-what the harness is for.
+string). Listings send `encoding-type=url` and decode the keys, so a key
+with any character survives the XML. A store that doesn't answer fails
+after 20s rather than holding a turn. The tests that need an endpoint are
+`#[ignore]`d in `tests/store.rs` and `tests/index.rs`, and read it from
+`LOCH_TEST_S3_ENDPOINT` (bucket `LOCH_TEST_S3_BUCKET`, default `sessions`):
+`moto_server` or MinIO will do. moto's verifier rejects correct signatures on
+keys holding a space or `+` and on prefixed listings when its IAM auth is on,
+so a signing failure in exactly those cases against moto is moto's.
 
 ## State
 
@@ -905,8 +783,8 @@ the transcript is the source of truth for what directories it names, and
 adding a field would change the ref of every bundle for a value the
 restore side can recompute.
 
-**The S3 backend has still never run against a real bucket.** It has moto
-coverage now, which is more than it had, but mocks agree with your
+**The S3 backend has still never run against a real bucket.** It has run
+against moto, which is more than it had, but mocks agree with your
 assumptions by construction. A live run failed on `Access Denied` (the
 IAM user lacked `s3:PutObject`); the region mismatch that precedes that
 failure surfaces as "The bucket you are attempting to access must be
@@ -939,14 +817,11 @@ between `bundle-not-found` and `store-unreachable` came from, but nothing has
 been wired up against it yet, so the field names have never survived contact
 with a real integration.
 
-The suite passes on 3.10.13 and 3.13 as well as 3.12, and a boto3-free
-install saves and lists against a `file://` store unmodified. **Neither
-workflow has ever run**, though — they were written against a repo with no
-CI and no release, so the first tag push is also the first execution of the
-release path. No release exists yet, so the wheel URL in the README points at
-a `v0.1.0` that has to be cut before it resolves.
+**Neither workflow has ever run** — the first tag push is also the first
+execution of the release path, including the six-target build matrix, and no
+release exists yet.
 
-**Blame and ask (`trace.py`) are a working demo on this repository.** All 12
+**Blame and ask (`trace.rs`) are a working demo on this repository.** All 12
 commits whose sessions still existed were backfilled exactly; the 50 from
 August have no conversation left, because Claude Code had already deleted
 their transcripts (`cleanupPeriodDays`, default 30) — the reason the stop
@@ -997,28 +872,16 @@ git pins, or emit back to Claude Code JSONL. Until the first conversation is
 shared, ids may change between commits (SPEC.md §12). The bundle format and
 everything `save`/`restore` do are unchanged.
 
-`format.canonical` is RFC 8785 written out by hand rather than `json.dumps`,
-because Python's float repr and code-point key order both disagree with it.
-That costs speed: the corpus check went from about 3.5 to about 5.5 minutes.
-If it ever matters, the fast path is `json.dumps` for any value containing no
-float, no non-BMP key and no lone surrogate, which is nearly all of them, and checking the two
-agree is a one-line property test.
+`json::canonical` is RFC 8785: keys by UTF-16 code unit, numbers as
+ECMAScript prints them, strings as JSON.stringify escapes them, integers
+exact at any size.
 
 ## Conventions
 
-- Verify before committing: `poetry run ruff check`,
-  `poetry run ruff format --check`, `poetry run mypy .`, and
-  `poetry run pytest`. Touching `rust/` adds `cargo fmt --check`,
-  `cargo clippy --release --all-targets -- -D warnings`, `cargo test` there,
-  and `LOCH_RUST=rust/target/release/loch poetry run pytest
-  test/test_equivalence.py test/test_equivalence_commands.py` after a
-  `cargo build --release`. A change to how either build reads transcripts
-  adds the corpus check (`LOCH_CORPUS=1`).
-- A behaviour change goes into both builds in one commit, with a scenario
-  that would have told them apart.
-- A command is ported when the harness covers it, not when it compiles. Port
-  behaviour exactly, quirks included, and fix a quirk in Python first if it
-  is a bug, so the reference stays the reference.
+- Verify before committing: `cargo fmt --check`,
+  `cargo clippy --release --all-targets -- -D warnings` and
+  `cargo test --release`. A change to how transcripts are read adds the
+  corpus check (`LOCH_CORPUS=1 cargo test --release --test corpus -- --ignored`).
 - Commit coherent changes as you go rather than batching.
 - **Every command must be fully drivable by a program that never reads the
   human text.** A new command isn't finished until `--json` covers it —

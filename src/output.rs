@@ -1,4 +1,4 @@
-//! The result envelope and its two renderings, as in `loch/output.py`.
+//! The result envelope and its two renderings.
 
 use crate::json::{self, Map, Value};
 use std::io::Write;

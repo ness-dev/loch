@@ -1,4 +1,4 @@
-//! Store key layout and derived index entries, as in `loch/index.py`.
+//! Store key layout and derived index entries.
 
 use crate::bundle::{unpack_bundle, Bundle, BundleSession};
 use crate::json::{self, Value};
@@ -38,7 +38,7 @@ pub fn bundle_key(ref_: &str) -> String {
     format!("{}{}.loch", BUNDLES_PREFIX, ref_)
 }
 
-fn ref_from_key(key: &str) -> String {
+pub fn ref_from_key(key: &str) -> String {
     key[BUNDLES_PREFIX.len()..key.len() - ".loch".len()].into()
 }
 

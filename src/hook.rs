@@ -20,14 +20,13 @@
 //! and nothing is written to stdout: a hook that breaks the agent gets
 //! uninstalled.
 
+use crate::agent::{self, Agent, TurnInfo};
 use crate::attribution::{self, EditRecord, TurnRecord};
-use crate::claude::{display_summary, AGENT};
 use crate::json::{self, Map, Value};
 use crate::object;
 use crate::snapshot;
 use crate::store::{self, Store};
 use crate::sys;
-use crate::trace::{self, content};
 use std::fs;
 use std::path::PathBuf;
 
@@ -114,94 +113,12 @@ fn write_state(session: &str, state: &State) -> Result<(), Stop> {
     Ok(())
 }
 
-// -- reading the transcript -------------------------------------------------------
-
-/// What the transcript says about a turn: the prompt that began it and the
-/// last record written.
-#[derive(Default)]
-pub struct TurnInfo {
-    pub prompt_uuid: Option<String>,
-    pub prompt: Option<String>,
-    pub started: Option<String>,
-    pub end_uuid: Option<String>,
-    pub ended: Option<String>,
-}
-
-/// A record a person typed: a user message that is neither a tool's result
-/// nor Claude Code's own bookkeeping.
-pub fn is_human_prompt(record: &Map) -> bool {
-    if !record.get("type").is_some_and(|t| t.is_str("user")) {
-        return false;
-    }
-    if record.get("isMeta").is_some_and(Value::truthy)
-        || record.get("isCompactSummary").is_some_and(Value::truthy)
-    {
-        return false;
-    }
-    match record.get("message").and_then(|m| m.get("content")) {
-        Some(Value::Str(_)) => true,
-        Some(Value::Array(_)) => !content(record)
-            .iter()
-            .any(|b| b.get("type").is_some_and(|t| t.is_str("tool_result"))),
-        _ => false,
-    }
-}
-
-pub fn prompt_text(record: &Map) -> Option<String> {
-    match record.get("message")?.get("content")? {
-        Value::Str(text) => Some(text.clone()),
-        Value::Array(_) => content(record)
-            .iter()
-            .find_map(|block| match block.get("text") {
-                Some(Value::Str(text)) if !text.is_empty() => Some(text.clone()),
-                _ => None,
-            }),
-        _ => None,
-    }
-}
-
-/// The turn the transcript ends with. When the hook closing it belongs to the
-/// *next* prompt, that prompt may already be written; `excluding` names it,
-/// and it and everything after are left out.
-pub fn current_turn(transcript: &str, excluding: Option<&str>) -> TurnInfo {
-    let records: Vec<Map> = trace::read_records(transcript)
-        .into_iter()
-        .filter(|r| matches!(r.get("uuid"), Some(Value::Str(_))))
-        .collect();
-    let mut end = records.len();
-    if let Some(next) = excluding {
-        if let Some(at) = records.iter().rposition(is_human_prompt) {
-            if prompt_text(&records[at]).as_deref() == Some(next) {
-                end = at;
-            }
-        }
-    }
-    let mut info = TurnInfo::default();
-    for record in &records[..end] {
-        let uuid = record
-            .get("uuid")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let stamp = record
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if is_human_prompt(record) {
-            info.prompt_uuid = uuid.clone();
-            info.prompt = display_summary(prompt_text(record).as_deref());
-            info.started = stamp.clone();
-        }
-        info.end_uuid = uuid;
-        info.ended = stamp;
-    }
-    info
-}
-
 // -- closing a turn ------------------------------------------------------------------
 
 /// Records the turn that began at `start` and ends now, in the session's edit
 /// record, and returns the snapshot it ended at.
 fn close_turn(
+    agent: &dyn Agent,
     session: &str,
     root: &str,
     start: Option<&str>,
@@ -210,8 +127,8 @@ fn close_turn(
     store: Option<&dyn Store>,
 ) -> Result<String, Stop> {
     let end = snapshot::snapshot(root)?;
-    let mut record = attribution::load_local(AGENT, session).unwrap_or_else(|| EditRecord {
-        agent: AGENT.into(),
+    let mut record = attribution::load_local(agent.id(), session).unwrap_or_else(|| EditRecord {
+        agent: agent.id().into(),
         session: session.into(),
         project: attribution::project_id(root),
         root: root.into(),
@@ -248,8 +165,8 @@ fn close_turn(
 }
 
 /// The session's last closed turn's prompt, to recognise a repeated `Stop`.
-fn last_prompt(session: &str) -> Option<String> {
-    attribution::load_local(AGENT, session)?
+fn last_prompt(agent: &dyn Agent, session: &str) -> Option<String> {
+    attribution::load_local(agent.id(), session)?
         .turns
         .last()?
         .prompt_uuid
@@ -259,19 +176,16 @@ fn last_prompt(session: &str) -> Option<String> {
 /// A turn begins. A turn still open from before — cancelled, or a crash then
 /// `--resume` — is closed first, so its edits are its own and not this
 /// turn's baseline.
-pub fn prompt(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
+pub fn prompt(agent: &dyn Agent, event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
     let session = session_of(event)?;
     let root = snapshot::workspace_root(&event_cwd(event));
     if let Some(state) = read_state(&session).filter(|s| s.open) {
         if snapshot::snapshottable(&state.root) {
-            let next = match event.get("prompt") {
-                Some(Value::Str(text)) => Some(text.as_str()),
-                _ => None,
-            };
             let info = transcript_of(event)
-                .map(|t| current_turn(&t, next))
+                .map(|t| agent.current_turn(&t, event, true))
                 .unwrap_or_default();
             close_turn(
+                agent,
                 &session,
                 &state.root,
                 Some(&state.turn_start),
@@ -296,9 +210,9 @@ pub fn prompt(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
 }
 
 /// The agent finished: record what the turn changed, and keep the transcript.
-pub fn stop(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
+pub fn stop(agent: &dyn Agent, event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
     if let Some(store) = store {
-        let _ = snapshot_transcript(event, store);
+        let _ = snapshot_transcript(agent, event, store);
     }
     let session = session_of(event)?;
     let state = read_state(&session);
@@ -310,9 +224,9 @@ pub fn stop(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
         return Ok(());
     }
     let info = transcript_of(event)
-        .map(|t| current_turn(&t, None))
+        .map(|t| agent.current_turn(&t, event, false))
         .unwrap_or_default();
-    let repeated = info.prompt_uuid.is_some() && last_prompt(&session) == info.prompt_uuid;
+    let repeated = info.prompt_uuid.is_some() && last_prompt(agent, &session) == info.prompt_uuid;
     // The turn's own start if it has one — an open turn, or a repeated stop of
     // the last one. Otherwise no prompt hook ran (installed mid-session, or a
     // harness without one), and the workspace's last snapshot is the best
@@ -321,7 +235,7 @@ pub fn stop(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
         Some(state) if state.open || repeated => Some(state.turn_start.clone()),
         _ => snapshot::latest(&root),
     };
-    close_turn(&session, &root, start.as_deref(), info, false, store)?;
+    close_turn(agent, &session, &root, start.as_deref(), info, false, store)?;
     if let Some(start) = start {
         write_state(
             &session,
@@ -337,14 +251,15 @@ pub fn stop(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
 
 /// The session is over. A turn still open was cut short; close it, and let
 /// the session's state go, so nothing it held is kept any longer.
-pub fn end(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
+pub fn end(agent: &dyn Agent, event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
     let session = session_of(event)?;
     if let Some(state) = read_state(&session).filter(|s| s.open) {
         if snapshot::snapshottable(&state.root) {
             let info = transcript_of(event)
-                .map(|t| current_turn(&t, None))
+                .map(|t| agent.current_turn(&t, event, false))
                 .unwrap_or_default();
             close_turn(
+                agent,
                 &session,
                 &state.root,
                 Some(&state.turn_start),
@@ -355,7 +270,7 @@ pub fn end(event: &Map, store: Option<&dyn Store>) -> Result<(), Stop> {
         }
     }
     if let Some(store) = store {
-        let _ = snapshot_transcript(event, store);
+        let _ = snapshot_transcript(agent, event, store);
     }
     let _ = fs::remove_file(state_path(&session));
     Ok(())
@@ -400,28 +315,32 @@ pub fn collect() -> Result<snapshot::Collected, snapshot::SnapshotError> {
 
 /// Copies the live transcript into the store. The file is append-only, so the
 /// latest snapshot covers every earlier one and one key per session suffices.
-pub fn snapshot_transcript(event: &Map, store: &dyn Store) -> Result<Option<String>, Stop> {
+pub fn snapshot_transcript(
+    agent: &dyn Agent,
+    event: &Map,
+    store: &dyn Store,
+) -> Result<Option<String>, Stop> {
     let (Some(Value::Str(path)), Some(Value::Str(session_id))) =
         (event.get("transcript_path"), event.get("session_id"))
     else {
         return Ok(None);
     };
+    let Some(key) = agent.transcript_key(path, session_id) else {
+        return Ok(None);
+    };
     let Ok(data) = fs::read(path) else {
         return Ok(None);
     };
-    let project = sys::basename(&sys::dirname(path));
-    let key = format!(
-        "{}{}/{}.jsonl",
-        trace::transcripts_prefix(),
-        project,
-        session_id
-    );
     store.put(&key, &data).map_err(|_| Stop)?;
     Ok(Some(key))
 }
 
-/// Run by the harness with the event as JSON on stdin.
-pub fn run(name: &str, stdin: &[u8]) {
+/// Run by the harness with the event as JSON on stdin. An agent this build
+/// doesn't know does nothing, like every other failure here.
+pub fn run(name: &str, agent_id: &str, stdin: &[u8]) {
+    let Some(agent) = agent::by_id(agent_id) else {
+        return;
+    };
     let Ok(text) = std::str::from_utf8(stdin) else {
         return;
     };
@@ -431,9 +350,9 @@ pub fn run(name: &str, stdin: &[u8]) {
     };
     let store = || store::create_store(&store::resolve_store_uri(None)).ok();
     let _ = match name {
-        "prompt" => prompt(&event, store().as_deref()),
-        "stop" => stop(&event, store().as_deref()),
-        "end" => end(&event, store().as_deref()),
+        "prompt" => prompt(agent, &event, store().as_deref()),
+        "stop" => stop(agent, &event, store().as_deref()),
+        "end" => end(agent, &event, store().as_deref()),
         // The tool-call hooks the git-notes design used. A settings file can
         // still name them until `install` is re-run; they do nothing.
         _ => return,

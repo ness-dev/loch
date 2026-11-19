@@ -5,23 +5,22 @@
 //! What a turn changed is recorded by the hooks (`hook.rs`) and matched by
 //! content (`attribution.rs`); nothing here reads or writes git history.
 
+use crate::agent::{self, Agent};
 use crate::attribution::{EditRecord, TurnRecord};
-use crate::claude::{self, home_dir, projects_dir, read_session_meta, AGENT};
+use crate::claude::{self, home_dir};
 use crate::format::Turn;
 use crate::git as gitio;
 use crate::ingest::{self, Origin};
 use crate::json::{self, Map, Value};
 use crate::object;
 use crate::py;
-use crate::rewrite::{rewrite_transcript, RewriteSpec};
-use crate::store::{Store, StoreError};
+use crate::store::Store;
 use crate::sys;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 
-pub fn transcripts_prefix() -> String {
-    format!("transcripts/{}/", AGENT)
+pub fn transcripts_prefix(agent: &str) -> String {
+    format!("transcripts/{}/", agent)
 }
 
 #[derive(Debug)]
@@ -59,14 +58,6 @@ pub fn py_str(value: Option<&Value>) -> String {
 
 // -- install ------------------------------------------------------------------
 
-/// A turn's two moments, which is all attribution needs, and the session's
-/// end, which closes a turn a cancel left open.
-const HOOK_EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", "prompt"),
-    ("Stop", "stop"),
-    ("SessionEnd", "end"),
-];
-
 /// What earlier versions of `install` wrote around every Bash call, for the
 /// git-notes design. Removed on install, so they stop costing a process each.
 const RETIRED: &[&str] = &["pre-tool", "post-tool"];
@@ -81,10 +72,17 @@ pub struct Installed {
     pub removed: Vec<String>,
 }
 
-fn hook_line(command: &str, name: &str) -> String {
+/// The line a hook runs. `agent` is passed only for agents other than Claude
+/// Code, so the lines earlier versions wrote for it still match.
+pub fn hook_line(command: &str, name: &str, agent: &dyn Agent) -> String {
+    let flag = if agent.id() == claude::AGENT {
+        String::new()
+    } else {
+        format!(" --agent {}", agent.id())
+    };
     // A checkout whose machine lacks loch gets a silent no-op rather than an
     // error on every turn, since the settings file is committed.
-    format!("{} hook {} 2>/dev/null || true", command, name)
+    format!("{} hook {}{} 2>/dev/null || true", command, name, flag)
 }
 
 fn is_retired(line: &str) -> bool {
@@ -93,12 +91,14 @@ fn is_retired(line: &str) -> bool {
         .any(|name| line.ends_with(&format!(" hook {} 2>/dev/null || true", name)))
 }
 
-/// Adds loch's hooks to a Claude Code settings file, keeping whatever else is
-/// there, and takes out the ones it no longer uses. Re-running changes
-/// nothing.
+/// Adds an agent's loch hooks to its hooks file, keeping whatever else is
+/// there, and takes out the ones loch no longer uses. Re-running changes
+/// nothing. Claude Code's settings and Codex's hooks.json share the shape
+/// `{"hooks": {"<Event>": [{"hooks": [{"type": "command", "command": ...}]}]}}`.
 pub fn install_hooks(
     settings_path: &str,
     command: &str,
+    agent: &dyn Agent,
 ) -> std::result::Result<Installed, InstallError> {
     let mut settings = match fs::read(settings_path) {
         Ok(bytes) => {
@@ -154,8 +154,8 @@ pub fn install_hooks(
     hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
 
     let mut added = Vec::new();
-    for (event, name) in HOOK_EVENTS {
-        let line = hook_line(command, name);
+    for (event, name) in agent.hook_events() {
+        let line = hook_line(command, name, agent);
         let groups = hooks
             .entry(event.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -220,67 +220,9 @@ pub fn content(record: &Map) -> Vec<&Map> {
     }
 }
 
-fn list_dir(path: &str) -> Vec<String> {
-    fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Claude's own copy if it still exists, else the store's snapshot, fetched
-/// into a cache laid out like Claude's project directory so the session's cwd
-/// is chosen the same way.
-pub fn find_transcript(
-    session_id: &str,
-    store: Option<&dyn Store>,
-) -> std::result::Result<Option<String>, StoreError> {
-    let root = projects_dir(None);
-    if Path::new(&root).is_dir() {
-        for project in list_dir(&root) {
-            let path = sys::join(
-                &sys::join(&root, &project),
-                &format!("{}.jsonl", session_id),
-            );
-            if Path::new(&path).exists() {
-                return Ok(Some(path));
-            }
-        }
-    }
-    let Some(store) = store else {
-        return Ok(None);
-    };
-    let prefix = transcripts_prefix();
-    let Ok(keys) = store.list(&prefix) else {
-        return Ok(None);
-    };
-    let suffix = format!("/{}.jsonl", session_id);
-    for key in keys {
-        if key.ends_with(&suffix) {
-            let project = key[prefix.len()..]
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let data = match store.get(&key) {
-                Ok(data) => data,
-                Err(StoreError::Missing(_)) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            let cache = sys::join(
-                &sys::join(&sys::join(&home_dir(), ".loch"), "cache"),
-                &project,
-            );
-            let cached = sys::join(&cache, &format!("{}.jsonl", session_id));
-            let _ = fs::create_dir_all(&cache);
-            let _ = fs::write(&cached, data);
-            return Ok(Some(cached));
-        }
-    }
-    Ok(None)
+/// Where transcripts fetched from the store are kept.
+pub fn cache_dir() -> String {
+    sys::join(&sys::join(&home_dir(), ".loch"), "cache")
 }
 
 // -- describing a turn -------------------------------------------------------------
@@ -338,14 +280,22 @@ impl<'a> Resolver<'a> {
 
     fn session(
         &mut self,
+        agent_id: &str,
         session_id: &str,
     ) -> std::result::Result<&(Option<String>, Vec<Turn>, Map), String> {
         if !self.sessions.contains_key(session_id) {
-            let path = find_transcript(session_id, self.store).map_err(|e| e.to_string())?;
+            let path = match agent::by_id(agent_id) {
+                Some(agent) => agent
+                    .find_transcript(session_id, self.store)
+                    .map_err(|e| e.to_string())?,
+                None => None,
+            };
             let mut turns = Vec::new();
             let mut header = Map::new();
-            if let Some(path) = &path {
-                if let Some(meta) = read_session_meta(path) {
+            // The loch converter reads Claude Code's format alone; another
+            // agent's turns are described without loch ids.
+            if let (Some(path), true) = (&path, agent_id == claude::AGENT) {
+                if let Some(meta) = claude::read_session_meta(path) {
                     let origin = Origin {
                         cwd: meta.cwd,
                         home: home_dir(),
@@ -369,7 +319,7 @@ impl<'a> Resolver<'a> {
         index: usize,
     ) -> std::result::Result<Link, String> {
         let turn: &TurnRecord = &record.turns[index];
-        let (path, turns, header) = self.session(&record.session)?;
+        let (path, turns, header) = self.session(&record.agent, &record.session)?;
         // The loch turn whose source record is the prompt that began this
         // turn — or that a resubmitted identical prompt folded into.
         let holds = |candidate: &&Turn, uuid: &str| {
@@ -430,132 +380,10 @@ pub struct Fork {
     pub origin_session: String,
 }
 
-fn parent(record: &Map) -> Option<String> {
-    let parent = match record.get("parentUuid") {
-        None | Some(Value::Null) => record.get("logicalParentUuid"),
-        other => other,
-    };
-    parent.and_then(Value::as_str).map(str::to_string)
-}
-
-fn uuid(record: &Map) -> &str {
-    record.get("uuid").and_then(Value::as_str).unwrap_or("")
-}
-
-/// A new Claude session holding the conversation, filed under `target_cwd`.
-/// With no `cut` it holds the conversation to its end — the last record
-/// written, which after a rewind is the branch the session was left on. With
-/// one, it ends at that record: the last of the turn being asked about.
-pub fn fork_session(
-    transcript: &str,
-    target_cwd: &str,
-    cut: Option<&str>,
-    title: Option<&str>,
-) -> std::result::Result<Fork, ForkError> {
-    let bytes =
-        fs::read(transcript).map_err(|e| ForkError::Internal(sys::os_error(&e, transcript)))?;
-    let raw = py::decode_surrogateescape(&bytes);
-    let records: Vec<Map> = records_of(&raw)
-        .into_iter()
-        .filter(|r| matches!(r.get("uuid"), Some(Value::Str(_))))
-        .collect();
-    if records.is_empty() {
-        return Err(ForkError::Trace(TraceError::new(
-            "turn-not-found",
-            "the transcript holds no records",
-        )));
-    }
-    let leaf = match cut {
-        None => records.len() - 1,
-        Some(cut) => match records.iter().rposition(|r| uuid(r) == cut) {
-            Some(leaf) => leaf,
-            None => {
-                return Err(ForkError::Trace(TraceError::new(
-                    "turn-not-found",
-                    format!("the transcript has no record {}", cut),
-                )))
-            }
-        },
-    };
-    write_fork(transcript, &raw, &records, leaf, target_cwd, title)
-}
-
 #[derive(Debug)]
 pub enum ForkError {
     Trace(TraceError),
     Internal(String),
-}
-
-fn write_fork(
-    transcript: &str,
-    raw: &str,
-    records: &[Map],
-    leaf: usize,
-    target_cwd: &str,
-    title: Option<&str>,
-) -> std::result::Result<Fork, ForkError> {
-    let mut by_uuid: HashMap<&str, usize> = HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-        by_uuid.insert(uuid(record), index);
-    }
-    let mut keep: HashSet<String> = HashSet::new();
-    let mut walker = Some(leaf);
-    while let Some(index) = walker {
-        let id = uuid(&records[index]).to_string();
-        if keep.contains(&id) {
-            break;
-        }
-        keep.insert(id);
-        walker = parent(&records[index]).and_then(|p| by_uuid.get(p.as_str()).copied());
-    }
-
-    let origin_cwd = match read_session_meta(transcript) {
-        Some(meta) => meta.cwd,
-        None => match claude::transcript_cwds(raw).into_iter().next() {
-            Some((cwd, _)) => cwd,
-            None => return Err(ForkError::Internal("the transcript names no cwd".into())),
-        },
-    };
-    let file = sys::basename(transcript);
-    let origin_session = file[..file.len().saturating_sub(".jsonl".len())].to_string();
-    let new_id = sys::uuid4();
-
-    let mut kept: Vec<String> = records
-        .iter()
-        .filter(|r| keep.contains(uuid(r)))
-        .map(|r| json::dumps(&Value::Object(r.clone()), json::UNICODE))
-        .collect();
-    let default_title = format!("loch ask: {}", py::truncate(&origin_session, 8));
-    kept.push(json::dumps(
-        &Value::Object(object! {
-            "type" => "custom-title",
-            "customTitle" => title.filter(|t| !t.is_empty()).unwrap_or(&default_title),
-            "sessionId" => origin_session.as_str(),
-        }),
-        json::DEFAULT,
-    ));
-    let home = home_dir();
-    let spec = RewriteSpec {
-        origin_cwd,
-        origin_home: home.clone(),
-        target_cwd: target_cwd.into(),
-        target_home: home,
-        origin_session_id: Some(origin_session.clone()),
-        target_session_id: Some(new_id.clone()),
-    };
-    let text = rewrite_transcript(&format!("{}\n", kept.join("\n")), &spec);
-    let path = claude::transcript_path_for(target_cwd, &new_id, None);
-    let parent_dir = sys::dirname(&path);
-    fs::create_dir_all(&parent_dir)
-        .map_err(|e| ForkError::Internal(sys::os_error(&e, &parent_dir)))?;
-    let bytes = py::encode_surrogateescape(&text)
-        .map_err(|_| ForkError::Internal("the fork holds an unencodable surrogate".into()))?;
-    fs::write(&path, bytes).map_err(|e| ForkError::Internal(sys::os_error(&e, &path)))?;
-    Ok(Fork {
-        session_id: new_id,
-        path,
-        cwd: target_cwd.into(),
-        records: keep.len(),
-        origin_session,
-    })
+    /// The agent's adapter can't fork a conversation.
+    Unsupported(&'static str),
 }

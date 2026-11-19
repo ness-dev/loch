@@ -20,9 +20,8 @@
 //! what an earlier backfill wrote.
 
 use crate::attribution::{self, EditRecord, FileChange, Hunk, TurnRecord};
-use crate::claude::{self, display_summary, AGENT};
+use crate::claude::{self, display_summary, is_human_prompt, prompt_text, AGENT};
 use crate::git;
-use crate::hook::{is_human_prompt, prompt_text};
 use crate::json::{self, Map, Value};
 use crate::snapshot;
 use crate::store::Store;

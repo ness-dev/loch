@@ -128,3 +128,74 @@ fn packing_matches_python_310_on_every_platform() {
     assert_eq!(&sha256_hex(&packed)[..16], "405552bff938ef58");
     assert_eq!(gunzip(&packed), data);
 }
+
+// -- format pins ----------------------------------------------------------------
+//
+// The ref is a hash of the packed bytes, so anything that changes them —
+// separators, key order, a null where a key was omitted, a field added to
+// every session — changes the identity of every bundle ever made. These pin
+// the bytes of today's format; a failure here means existing refs would no
+// longer reproduce, which needs a deliberate decision, not a test update.
+
+fn pinned_bundle() -> Bundle {
+    Bundle {
+        version: 1,
+        agent: "claude-code".into(),
+        created_at: "2026-08-14T13:27:07.373Z".into(),
+        origin: BundleOrigin {
+            home: "/home/mike".into(),
+            platform: "linux".into(),
+            hostname: "box".into(),
+        },
+        sessions: vec![
+            BundleSession {
+                session_id: "11111111-2222-4333-8444-555555555555".into(),
+                cwd: "/home/mike/proj".into(),
+                git_branch: Some("feature/é".into()),
+                claude_version: Some("1.0.99".into()),
+                modified_at: "2026-08-14T13:00:00.000Z".into(),
+                transcript: concat!(
+                    "{\"type\":\"user\",\"cwd\":\"/home/mike/proj\",\"message\":",
+                    "{\"content\":\"quote \\\" newline \\n tab \\t snowman ☃\"}}\n"
+                )
+                .into(),
+            },
+            BundleSession {
+                session_id: "66666666-7777-4888-9999-000000000000".into(),
+                cwd: "/home/mike/proj".into(),
+                git_branch: None,
+                claude_version: None,
+                modified_at: "2026-08-14T12:00:00.000Z".into(),
+                transcript: "{\"cwd\":\"/home/mike/proj\"}\n".into(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn the_packed_json_is_pinned() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    let json = String::from_utf8(gunzip(&packed)).unwrap();
+    assert_eq!(
+        json,
+        r##"{"version":1,"agent":"claude-code","createdAt":"2026-08-14T13:27:07.373Z","origin":{"home":"/home/mike","platform":"linux","hostname":"box"},"sessions":[{"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"/home/mike/proj","gitBranch":"feature/é","claudeVersion":"1.0.99","modifiedAt":"2026-08-14T13:00:00.000Z","transcript":"{\"type\":\"user\",\"cwd\":\"/home/mike/proj\",\"message\":{\"content\":\"quote \\\" newline \\n tab \\t snowman ☃\"}}\n"},{"sessionId":"66666666-7777-4888-9999-000000000000","cwd":"/home/mike/proj","modifiedAt":"2026-08-14T12:00:00.000Z","transcript":"{\"cwd\":\"/home/mike/proj\"}\n"}]}"##
+    );
+}
+
+#[test]
+fn the_ref_is_pinned() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    assert_eq!(
+        bundle_ref(&packed),
+        "3069348d032085727a057739310cef4cb14ab8dba1fe838f865e46bf90235dad"
+    );
+}
+
+#[test]
+fn repacking_an_unpacked_bundle_reproduces_its_bytes() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    assert_eq!(
+        pack_bundle(&unpack_bundle(&packed).unwrap()).unwrap(),
+        packed
+    );
+}

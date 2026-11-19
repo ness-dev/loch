@@ -218,7 +218,8 @@ src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
 │                 #   blame/log/ask/backfill/gc/hook/help/version
-├── claude.rs     # Claude Code adapter: path encoding, session discovery, metadata
+├── agent.rs      # the adapter boundary: what loch needs from one agent harness
+├── claude.rs     # Claude Code adapter: path encoding, discovery, metadata, turns, fork
 ├── bundle.rs     # bundle format, gzip, content-addressed ref
 ├── format.rs     # loch format: turn and content ids, derived files
 ├── ingest.rs     # Claude Code JSONL -> loch turns (the converter)
@@ -830,10 +831,13 @@ field it wants is `foreignCwds`. Its shape is
 keyed on the origin deliberately (above) — it was `{"<path>": <count>}`
 briefly and was changed before anything consumed it.
 
-Nothing currently pins the bundle format. The two constraints above —
-compact separators and omitted-not-null metadata — are held by prose
-rather than by a test, so a well-meaning refactor could change every
-ref the format produces without failing the suite. Note that
+The bundle format is pinned by `tests/bundle.rs`: the exact packed JSON
+and ref of a two-session bundle (an absent branch and version, non-ASCII,
+escapes), and that re-packing an unpacked bundle reproduces its bytes. A
+failure there means every existing ref would stop reproducing, which needs
+a decision, not a test update. The adapter extraction was also checked
+against real data: `save` and `list` on three project directories (100
+sessions) gave identical refs and output before and after. Note that
 `SessionMeta.other_cwds` is deliberately *not* packed into the bundle:
 the transcript is the source of truth for what directories it names, and
 adding a field would change the ref of every bundle for a value the

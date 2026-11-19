@@ -162,8 +162,15 @@ pub struct ForeignCwd {
 /// satisfy, keyed by their path on the *origin* machine. Takes the transcript
 /// before rewriting, the only place the origin path still exists losslessly.
 pub fn foreign_cwds(raw: &str, spec: &RewriteSpec) -> Vec<(String, ForeignCwd)> {
-    transcript_cwds(raw)
-        .into_iter()
+    foreign_cwds_of(transcript_cwds(raw), spec)
+}
+
+/// `foreign_cwds` over the cwds an agent's adapter read from the transcript.
+pub fn foreign_cwds_of(
+    cwds: Vec<(String, usize)>,
+    spec: &RewriteSpec,
+) -> Vec<(String, ForeignCwd)> {
+    cwds.into_iter()
         .filter_map(|(cwd, count)| {
             let restored = rewrite_transcript(&cwd, spec);
             (restored != spec.target_cwd).then_some((cwd, ForeignCwd { count, restored }))

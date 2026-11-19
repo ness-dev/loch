@@ -4,6 +4,7 @@
 // The error path is cold and runs once per process; boxing it buys nothing.
 #![allow(clippy::result_large_err)]
 
+pub mod agent;
 pub mod argparse;
 pub mod attribution;
 pub mod backfill;

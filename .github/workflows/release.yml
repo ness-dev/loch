@@ -54,7 +54,16 @@ jobs:
 
       - name: Check a Linux binary really is static
         if: matrix.musl
-        run: file target/${{ matrix.target }}/release/loch | grep -q "statically linked"
+        # Rust links x86_64 musl as static-pie, which `file` reports as
+        # "static-pie linked" rather than "statically linked". What makes a
+        # binary static either way is having no program interpreter.
+        run: |
+          bin=target/${{ matrix.target }}/release/loch
+          file "$bin"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "$bin requests a dynamic loader" >&2
+            exit 1
+          fi
 
       - name: Package
         run: |

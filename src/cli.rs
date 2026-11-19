@@ -1444,6 +1444,30 @@ fn exec_claude(root: &str, command: &[String]) -> Run {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+// -- gc ------------------------------------------------------------------------------
+
+/// Deletes the snapshots nothing needs: the hooks do this on their own every
+/// `COLLECT_EVERY` snapshots, and this runs it now.
+pub fn command_gc(argv: &[String]) -> Run {
+    let p = parser("gc");
+    p.parse(argv)?;
+    let collected = crate::hook::collect().map_err(|e| Failure::Internal(e.0))?;
+    Ok(Outcome::with(
+        "gc",
+        object! {
+            "kept" => collected.kept,
+            "removed" => collected.removed,
+            "bytes" => collected.bytes as i64,
+        },
+        format!(
+            "removed {} object(s), {}; kept {}\n",
+            collected.removed,
+            format_bytes(collected.bytes),
+            collected.kept
+        ),
+    ))
+}
+
 // -- help / version -----------------------------------------------------------------
 
 pub fn command_help(_argv: &[String]) -> Run {
@@ -1476,6 +1500,7 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "ask" => command_ask(argv),
         "log" => command_log(argv),
         "hook" => command_hook(argv),
+        "gc" => command_gc(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),
         _ => return None,

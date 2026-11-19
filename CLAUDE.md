@@ -91,6 +91,13 @@ requirements fixed the rest of the design:
   `UserPromptSubmit` and `Stop` hooks are the two moments needed. The old
   pre/post-tool hooks, which ran twice per shell command, are gone, and
   `install` removes them.
+- **Every turn gets closed by someone.** Claude Code runs no `Stop` for a
+  cancelled turn and nothing for a crash, so the cancelled turn's edits would
+  become the next turn's baseline and belong to nobody. A session's state
+  therefore says whether its turn is open, and the next `prompt` — or
+  `SessionEnd`, the third hook — closes it first, marked `interrupted`. Every
+  state and record file is written aside and renamed, so a hook killed
+  mid-write leaves the old file or the new one, never half of either.
 - **No background process.** Snapshots are taken on demand with a stat cache,
   the way git's index works: files whose size and mtime are unchanged aren't
   read again. A harness with no hooks gets coarser attribution, never a
@@ -103,8 +110,14 @@ Git is still *read*, in two places: a project's identity is its root commit
 (the same on every clone and immune to history rewrites), and `list`'s
 default branch. Nothing loch records goes into git.
 
-**Forking at a turn needs the disk state *at that turn*.** That state is the
-turn's end snapshot. Restoring it is the unbuilt part (SPEC.md §10, pins).
+**Snapshots are disposable, so they are collected.** Nothing reads a snapshot
+once its turn is diffed; blame works from the records' hashes. A
+mark-and-sweep keeps each workspace's latest snapshot and each live session's
+turn start, and deletes whatever else is more than an hour old. It runs from
+the hooks every 50 snapshots, like `git gc --auto`, or as `loch gc`. Steady
+state is about one compressed copy of each project plus the turns in flight.
+`ask` resumes the conversation against today's files; restoring a turn's
+exact files was considered and isn't wanted.
 
 **No single index object.** A shared `index.json` would need
 read-modify-write on every save, so two machines saving concurrently would
@@ -185,7 +198,7 @@ binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
-│                 #   blame/log/ask/hook/help/version
+│                 #   blame/log/ask/gc/hook/help/version
 ├── claude.rs     # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.rs     # bundle format, gzip, content-addressed ref
 ├── format.rs     # loch format: turn and content ids, derived files
@@ -193,7 +206,7 @@ src/
 ├── index.rs      # store key layout, derived index entries, delete and reindex
 ├── snapshot.rs   # on-demand workspace snapshots with a stat cache, like git's index
 ├── attribution.rs # per-turn added lines, edit records, and blame's matcher
-├── hook.rs       # `loch hook prompt|stop`: the turn boundaries
+├── hook.rs       # `loch hook prompt|stop|end`: turn boundaries, closing, collection
 ├── trace.rs      # install, finding transcripts, describing turns, ask's fork
 ├── git.rs        # git by subprocess: a project's root commit, the current branch
 ├── blame_html.rs # `blame --html`: self-contained page (blame_template.html)
@@ -711,13 +724,18 @@ Known gaps:
 
 ## Performance
 
-**Hooks run twice per turn, not twice per shell command.** The git-notes
-design needed a hook around every Bash call (73ms each in Python, then 3ms in
-Rust with a native HEAD reader that is now gone). Attribution needs only the
-turn's start and end. Each of those is a snapshot: one walk of the
-workspace, a `stat` per file, and a read only of files whose size or mtime
-changed. A snapshot of a project's first turn reads everything once.
-`examples/bench_hook.rs` still measures any binary's hooks.
+**Hooks run at a turn's boundaries, not around every shell command.** The
+git-notes design needed a hook around every Bash call (73ms each in Python,
+then 3ms in Rust with a native HEAD reader that is now gone). Attribution
+needs a snapshot at the turn's start and end: one walk of the workspace, a
+`stat` per file, and a read only of files whose size or mtime changed. A
+project's first snapshot reads everything once. Measured with
+`examples/bench_hook.rs` (median of 20, one file changed per turn):
+
+| files | `prompt` | `stop` |
+| --- | --- | --- |
+| 2,000 | 43ms | 50ms |
+| 20,000 | 75ms | 134ms |
 
 **Redaction is most of `save`'s cost.** A backtracking engine tries all ten
 rules at every position, and `env-assignment` can begin at any capital: over
@@ -849,15 +867,19 @@ release exists yet.
 - **A person's text isn't the agent's.** A line someone later rewrote is
   unattributed, a re-indented one keeps its turn, and a person's lone `}` is
   not credited to the agent.
+- **Cut-short turns keep their edits.** A cancelled turn is closed by the
+  next prompt, a crash followed by `--resume` likewise, and quitting mid-turn
+  by `SessionEnd`.
+- **Collection is safe.** It removes earlier turns' snapshots and a killed
+  write's leftovers, while an open turn's start survives until it's
+  abandoned.
 
 The notes written under the old design, on this repository only, are not
 migrated: they sit on commits `main` no longer contains.
 
 Known gaps:
-- **No fork at a turn.** The fork resumes in the session's recorded root,
-  not in the turn's snapshot.
-- **Snapshots stay local and are never pruned.** Content is deduplicated,
-  but manifests accumulate, two per turn.
+- **A crash nobody resumes** loses its turn's attribution: nothing ever says
+  when that turn ended. Its state expires after 7 days.
 - **The file index keys on path,** so a file renamed after the turn that
   wrote it is not found under its new name.
 - **Sessions running at once in one workspace** each record the other's

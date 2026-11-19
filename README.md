@@ -109,8 +109,14 @@ the lines, not the code, and blame finds a line's turn by matching the text in
 front of it. Nothing is written to git, so a squash merge, a rebase or a
 cherry-pick loses nothing, and a teammate pointed at the same store sees the
 same answers in their own clone. A line someone later rewrites by hand is, by
-design, no longer the agent's. Each session's transcript is copied into the
-store too — Claude Code deletes its own after 30 days.
+design, no longer the agent's. A turn you cancel, or one cut short by a crash,
+is closed by your next prompt or by the session ending, so its edits are still
+its own. Each session's transcript is copied into the store too — Claude Code
+deletes its own after 30 days.
+
+Snapshots are only needed until a turn is recorded, so loch deletes old ones
+itself every 50 snapshots, keeping about one compressed copy of each project;
+`loch gc` does it on demand.
 
 `ask` never touches the original session: it writes a new one holding the
 conversation, so the follow-up sees today's code.

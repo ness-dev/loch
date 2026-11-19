@@ -1,8 +1,9 @@
 # loch format, version 1
 
 **Status: draft.** The derived-file format and the Claude Code converter
-(§3–§8) are implemented in `loch/format.py` and `loch/ingest.py`. The storage,
-pin and native-turn sections (§9–§11) describe intended shapes that nothing
+(§3–§8) are implemented in `src/format.rs` and `src/ingest.rs`, and workspace
+attribution (§10) in `src/snapshot.rs` and `src/attribution.rs`. The storage
+and native-turn sections (§9, §11) describe intended shapes that nothing
 writes yet. Questions this draft doesn't settle are collected in §13 rather
 than guessed at.
 
@@ -277,7 +278,7 @@ content/<hex>    content object
 turns/<hex>      turn core
 ```
 
-## 10. Workspace attribution (implemented) and pins
+## 10. Workspace attribution
 
 Which turn wrote which lines of a project, recorded without git and found
 again by content, so that squashing, rebasing, cherry-picking and cloning
@@ -298,11 +299,19 @@ them: an edit tool, a shell command, a generator, a formatter it ran.
   SHA-256 of its manifest, one `<content sha256>\t<size>\t<path>` line per
   file, sorted by path.
 - **Turn boundaries** come from the harness: Claude Code's `UserPromptSubmit`
-  and `Stop` hooks. A harness with only an end-of-turn signal uses each
+  and `Stop` hooks, and `SessionEnd`. A harness with only an end-of-turn signal uses each
   turn's end snapshot as the next turn's start. With no signal at all, a
   change is attributed to the span between two snapshots.
 - **Repeated stops are one turn.** Claude Code can stop more than once for one
   prompt; those stops are one turn, measured from where it began.
+- **Every turn gets closed.** Claude Code runs no `Stop` for a cancelled turn
+  and nothing at all for a crash. A turn still open when the session's next
+  prompt arrives, or when the session ends, is closed then, marked
+  `interrupted`, ending where the workspace stands at that moment; otherwise
+  its edits would become the next turn's baseline and belong to nobody. When
+  the next prompt's own record is already in the transcript, it is excluded
+  from the interrupted turn. A crashed session that is never resumed is the
+  one case nothing closes.
 
 **What a turn added.** For each file whose content changed, a line diff
 (Myers) from the start to the end snapshot gives the inserted and replaced
@@ -322,7 +331,7 @@ formatter re-indenting a turn's code doesn't sever the link.
  "turns": [{"promptUuid": "<record>", "endUuid": "<record>",
             "started": "<ISO-8601>", "ended": "<ISO-8601>",
             "prompt": "<first 120 characters, redacted>",
-            "startSnapshot": "<id>", "endSnapshot": "<id>",
+            "interrupted": false,
             "files": [{"path": "<relative, / separated>",
                        "hunks": [{"start": 12, "lines": ["<line hash>", ...]}]}]}]}
 ```
@@ -361,11 +370,21 @@ apply): `reindex` rebuilds it from the records.
 A line no hunk claims was not written by a recorded turn. That includes a
 line someone rewrote after the agent wrote it, which is the intended answer.
 
-**Not yet built: pins.** Forking at a turn should resume against the files as
-they stood when the turn ended. That state is exactly the turn's
-`endSnapshot`. Restoring it into a fresh directory, and keeping the snapshots
-a pin needs from being pruned, is what remains. Snapshot objects stay local
-today, so a fork on another machine would need them uploaded first.
+**Snapshots are disposable.** Nothing reads a snapshot once its turn has
+been diffed, since blame works from the hashes in the records alone, so a
+collector keeps only what a future diff needs. Mark and sweep, from two kinds
+of root:
+- **each workspace's latest snapshot,** the next turn's baseline;
+- **each live session's turn start.** A session's state untouched for 7 days
+  belongs to a crash nobody resumed, and stops being a root.
+
+Everything else written more than an hour ago is deleted. The hour covers
+another session's hook that has snapshotted but not yet recorded the id. The
+collector runs from the hooks once 50 snapshots have accumulated, as
+`git gc --auto` does, and never in the background.
+
+`ask` resumes a conversation against today's files, not the files as they
+stood when the turn ended; restoring those was considered and isn't wanted.
 
 ## 11. Native turns (not yet implemented)
 

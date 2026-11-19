@@ -1,12 +1,12 @@
-//! Wall-clock cost of `loch hook` per call, for any number of loch binaries.
+//! Wall-clock cost of `loch hook` per turn, for any number of loch binaries.
 //!
-//!     cargo run --release --example bench_hook -- [--runs N] <loch> [<loch> ...]
+//!     cargo run --release --example bench_hook -- [--runs N] [--files N] <loch> ...
 //!
-//! Each binary runs against its own scratch repository with the event Claude
-//! Code sends around a Bash call. Three cases, since they cost different
-//! amounts: `pre-tool`, `post-tool` when the call committed nothing (nearly
-//! every call), and `post-tool` when it made a commit and a note gets written.
-//! Reports the median and p90 in milliseconds.
+//! Each binary runs against its own scratch repository of `--files` files
+//! (default 2000) with the events Claude Code sends at a turn's boundaries.
+//! Two cases: `prompt`, which snapshots, and `stop`, which snapshots, diffs
+//! the turn's one changed file and writes the edit record. Reports the median
+//! and p90 in milliseconds.
 
 use std::io::Write;
 use std::path::Path;
@@ -54,72 +54,69 @@ fn run(loch: &str, name: &str, event: &str, home: &Path) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-fn bench(loch: &str, runs: usize) -> Vec<(&'static str, Vec<f64>)> {
+fn bench(loch: &str, runs: usize, files: usize) -> Vec<(&'static str, Vec<f64>)> {
     let root = std::env::temp_dir().join(format!("loch-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let repo = root.join("repo");
-    std::fs::create_dir_all(&repo).expect("scratch dir");
+    std::fs::create_dir_all(repo.join("src")).expect("scratch dir");
     git(&repo, &["init", "-q", "-b", "main"], &root);
-    git(
-        &repo,
-        &["commit", "-q", "--allow-empty", "-m", "initial"],
-        &root,
-    );
-
-    let mut pre = Vec::new();
-    let mut post = Vec::new();
-    let mut commit = Vec::new();
+    for i in 0..files {
+        let body = format!("fn item_{}() -> usize {{\n    {}\n}}\n", i, i);
+        std::fs::write(repo.join(format!("src/f{}.rs", i)), body).expect("write");
+    }
+    let transcript = root.join("transcript.jsonl");
+    let mut prompt = Vec::new();
+    let mut stop = Vec::new();
     for i in 0..runs {
+        let line = format!(
+            r#"{{"type": "user", "uuid": "p{}", "message": {{"content": "turn {}"}}}}"#,
+            i, i
+        );
+        let mut text = std::fs::read_to_string(&transcript).unwrap_or_default();
+        text.push_str(&line);
+        text.push('\n');
+        std::fs::write(&transcript, text).expect("transcript");
         let event = format!(
-            r#"{{"session_id": "{}", "cwd": "{}", "tool_name": "Bash", "tool_input": {{"command": "echo {}"}}, "tool_use_id": "toolu_{:08}"}}"#,
+            r#"{{"session_id": "{}", "cwd": "{}", "transcript_path": "{}"}}"#,
             SESSION,
             repo.display(),
-            i,
-            i
+            transcript.display()
         );
-        pre.push(run(loch, "pre-tool", &event, &root));
-        if i % 2 == 1 {
-            git(
-                &repo,
-                &[
-                    "commit",
-                    "-q",
-                    "--allow-empty",
-                    "-m",
-                    &format!("change {}", i),
-                ],
-                &root,
-            );
-            commit.push(run(loch, "post-tool", &event, &root));
-        } else {
-            post.push(run(loch, "post-tool", &event, &root));
-        }
+        prompt.push(run(loch, "prompt", &event, &root));
+        std::fs::write(
+            repo.join("src/f0.rs"),
+            format!("fn changed() -> usize {{ {} }}\n", i),
+        )
+        .expect("edit");
+        stop.push(run(loch, "stop", &event, &root));
     }
     let _ = std::fs::remove_dir_all(&root);
-    vec![
-        ("pre-tool", pre),
-        ("post-tool", post),
-        ("post-commit", commit),
-    ]
+    vec![("prompt", prompt), ("stop", stop)]
 }
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut runs = 40;
-    if args.first().map(String::as_str) == Some("--runs") {
-        runs = args.get(1).and_then(|n| n.parse().ok()).expect("--runs N");
+    let mut files = 2000;
+    while let Some(flag) = args.first().cloned().filter(|a| a.starts_with("--")) {
+        let value: usize = args.get(1).and_then(|n| n.parse().ok()).expect("a number");
+        match flag.as_str() {
+            "--runs" => runs = value,
+            "--files" => files = value,
+            _ => panic!("unknown flag {}", flag),
+        }
         args.drain(..2);
     }
     assert!(
         !args.is_empty(),
-        "usage: bench_hook [--runs N] <loch> [<loch> ...]"
+        "usage: bench_hook [--runs N] [--files N] <loch> [<loch> ...]"
     );
     println!(
         "{:<48} {:<12} {:>9} {:>9}",
         "binary", "case", "median", "p90"
     );
     for loch in &args {
-        for (case, mut samples) in bench(loch, runs) {
+        for (case, mut samples) in bench(loch, runs, files) {
             samples.sort_by(|a, b| a.total_cmp(b));
             let median = samples[samples.len() / 2];
             let p90 = samples[(samples.len() * 9 / 10).saturating_sub(1)];

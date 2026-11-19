@@ -59,8 +59,13 @@ pub fn py_str(value: Option<&Value>) -> String {
 
 // -- install ------------------------------------------------------------------
 
-/// The two moments a turn has, which is all attribution needs.
-const HOOK_EVENTS: &[(&str, &str)] = &[("UserPromptSubmit", "prompt"), ("Stop", "stop")];
+/// A turn's two moments, which is all attribution needs, and the session's
+/// end, which closes a turn a cancel left open.
+const HOOK_EVENTS: &[(&str, &str)] = &[
+    ("UserPromptSubmit", "prompt"),
+    ("Stop", "stop"),
+    ("SessionEnd", "end"),
+];
 
 /// What earlier versions of `install` wrote around every Bash call, for the
 /// git-notes design. Removed on install, so they stop costing a process each.

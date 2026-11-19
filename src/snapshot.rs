@@ -68,6 +68,20 @@ pub fn has_git_marker(root: &str) -> bool {
     Path::new(root).join(".git").exists()
 }
 
+/// Writes `path` aside and renames it into place, so a hook killed mid-write
+/// — Claude Code's hook timeout, a crash — leaves the old file or the new one,
+/// never half of either. The leftover aside file is swept by `collect`.
+pub fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().expect("written files have a directory");
+    fs::create_dir_all(parent)?;
+    let name = path.file_name().expect("a file name").to_string_lossy();
+    let staged = parent.join(format!(".{}.{}{}", name, TMP_MARK, std::process::id()));
+    fs::write(&staged, data)?;
+    fs::rename(&staged, path)
+}
+
+const TMP_MARK: &str = "tmp";
+
 fn object_path(hash: &str) -> PathBuf {
     loch_home()
         .join("objects")
@@ -80,15 +94,10 @@ fn write_object(hash: &str, data: &[u8]) -> Result<(), SnapshotError> {
     if path.exists() {
         return Ok(());
     }
-    let parent = path.parent().expect("objects have a directory");
-    fs::create_dir_all(parent).map_err(|e| io(e, parent))?;
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(data).expect("writing to a Vec");
     let compressed = encoder.finish().expect("finishing into a Vec");
-    // Written aside and renamed, so a reader never sees half an object.
-    let staged = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&staged, compressed).map_err(|e| io(e, &staged))?;
-    fs::rename(&staged, &path).map_err(|e| io(e, &path))
+    write_atomically(&path, &compressed).map_err(|e| io(e, &path))
 }
 
 pub fn read_object(hash: &str) -> Result<Vec<u8>, SnapshotError> {
@@ -178,7 +187,6 @@ fn load_cache(root: &str) -> (HashMap<String, Cached>, i128) {
 
 fn save_cache(root: &str, taken: i128, cache: &[(String, Cached)]) -> Result<(), SnapshotError> {
     let dir = state_dir(root);
-    fs::create_dir_all(&dir).map_err(|e| io(e, &dir))?;
     let mut text = format!("{}\n", taken);
     for (path, cached) in cache {
         text.push_str(&format!(
@@ -187,9 +195,7 @@ fn save_cache(root: &str, taken: i128, cache: &[(String, Cached)]) -> Result<(),
         ));
     }
     let path = dir.join("index");
-    let staged = dir.join(format!("index.tmp{}", std::process::id()));
-    fs::write(&staged, text).map_err(|e| io(e, &staged))?;
-    fs::rename(&staged, &path).map_err(|e| io(e, &path))
+    write_atomically(&path, text.as_bytes()).map_err(|e| io(e, &path))
 }
 
 /// The latest snapshot taken of `root`, by any session.
@@ -323,7 +329,116 @@ pub fn snapshot(root: &str) -> Result<String, SnapshotError> {
     let id = content_hash(&manifest);
     write_object(&id, &manifest)?;
     save_cache(root, taken, &fresh)?;
-    let dir = state_dir(root);
-    fs::write(dir.join("latest"), &id).map_err(|e| io(e, &dir))?;
+    let latest = state_dir(root).join("latest");
+    write_atomically(&latest, id.as_bytes()).map_err(|e| io(e, &latest))?;
+    count_snapshot();
     Ok(id)
+}
+
+// -- collection -------------------------------------------------------------------
+
+/// Snapshots taken since the last collection, so the hooks can collect the
+/// way `git gc --auto` does: a cheap check on every run, real work rarely.
+fn counter_path() -> PathBuf {
+    loch_home().join("snapshots-since-collect")
+}
+
+fn count_snapshot() {
+    let path = counter_path();
+    let count: u64 = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    let _ = write_atomically(&path, (count + 1).to_string().as_bytes());
+}
+
+/// How many snapshots between automatic collections.
+pub const COLLECT_EVERY: u64 = 50;
+
+pub fn collection_due() -> bool {
+    fs::read_to_string(counter_path())
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .is_some_and(|count| count >= COLLECT_EVERY)
+}
+
+/// Anything written this recently is kept whether or not a root reaches it:
+/// another session's hook may have just snapshotted and not yet recorded the
+/// id anywhere a collection can see.
+pub const GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The snapshot of every workspace's latest state: the baseline for each
+/// workspace's next turn, and so always a root.
+pub fn workspace_roots() -> Vec<String> {
+    let Ok(entries) = fs::read_dir(loch_home().join("workspaces")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path().join("latest")).ok())
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Collected {
+    pub kept: usize,
+    pub removed: usize,
+    pub bytes: u64,
+}
+
+fn is_old(path: &Path, now: std::time::SystemTime) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > GRACE)
+}
+
+/// Mark and sweep: every object `roots` reach — a snapshot's manifest and
+/// the contents it lists — is kept; every other object older than `GRACE` is
+/// deleted, as are aside files a killed write left behind. Blame never reads
+/// a snapshot (the edit records hold hashes), so nothing else needs one.
+pub fn collect(roots: &[String]) -> Result<Collected, SnapshotError> {
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for root in roots {
+        // A root that is already gone, or unreadable, protects nothing.
+        let Ok(entries) = read_snapshot(root) else {
+            continue;
+        };
+        reachable.insert(root.clone());
+        reachable.extend(entries.into_iter().map(|e| e.hash));
+    }
+    let now = std::time::SystemTime::now();
+    let mut collected = Collected::default();
+    let objects = loch_home().join("objects");
+    let Ok(prefixes) = fs::read_dir(&objects) else {
+        let _ = write_atomically(&counter_path(), b"0");
+        return Ok(collected);
+    };
+    for prefix in prefixes.flatten() {
+        let Ok(files) = fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        let head = prefix.file_name().to_string_lossy().into_owned();
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let path = file.path();
+            let aside = name.starts_with('.') && name.contains(TMP_MARK);
+            let kept = !aside && reachable.contains(&format!("{}{}", head, name));
+            if kept || !is_old(&path, now) {
+                collected.kept += 1;
+                continue;
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if fs::remove_file(&path).is_ok() {
+                collected.removed += 1;
+                collected.bytes += size;
+            }
+        }
+        let _ = fs::remove_dir(prefix.path());
+    }
+    let _ = write_atomically(&counter_path(), b"0");
+    Ok(collected)
 }

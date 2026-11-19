@@ -158,8 +158,50 @@ impl World {
             self.minute,
             text
         ));
-        let out = self.loch_in(&self.repo, &["hook", "prompt"], &self.event());
+        // As Claude Code sends it: the prompt's text rides on the event.
+        let event = format!(
+            r#"{{"session_id": "{}", "cwd": "{}", "transcript_path": "{}", "prompt": "{}"}}"#,
+            SESSION,
+            s(&self.repo),
+            s(&self.transcript),
+            text
+        );
+        let out = self.loch_in(&self.repo, &["hook", "prompt"], &event);
         assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    fn hook(&self, name: &str) {
+        let out = self.loch_in(&self.repo, &["hook", name], &self.event());
+        assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    fn session_state(&self) -> PathBuf {
+        self.home
+            .join(".loch/sessions")
+            .join(format!("{}.json", SESSION))
+    }
+
+    /// Everything under ~/.loch made to look long untouched: objects past
+    /// collection's grace period, and session state past ABANDONED.
+    fn age_everything(&self) {
+        self.age(".loch");
+    }
+
+    fn age(&self, under: &str) {
+        self.sh(&format!(
+            "find '{}' -exec touch -t 202001010000 {{}} +",
+            s(&self.home.join(under))
+        ));
+    }
+
+    fn objects(&self) -> usize {
+        fs::read_dir(self.home.join(".loch/objects"))
+            .map(|dirs| {
+                dirs.flatten()
+                    .map(|d| fs::read_dir(d.path()).map(|f| f.count()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// The agent stops: its reply is written and the hook runs.
@@ -246,7 +288,7 @@ fn install_writes_the_two_turn_hooks_and_keeps_existing_settings() {
     let first = w.json(&["install"]);
     assert_eq!(
         first.get("added").unwrap(),
-        &json::loads(r#"["UserPromptSubmit", "Stop"]"#).unwrap()
+        &json::loads(r#"["UserPromptSubmit", "Stop", "SessionEnd"]"#).unwrap()
     );
     let again = w.json(&["install"]);
     assert_eq!(again.get("added").unwrap(), &Value::Array(vec![]));
@@ -592,4 +634,162 @@ fn a_person_s_lone_brace_is_not_credited_to_the_agent() {
     let lines = owners(&w.json(&["blame", "a.js"]));
     assert_eq!(lines[..3], vec![some("write a block"); 3][..]);
     assert_eq!(lines[3..], [None, None]);
+}
+
+fn interrupted_flags(w: &World) -> Vec<bool> {
+    let record = fs::read_to_string(
+        w.home
+            .join(".loch/edits/claude-code")
+            .join(format!("{}.json", SESSION)),
+    )
+    .unwrap();
+    json::loads(&record)
+        .unwrap()
+        .get("turns")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.get("interrupted").unwrap().truthy())
+        .collect()
+}
+
+#[test]
+fn a_cancelled_turn_is_closed_by_the_next_prompt() {
+    let mut w = World::new(true);
+    w.prompt("p1", "start something");
+    w.write("half.py", "half_done = True\n");
+    // Cancelled: Claude Code runs no Stop. The next prompt arrives instead.
+    w.prompt("p2", "do something else");
+    w.write("other.py", "other_work = 2\n");
+    w.stop("p2");
+    // The cancelled turn's edits are its own, not the next turn's baseline.
+    assert_eq!(
+        owners(&w.json(&["blame", "half.py"])),
+        vec![some("start something")]
+    );
+    assert_eq!(
+        owners(&w.json(&["blame", "other.py"])),
+        vec![some("do something else")]
+    );
+    assert_eq!(interrupted_flags(&w), vec![true, false]);
+}
+
+#[test]
+fn quitting_mid_turn_is_closed_by_the_session_s_end() {
+    let mut w = World::new(true);
+    w.prompt("p1", "leave halfway");
+    w.write("left.py", "left_behind = 1\n");
+    w.hook("end");
+    assert_eq!(
+        owners(&w.json(&["blame", "left.py"])),
+        vec![some("leave halfway")]
+    );
+    assert_eq!(interrupted_flags(&w), vec![true]);
+    assert!(
+        !w.session_state().exists(),
+        "the session's state is released"
+    );
+}
+
+#[test]
+fn a_crash_then_resume_closes_the_turn_on_the_next_prompt() {
+    let mut w = World::new(true);
+    w.prompt("p1", "before the crash");
+    w.write("crashed.py", "written_before_crash = 1\n");
+    // The process dies: no Stop, no SessionEnd. `claude --resume` keeps the
+    // session id, so its next prompt finds the turn still open.
+    w.prompt("p2", "after resuming");
+    w.stop("p2");
+    assert_eq!(
+        owners(&w.json(&["blame", "crashed.py"])),
+        vec![some("before the crash")]
+    );
+}
+
+#[test]
+fn collection_keeps_what_the_next_turn_needs_and_drops_the_rest() {
+    let mut w = World::new(true);
+    for turn in 0..4 {
+        w.prompt(&format!("p{}", turn), &format!("turn {}", turn));
+        w.write(
+            "grow.py",
+            &(0..=turn)
+                .map(|i| format!("line_number_{} = {}\n", i, i))
+                .collect::<String>(),
+        );
+        w.stop(&format!("p{}", turn));
+    }
+    let before = w.objects();
+    w.age_everything();
+    let collected = w.json(&["gc"]);
+    let removed = collected.get("removed").unwrap().as_i64().unwrap();
+    assert!(removed > 0, "earlier turns' snapshots go: {:?}", collected);
+    assert_eq!(w.objects(), before - removed as usize);
+    // Blame never needed them, and the next turn's baseline survived.
+    assert_eq!(owners(&w.json(&["blame", "grow.py"]))[0], some("turn 0"));
+    w.prompt("p9", "after collecting");
+    w.write("grow.py", "line_number_0 = 0\nbrand_new_line = 9\n");
+    w.stop("p9");
+    assert_eq!(
+        owners(&w.json(&["blame", "grow.py"]))[1],
+        some("after collecting")
+    );
+}
+
+#[test]
+fn an_open_turn_survives_collection_until_it_is_abandoned() {
+    let mut w = World::new(true);
+    w.prompt("p1", "still running");
+    w.write("slow.py", "slow_work = 1\n");
+    // Another session in the same workspace moves its latest snapshot on, so
+    // only this turn's own state still points at where it began.
+    let other = format!(
+        r#"{{"session_id": "99999999-0000-0000-0000-000000000000", "cwd": "{}"}}"#,
+        s(&w.repo)
+    );
+    assert!(w
+        .loch_in(&w.repo, &["hook", "prompt"], &other)
+        .status
+        .success());
+    // Old objects, but the turn is open: its start snapshot is a root.
+    w.age(".loch/objects");
+    w.json(&["gc"]);
+    w.stop("p1");
+    assert_eq!(
+        owners(&w.json(&["blame", "slow.py"])),
+        vec![some("still running")]
+    );
+
+    // A crash nobody resumes: once the state is past ABANDONED it lets go.
+    w.prompt("p2", "never finished");
+    w.age_everything();
+    w.json(&["gc"]);
+    assert!(!w.session_state().exists());
+}
+
+#[test]
+fn a_killed_write_leaves_nothing_half_written_behind() {
+    let mut w = World::new(true);
+    w.prompt("p1", "anything");
+    w.stop("p1");
+    // What a hook killed between write and rename leaves: an aside file.
+    let objects = w.home.join(".loch/objects/ab");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join(".cdef.tmp999"), "partial").unwrap();
+    w.age_everything();
+    w.json(&["gc"]);
+    assert!(!objects.join(".cdef.tmp999").exists());
+}
+
+#[test]
+fn the_hooks_collect_on_their_own_once_due() {
+    let mut w = World::new(true);
+    w.prompt("p1", "first");
+    w.stop("p1");
+    let counter = w.home.join(".loch/snapshots-since-collect");
+    fs::write(&counter, "49").unwrap();
+    w.prompt("p2", "second");
+    // That prompt's snapshot made 50: the hook collected and reset the count.
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "0");
 }

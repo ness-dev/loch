@@ -19,6 +19,16 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loch hook end 2>/dev/null || true"
+          }
+        ]
+      }
     ]
   }
 }

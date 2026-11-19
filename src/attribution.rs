@@ -146,8 +146,10 @@ pub struct TurnRecord {
     /// of transcript content `list` carries, so blame can say what was asked
     /// without fetching the transcript.
     pub prompt: Option<String>,
-    pub start_snapshot: Option<String>,
-    pub end_snapshot: String,
+    /// The turn was cut short — cancelled, or the session crashed — and was
+    /// closed by the next prompt or the session's end rather than by `Stop`,
+    /// so it ends where the workspace stood then.
+    pub interrupted: bool,
     pub files: Vec<FileChange>,
 }
 
@@ -193,8 +195,7 @@ impl EditRecord {
                     "started" => opt(&turn.started),
                     "ended" => turn.ended.as_str(),
                     "prompt" => opt(&turn.prompt),
-                    "startSnapshot" => opt(&turn.start_snapshot),
-                    "endSnapshot" => turn.end_snapshot.as_str(),
+                    "interrupted" => turn.interrupted,
                     "files" => files,
                 })
             })
@@ -241,8 +242,7 @@ impl EditRecord {
                 started: text(turn, "started"),
                 ended: text(turn, "ended")?,
                 prompt: text(turn, "prompt"),
-                start_snapshot: text(turn, "startSnapshot"),
-                end_snapshot: text(turn, "endSnapshot")?,
+                interrupted: turn.get("interrupted").is_some_and(Value::truthy),
                 files,
             });
         }
@@ -313,8 +313,10 @@ pub fn load_local(agent: &str, session: &str) -> Option<EditRecord> {
 
 pub fn save_local(record: &EditRecord) -> std::io::Result<()> {
     let path = local_path(&record.agent, &record.session);
-    fs::create_dir_all(path.parent().expect("has a parent"))?;
-    fs::write(path, json::dumps(&record.to_json(), json::COMPACT_UNICODE))
+    snapshot::write_atomically(
+        &path,
+        json::dumps(&record.to_json(), json::COMPACT_UNICODE).as_bytes(),
+    )
 }
 
 fn local_records() -> Vec<EditRecord> {
@@ -546,8 +548,7 @@ mod tests {
                     started: None,
                     ended: ended.into(),
                     prompt: None,
-                    start_snapshot: None,
-                    end_snapshot: "x".into(),
+                    interrupted: false,
                     files: vec![FileChange {
                         path: "f.py".into(),
                         hunks: vec![Hunk {

@@ -12,6 +12,7 @@ pub mod blame_html;
 pub mod bundle;
 pub mod claude;
 pub mod cli;
+pub mod codex;
 pub mod format;
 pub mod git;
 pub mod hook;

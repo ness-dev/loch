@@ -35,6 +35,8 @@ fn file_store(name: &str) -> FileStore {
 fn session(session_id: &str, branch: Option<&str>) -> BundleSession {
     BundleSession {
         session_id: session_id.into(),
+        agent: None,
+        agent_version: None,
         cwd: "/repo".into(),
         git_branch: branch.map(str::to_string),
         claude_version: Some("1.0.99".into()),

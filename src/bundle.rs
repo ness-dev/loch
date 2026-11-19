@@ -20,14 +20,32 @@ pub struct BundleOrigin {
     pub hostname: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct BundleSession {
     pub session_id: String,
+    /// Set only where the session's agent differs from the bundle's, so a
+    /// bundle of one agent's sessions — every Claude bundle before Codex —
+    /// keeps its bytes, and its ref.
+    pub agent: Option<String>,
     pub cwd: String,
     pub git_branch: Option<String>,
     pub claude_version: Option<String>,
+    /// Any other agent's version: `claudeVersion` keeps meaning Claude's.
+    pub agent_version: Option<String>,
     pub modified_at: String,
     pub transcript: String,
+}
+
+impl BundleSession {
+    pub fn agent_of<'a>(&'a self, bundle: &'a Bundle) -> &'a str {
+        self.agent.as_deref().unwrap_or(&bundle.agent)
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.claude_version
+            .as_deref()
+            .or(self.agent_version.as_deref())
+    }
 }
 
 #[derive(Clone)]
@@ -40,14 +58,20 @@ pub struct Bundle {
 }
 
 fn session_json(session: &BundleSession) -> Value {
-    let mut record =
-        object! {"sessionId" => session.session_id.as_str(), "cwd" => session.cwd.as_str()};
+    let mut record = object! {"sessionId" => session.session_id.as_str()};
     // Omitted rather than null: the ref is a hash of these bytes.
+    if let Some(agent) = &session.agent {
+        record.insert("agent".into(), agent.as_str().into());
+    }
+    record.insert("cwd".into(), session.cwd.as_str().into());
     if let Some(branch) = &session.git_branch {
         record.insert("gitBranch".into(), branch.as_str().into());
     }
     if let Some(version) = &session.claude_version {
         record.insert("claudeVersion".into(), version.as_str().into());
+    }
+    if let Some(version) = &session.agent_version {
+        record.insert("agentVersion".into(), version.as_str().into());
     }
     record.insert("modifiedAt".into(), session.modified_at.as_str().into());
     record.insert("transcript".into(), session.transcript.as_str().into());
@@ -205,8 +229,11 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
                 .map(str::to_string)
                 .ok_or_else(|| format!("'{}'", key))
         };
+        let optional = |key: &str| session.get(key).and_then(Value::as_str).map(str::to_string);
         sessions.push(BundleSession {
             session_id: required("sessionId")?,
+            agent: optional("agent"),
+            agent_version: optional("agentVersion"),
             cwd: required("cwd")?,
             git_branch: session
                 .get("gitBranch")

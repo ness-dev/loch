@@ -9,8 +9,8 @@ laptop that produced it. `loch` packs those transcripts into a
 content-addressed bundle, stores it anywhere S3-compatible, and unpacks
 it elsewhere with paths rewritten so the session actually resumes.
 
-Currently supports Claude Code. Codex and Cursor are the intended next
-adapters.
+Supports Claude Code and Codex, behind one adapter boundary (`agent.rs`,
+below). Cursor is the obvious next one.
 
 It is also becoming the **conversation format**: `loch ingest` turns a
 session into a content-addressed graph of turns that can be forked, shared
@@ -208,6 +208,159 @@ public API. Re-verify if something breaks.
   bigger window is a bet on a bound that the worst cases are the likeliest
   to break.
 
+## Empirical findings about Codex's storage
+
+Verified on codex-cli 0.166.0 by experiment (scratch repositories, real
+`codex exec` and TUI runs), against the 70 rollouts on one machine
+(versions 0.46, 0.121, 0.165, 0.166). Not stable public API: re-verify if
+something breaks. Claude's rules above do **not** carry over; each was
+re-derived.
+
+- **Where sessions live:** `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local
+  time>-<id>.jsonl`, `$CODEX_HOME` defaulting to `~/.codex`. Filed by date,
+  not by directory, so there is no directory to look in and discovery reads
+  every rollout (`codex.rs`). That costs ~50ms for 70 rollouts (10MB) and is
+  linear in total bytes.
+- **`codex resume <id>` needs the rollout file and nothing else.** A copy
+  under a fresh id, with no row in any sqlite file, resumed and recalled its
+  conversation, and Codex inserted the `threads` row itself afterwards. The
+  sqlite files are projections: `state_5.sqlite`'s `threads` holds
+  `rollout_path` and summary columns, and `thread_history_1.sqlite` is keyed
+  by rollout byte offset (`thread_history_projection_state`). Lookup is by
+  the id the file name ends with. The date directory and the time in the
+  name don't matter (a copy under `2025/03/01` resumed), so `restore` files
+  a session under the day its `session_meta` says it began.
+  `session_index.jsonl` holds thread names alone (appended, last wins), so
+  loch reads it for blame's title and never writes it.
+- **Records** are `{"timestamp", "type", "payload"}`, newer ones with an
+  `ordinal`. `session_meta` comes first: `id` and `session_id`, `cwd`,
+  `cli_version`, `originator`, `git: {commit_hash, branch}`,
+  `history_mode` (`paginated` from 0.165, absent before). The id also
+  appears in `thread_settings_applied.thread_id`, `item_completed.thread_id`
+  and `token_usage_record.session_id`, so, as with Claude, minting an id
+  means rewriting every occurrence (the rewrite's session pair does), and
+  the file name too.
+- **A turn is named by id.** `task_started`, `turn_context`,
+  `item_completed`, `token_usage_record` and `task_complete` carry
+  `payload.turn_id`, and response items carry it in
+  `internal_chat_message_metadata_passthrough.turn_id`. But a `resume`
+  writes `thread_settings_applied`, which names no turn, *before* the next
+  `task_started`, so "the last turn seen" puts it in the previous turn. A
+  turn therefore runs from the first to the last record **naming** it,
+  which is where `ask --at-turn` cuts.
+- **What a person typed** is `event_msg` `item_completed` with a
+  `UserMessage` item (0.165+), or `event_msg` `user_message` (older).
+  `response_item` user messages are not it: Codex injects
+  `<environment_context>` and AGENTS.md as user messages.
+- **The live cwd is the last `turn_context`'s.** `resume -C <elsewhere>`
+  appends a `turn_context` naming the new directory, and `session_meta`
+  keeps naming where the session began. Nothing else marks which is live,
+  and there is no directory-name disambiguator as there is for Claude. The
+  last turn is where the session most recently ran, which is what a
+  restore wants. Cwds are counted from `session_meta` and `turn_context`
+  only. `world_state` and tool calls name directories too, so a substring
+  count would cry wolf, as it would for Claude.
+- **Codex does not resolve symlinks in `-C`.** A session begun in `/tmp/x`
+  recorded `/private/tmp/x` (the process's resolved cwd), and the same
+  session resumed with `-C /tmp/y` recorded `/tmp/y`. Discovery compares
+  cwds resolved.
+- **The branch is recorded once,** in `session_meta.git.branch`, for the
+  directory the session began in. No turn records one, and neither does
+  `world_state`. A moved session's branch is unknowable from its rollout, so
+  it is reported as none (`[no branch]`, `%00` in the index) rather than
+  the old directory's, which is Claude's stale-branch defect. A session
+  begun through a symlink to where it is now has not moved. None of the 70
+  local rollouts had moved, so this is the rare case, and it is the honest
+  answer.
+- **Hooks** use Claude's file shape,
+  `{"hooks": {"<Event>": [{"hooks": [{"type": "command", "command", "timeout"}]}]}}`,
+  from `$CODEX_HOME/hooks.json` and `<project>/.codex/hooks.json` (plus
+  plugins and config layers). 0.166 knows `PreToolUse`,
+  `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`,
+  `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `SubagentStart`,
+  `SubagentStop`, `Stop`, `Interrupt` and `PreModelRequest`. They're enabled
+  by `[features] hooks` (stable and on here; `codex_hooks` is its deprecated
+  alias). It clamps the `SessionEnd` and `Interrupt` timeouts to 3s. Captured
+  payloads: every event carries `session_id`, `transcript_path`, `cwd` and
+  `hook_event_name`. `UserPromptSubmit` and `Stop` add `turn_id`, `model`
+  and `permission_mode`; `UserPromptSubmit` adds `prompt`, and `Stop` adds
+  `stop_hook_active` and `last_assistant_message`. `SessionEnd` adds
+  `reason` and **no `turn_id`**. So `hook.rs` is unchanged; only reading the
+  turn back from the transcript differs.
+- **New hooks don't run until a person trusts them.** Trust lives in
+  `config.toml` as `[hooks.state."<file>:<event_snake>:<group>:<index>"]
+  trusted_hash = "sha256:…"`. An untrusted hook is skipped silently in
+  `exec`, and the TUI opens with "Hooks need review: N hooks are new or
+  changed" (*Review hooks* / *Trust all and continue* / *Continue without
+  trusting*), with `/hooks` to manage them. The hash is not a plain SHA-256
+  of the entry. **loch never writes trust**: it is the user's review of a
+  command that runs outside the sandbox, and forging it would defeat the
+  point. `install` reports `needsReview` and says to open `/hooks`. Trust is
+  keyed by position, so loch appends its hooks as new groups and leaves
+  every existing entry's position, and so its trust, alone. That is what
+  keeps Ness's user-level hooks trusted after a `--local` install.
+  `--dangerously-bypass-hook-trust` exists for automation. The tests used
+  it, and loch never passes it.
+- **A cancelled turn gets no `Stop`.** Esc mid-turn writes `turn_aborted`
+  (`reason: "interrupted"`) and runs no `Stop`, exactly like Claude Code,
+  so the next prompt's hook closes it as `interrupted`, keeping its edits.
+  Verified in the TUI. `SessionEnd` runs on `/quit` and at the end of every
+  `exec`, so quitting mid-turn is closed the same way. The `Interrupt` event
+  would close a cancelled turn sooner, but no payload was captured and
+  nothing needs it, so it isn't installed.
+- **`codex fork` can't cut at a turn** (no `--at-turn`), and needs a session
+  Codex can already find. `ask` writes its own fork instead: a prefix of the
+  rollout's lines, kept byte for byte, under a new id, rewritten into the
+  target cwd. It resumes with `codex resume <id>`. It has no title, since
+  titles live in `session_index.jsonl`.
+- **Tool calls changed shape across versions:** 0.166's are
+  `custom_tool_call`s named `exec` whose input is JavaScript calling
+  `tools.exec_command`, and older ones are `function_call`s. So backfill's
+  approach (the text an `Edit`/`Write` call carries) doesn't carry over, and
+  `backfill` stays Claude-only.
+
+## The adapter boundary, and what a third harness costs
+
+`agent.rs` is everything loch needs from one harness, in three tiers. Each
+later tier's methods have defaults that decline, so an adapter is as big as
+what the harness supports:
+
+1. **Attribution** (`blame`, `log`). Required: an `id`, the hook events
+   (a turn's start, its end, and ideally the session's end) and the hooks
+   file `install` writes. That is the whole requirement, because snapshots,
+   diffs, edit records and matching are harness-agnostic, and `hook.rs`
+   only needs a payload with `session_id` and `cwd` (Claude-shaped field
+   names; an adapter for differently named fields would add a payload
+   mapping). Optional: `current_turn` (which transcript record a turn began
+   and ended at, and its prompt) and `transcript_key` (keeping the
+   transcript in the store). Without them blame still works and says
+   nothing about what was asked.
+2. **Transport** (`save`, `list`, `restore`): `list_sessions` with the
+   live-cwd/branch/version choice, `transcript_cwds`, `restore_path`,
+   `existing_transcript` and `resume_command`. The rewrite itself is shared
+   and needs nothing, as long as the transcript is text with paths in it.
+3. **Conversation** (`ask`): `find_transcript` and `fork`, plus `title` if
+   the harness keeps one outside the transcript.
+
+**The degraded tier is a first-class case.** A harness with turn hooks and
+no resumable transcript implements tier 1 alone, about 40 lines on Codex's
+model. `save` finds none of its sessions, `restore` reports a bundled one
+as `"status": "unsupported"`, and `ask` fails with `unsupported-agent`.
+Blame and log are complete. A harness with no hooks at all gets no tier
+today; the shape for it is a stop-only hook (each turn's end snapshot
+becomes the next turn's start, which `stop` already handles) or, with no
+signal at all, attribution to the span between two `snapshot` calls,
+which nothing drives yet.
+
+Codex took ~600 lines (`codex.rs`), most of it the format: where a turn
+starts and ends, the live cwd, a prefix fork. The questions to answer
+first for the next harness, in the order they decide the cost: does resume
+need anything besides the transcript file (Codex: no; this is the one that
+could make restore impractical); are hooks trusted or gated (Codex: gated);
+what names a turn in the transcript; where the live cwd and branch are
+recorded. Cursor, Gemini CLI and Copilot CLI have not been examined.
+Nothing here is verified about them.
+
 ## Layout
 
 One Rust crate at the root: a library holding every module, and the `loch`
@@ -220,6 +373,7 @@ src/
 │                 #   blame/log/ask/backfill/gc/hook/help/version
 ├── agent.rs      # the adapter boundary: what loch needs from one agent harness
 ├── claude.rs     # Claude Code adapter: path encoding, discovery, metadata, turns, fork
+├── codex.rs      # Codex adapter: rollout discovery, live cwd, turns by id, prefix fork
 ├── bundle.rs     # bundle format, gzip, content-addressed ref
 ├── format.rs     # loch format: turn and content ids, derived files
 ├── ingest.rs     # Claude Code JSONL -> loch turns (the converter)
@@ -243,6 +397,7 @@ src/
 tests/            # integration tests, one file per module plus cli.rs
 ├── derived_reader/ # a verifying reader for derived files, shared by three tests
 ├── trace.rs      # hooks, blame, log and ask end to end, squash and clone included
+├── codex.rs      # the Codex adapter end to end, on synthetic rollouts
 ├── backfill.rs   # backfill's two sources, contested commits, renames
 └── corpus.rs     # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
 examples/bench_hook.rs # per-call wall clock of `loch hook`, any number of binaries
@@ -579,8 +734,10 @@ never a code. The set today:
 | `author-key-unreadable` | `ingest --author-key` named a file that isn't an OpenSSH public key |
 | `file-unreadable` | `blame`/`log`/`ask` named a file that can't be read |
 | `not-linked` | `ask` on a line no recorded turn wrote |
-| `transcript-missing` | a turn wrote the line but its transcript is in neither Claude's directory nor the store |
+| `transcript-missing` | a turn wrote the line but its transcript is in neither its agent's directory nor the store |
 | `turn-not-found` | the transcript no longer holds the record a turn ended on |
+| `unknown-agent` | `--agent` named an agent this build doesn't know |
+| `unsupported-agent` | `ask` on a turn whose agent's adapter can't fork or resume |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -621,6 +778,29 @@ renderer prints both, and the prose warning is stderr-only as usual, so
 JSON mode carries the same fact as a payload field and leaves stderr
 empty. `save` and `list` carry the same signal ahead of time as
 `otherCwds`.
+
+**Several agents, additively.** Each session in `list`, `save` and
+`restore` carries `agent` (`claude-code`, `codex`) and `agentVersion`.
+`claudeVersion` keeps meaning Claude Code's version, so it is null on a
+Codex session rather than reused. `install` writes every agent's hooks
+unless `--agent` picks one. Its top-level `settings`/`added`/`removed`
+stay the first agent's (Claude's by default), and `agents` lists each,
+with `needsReview` true where the agent won't run the hooks just added
+until a person approves them. A restore of a session whose agent this
+build lacks is `"status": "unsupported"`. None of this changed a field's
+meaning, so `schema` stays 2. Blame's payload gained nothing. Its `agent`
+field now says `codex` for Codex turns, and `turn`/`conversation` are null
+for them, since the loch converter reads Claude's format alone. Consumers
+keying on `agent == "claude-code"` (the Ness blame gutter) should expect
+the other value.
+
+**One bundle, several agents, unchanged refs.** A bundle's `agent` is its
+first session's, and a session of another agent carries its own `agent`
+key. The key is omitted whenever it would equal the bundle's, so a bundle
+of one agent's sessions, every Claude bundle ever made included, packs to
+the bytes it always did (`tests/bundle.rs` pins them, and
+`tests/codex.rs` checks a Claude-only `save` carries no new key). Index
+entries name their first session's agent.
 
 **Never the matched text.** Redaction is reported as `{"<rule>": <count>}`
 plus a `redacted` total, exactly as much as the prose summary carries and no
@@ -920,10 +1100,48 @@ kind, so it is worth knowing about: a stale `LOCHY_STORE=s3://...` makes
 shim is ever wanted, the shape is to read `LOCH_*` first, fall back to the
 old name, and warn on stderr in text mode only.
 
+**Codex is verified end to end on real sessions** (codex-cli 0.166.0,
+scratch repositories, a temporary store):
+- **Hooks and blame.** `install --agent codex` wrote `.codex/hooks.json`,
+  and a session of two `exec` turns, each editing `greet.py` through the
+  shell, was recorded turn by turn under `edits/codex/`. `blame` gave
+  lines 1–2 to the first turn and 3–6 to the second, with `"agent":
+  "codex"` and Codex's own thread title. A human-committed line stayed
+  unattributed.
+- **A cancelled turn.** In the TUI, Esc mid-turn ran no `Stop`. The next
+  prompt closed the turn as `interrupted`, keeping its edit, and the next
+  turn recorded none of it.
+- **ask.** `ask greet.py:1 --at-turn` forked at the first turn's
+  `task_complete`, and resumed, the fork knew that turn's codeword and not
+  the second's. Without `--at-turn` it knew both.
+- **save and restore across machines.** The bundle was rewritten to
+  another machine's home and repo path, then restored with `--new-id` into
+  a different directory. It came back with `residualOriginPaths` and
+  `foreignCwds` both empty, no trace of the foreign home or the old id in
+  the file, every cwd naming the target, and `codex resume` recalled both
+  codewords and named the new directory as its cwd.
+- **Discovery.** All 70 local rollouts (four CLI versions) are found under
+  their live cwd. A Claude `save` of 100 real sessions gave the same refs
+  before and after the adapter extraction.
+- **Install beside Ness.** `install --local` against a copy of this
+  machine's `~/.codex/hooks.json` kept every Ness group byte for byte and
+  in place, and appended loch's.
+
+Not verified: the trust prompt was seen but loch's hooks were never
+trusted through it. Every hook run used `--dangerously-bypass-hook-trust`
+on a scratch repository, so how the TUI flow and `needsReview` read to a
+person is untested.
+
+Codex gaps: `ingest` and `backfill` are Claude-only (SPEC.md §8's converter;
+see the tool-call note above); a moved session has no branch; `--local`
+installs into the user's hooks file, so loch runs for every Codex project on
+the machine (it refuses `/` and home, as always); a fork has no title;
+`archived_sessions` isn't searched.
+
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the
 obvious next one, and the layout takes it without a migration), PR-level
-git pointers for bundles, and no adapters beyond Claude Code.
+git pointers for bundles, and no adapters beyond Claude Code and Codex.
 `restore` still needs a full 64-character ref — the index makes refs
 discoverable, but nothing resolves a prefix.
 

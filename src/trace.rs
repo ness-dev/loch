@@ -353,6 +353,7 @@ impl<'a> Resolver<'a> {
             Some(v) if v.truthy() => v.as_str().map(str::to_string),
             _ => None,
         };
+        let kept = || agent::by_id(&record.agent).and_then(|a| a.title(&record.session));
         Ok(Link {
             session_id: record.session.clone(),
             agent: record.agent.clone(),
@@ -363,7 +364,9 @@ impl<'a> Resolver<'a> {
             transcript: path.clone(),
             turn: found.map(|t| t.id.clone()),
             conversation,
-            title: title_of("title").or_else(|| title_of("aiTitle")),
+            title: title_of("title")
+                .or_else(|| title_of("aiTitle"))
+                .or_else(kept),
             prompt: turn.prompt.clone(),
             backfilled: turn.backfilled,
         })

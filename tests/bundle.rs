@@ -18,6 +18,8 @@ fn sample_bundle(git_branch: Option<&str>) -> Bundle {
         },
         sessions: vec![BundleSession {
             session_id: "abc".into(),
+            agent: None,
+            agent_version: None,
             cwd: "/home/mike/proj".into(),
             git_branch: git_branch.map(str::to_string),
             claude_version: Some("1.0.99".into()),
@@ -150,6 +152,8 @@ fn pinned_bundle() -> Bundle {
         sessions: vec![
             BundleSession {
                 session_id: "11111111-2222-4333-8444-555555555555".into(),
+                agent: None,
+                agent_version: None,
                 cwd: "/home/mike/proj".into(),
                 git_branch: Some("feature/é".into()),
                 claude_version: Some("1.0.99".into()),
@@ -162,6 +166,8 @@ fn pinned_bundle() -> Bundle {
             },
             BundleSession {
                 session_id: "66666666-7777-4888-9999-000000000000".into(),
+                agent: None,
+                agent_version: None,
                 cwd: "/home/mike/proj".into(),
                 git_branch: None,
                 claude_version: None,

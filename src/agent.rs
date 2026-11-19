@@ -129,6 +129,11 @@ pub trait Agent: Sync {
     ) -> Result<Option<String>, StoreError> {
         Ok(None)
     }
+    /// The session's title, where the agent keeps one outside the
+    /// transcript.
+    fn title(&self, _session_id: &str) -> Option<String> {
+        None
+    }
     /// A new session holding the conversation up to `cut` (the end, if none),
     /// filed under `target_cwd`.
     fn fork(
@@ -142,7 +147,7 @@ pub trait Agent: Sync {
     }
 }
 
-static ALL: &[&dyn Agent] = &[&crate::claude::CLAUDE_CODE];
+static ALL: &[&dyn Agent] = &[&crate::claude::CLAUDE_CODE, &crate::codex::CODEX];
 
 pub fn all() -> &'static [&'static dyn Agent] {
     ALL

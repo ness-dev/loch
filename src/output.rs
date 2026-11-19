@@ -67,6 +67,9 @@ pub fn fail<T>(code: &'static str, message: impl Into<String>) -> Result<T> {
     Err(CommandError::new(code, message))
 }
 
+/// The envelope's own keys, which no payload may use.
+pub const RESERVED: &[&str] = &["schema", "ok", "command", "code", "error"];
+
 pub fn document(command: &str, ok: bool, payload: Map, failure: Option<(&str, &str)>) -> Value {
     let mut body = Map::new();
     body.insert("schema".into(), Value::int(SCHEMA));
@@ -77,6 +80,16 @@ pub fn document(command: &str, ok: bool, payload: Map, failure: Option<(&str, &s
         body.insert("error".into(), Value::str(error));
     }
     for (key, value) in payload {
+        // A payload key equal to an envelope key would overwrite it, as
+        // `install`'s `command` once did, turning "install" into a path.
+        debug_assert!(
+            !RESERVED.contains(&key.as_str()),
+            "payload key {} is the envelope's",
+            key
+        );
+        if RESERVED.contains(&key.as_str()) {
+            continue;
+        }
         body.insert(key, value);
     }
     Value::Object(body)

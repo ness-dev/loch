@@ -1006,7 +1006,8 @@ pub fn command_install(argv: &[String]) -> Run {
     let (_, settings, installed, _) = &results[0];
     let mut payload = object! {
         "settings" => settings.as_str(),
-        "command" => command.as_str(),
+        // Not `command`, which is the envelope's: the hooks' loch.
+        "hookCommand" => command.as_str(),
         "added" => strings(&installed.added),
         "removed" => strings(&installed.removed),
     };

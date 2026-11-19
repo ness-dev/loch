@@ -157,3 +157,14 @@ fn an_error_exits_nonzero_in_both_modes() {
     );
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
 }
+
+#[test]
+fn a_payload_cannot_overwrite_the_envelope() {
+    // install's `command` (the hooks' loch path) once replaced the envelope's
+    // `command`, so `loch install --json` reported "command": "loch".
+    let payload: Map = [("command".to_string(), Value::str("/opt/loch"))]
+        .into_iter()
+        .collect();
+    let body = document("install", true, payload, None);
+    assert_eq!(body.get("command"), Some(&Value::str("install")));
+}

@@ -752,6 +752,15 @@ anything wider would relabel a bug in this process as a failure of the
 store. (`s3-extra-missing` existed while S3 needed an optional Python
 package; the binary carries its client, so it can't arise and is gone.)
 
+**A payload never overwrites the envelope.** `schema`, `ok`, `command`,
+`code` and `error` are the envelope's (`output::RESERVED`), and
+`document` drops a payload key that reuses one. Until that rule existed,
+`install`'s payload field `command`, the hooks' loch path, replaced the
+envelope's, so `install --json` said `"command": "loch"` rather than
+`"install"`. The field is `hookCommand` now. Nothing bumped `schema` for
+it, since the envelope went back to its documented meaning, but a caller
+that read the path from `install`'s `command` has to read `hookCommand`.
+
 **Exactly one document per invocation, including parse failures.**
 `argparse.rs` returns `-h` and a bad flag as `Exit` values rather than
 printing and exiting, so `main()` renders both in the mode asked for. A bug

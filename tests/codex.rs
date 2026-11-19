@@ -718,6 +718,8 @@ fn install_adds_codex_hooks_beside_the_ones_already_there() {
     fs::write(&hooks, theirs).unwrap();
 
     let installed = world.ok(&["install", "--agent", "codex"]);
+    assert_eq!(text(&installed, "command"), "install");
+    assert_eq!(text(&installed, "hookCommand"), "loch");
     let codex = &items(&installed, "agents")[0];
     assert_eq!(text(codex, "agent"), "codex");
     assert_eq!(text(codex, "settings"), s(&hooks));

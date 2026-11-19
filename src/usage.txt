@@ -24,7 +24,8 @@ Usage:
   loch hook    prompt | stop | end [--agent <id>]   (run by the agent's harness)
   loch --version
 
-Agents: claude-code, codex. --agent picks one; without it, every one.
+Agents: claude-code, codex. --agent picks one, or all; without it, list and
+save cover every agent and install sets up Claude Code alone.
 
 Every command takes --json, which replaces the text below with one machine-
 readable document on stdout.
@@ -43,9 +44,9 @@ Environment:
 
 Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 
-`install` adds Claude Code and Codex hooks (.claude/settings.json and
-.codex/hooks.json; with --local, .claude/settings.local.json and
-~/.codex/hooks.json) that snapshot the workspace when a prompt is submitted,
+`install` adds Claude Code hooks (.claude/settings.json, or with --local
+.claude/settings.local.json), and with --agent codex or all Codex's
+(.codex/hooks.json, or with --local the user-wide ~/.codex/hooks.json), snapshot the workspace when a prompt is submitted,
 when the agent stops and when the session ends, and record which lines each
 turn added — however it added them — in the store, along with the session's
 transcript. Codex runs new hooks only after you trust them in its /hooks.

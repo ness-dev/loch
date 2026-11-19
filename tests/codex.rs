@@ -652,6 +652,10 @@ fn one_bundle_carries_both_agents_and_restores_each_to_its_own() {
     let reference = text(&save, "ref").to_string();
     let packed = fs::read(world.store.join(format!("bundles/{}.loch", reference))).unwrap();
     let bundle = loch::bundle::unpack_bundle(&packed).unwrap();
+    assert_eq!(
+        bundle.version, 2,
+        "a build that ignores agent must refuse it"
+    );
     assert_eq!(bundle.agent, "claude-code");
     assert_eq!(bundle.sessions[0].agent, None);
     assert_eq!(bundle.sessions[1].agent.as_deref(), Some("codex"));
@@ -705,6 +709,7 @@ fn a_bundle_of_claude_sessions_alone_has_no_agent_fields() {
     assert!(!json.contains("\"agentVersion\""));
     assert!(!json.contains("\"agent\":\"codex\""));
     assert!(json.contains("\"agent\":\"claude-code\""));
+    assert!(json.starts_with("{\"version\":1,"));
 }
 
 // -- install ----------------------------------------------------------------------------
@@ -770,9 +775,18 @@ fn install_adds_codex_hooks_beside_the_ones_already_there() {
 }
 
 #[test]
-fn install_sets_up_every_agent_by_default() {
+fn install_sets_up_claude_alone_unless_asked() {
     let world = World::new();
-    let installed = world.ok(&["install"]);
+    // What existing callers (Ness's `install --local --command`) run: it must
+    // not start writing Codex's user-wide hooks file.
+    let local = world.ok(&["install", "--local", "--command", "/opt/loch"]);
+    assert_eq!(items(&local, "agents").len(), 1);
+    assert!(!world.home.join(".codex").exists());
+    let plain = world.ok(&["install"]);
+    assert_eq!(text(&items(&plain, "agents")[0], "agent"), "claude-code");
+    assert!(!world.repo.join(".codex").exists());
+
+    let installed = world.ok(&["install", "--agent", "all"]);
     let agents: Vec<&str> = items(&installed, "agents")
         .iter()
         .map(|a| text(a, "agent"))
@@ -786,4 +800,43 @@ fn install_sets_up_every_agent_by_default() {
     assert!(world.repo.join(".codex/hooks.json").exists());
     let claude = fs::read_to_string(world.repo.join(".claude/settings.json")).unwrap();
     assert!(claude.contains("\"loch hook stop 2>/dev/null || true\""));
+}
+
+#[test]
+fn a_timestamp_a_bundle_carries_cannot_crash_restore() {
+    let world = World::new();
+    let repo = s(&world.repo);
+    // Cut so the 19th byte falls inside a character.
+    world.append(
+        SESSION,
+        &[format!(
+            r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{}","timestamp":"2025-01-01T00:00:0é","cwd":"{}"}}}}"#,
+            SESSION, repo
+        )],
+    );
+    world.begin(SESSION, TURN_A, &repo, 1, "hello");
+    let reference = text(&world.ok(&["save"]), "ref").to_string();
+    let there = world.elsewhere("b");
+    let restore = there.ok(&["restore", &reference]);
+    let path = text(&items(&restore, "sessions")[0], "path").to_string();
+    assert!(path.ends_with(&format!("-{}.jsonl", SESSION)), "{}", path);
+    assert!(Path::new(&path).exists());
+}
+
+#[test]
+fn ask_on_a_turn_of_an_agent_this_build_lacks_is_unsupported() {
+    let world = World::new();
+    world.meta(SESSION, &s(&world.repo), "feat/x");
+    world.turn(TURN_A, 1, "make a", "echo 'alpha line here' > a.txt");
+    // As a newer build would have recorded it.
+    world.sh(&format!(
+        "for f in $(grep -rl '\"agent\": *\"codex\"' '{}' '{}'); do sed -i.bak 's/\"agent\": *\"codex\"/\"agent\": \"gemini\"/' \"$f\"; done",
+        s(&world.store),
+        s(&world.home.join(".loch"))
+    ));
+    let blame = world.ok(&["blame", "a.txt"]);
+    assert_eq!(text(&items(&blame, "conversations")[0], "agent"), "gemini");
+    let (document, code) = world.json(&["ask", "a.txt:1", "--no-launch"]);
+    assert_ne!(code, 0);
+    assert_eq!(text(&document, "code"), "unsupported-agent");
 }

@@ -100,7 +100,7 @@ fn absent_metadata_stays_absent_rather_than_null() {
 #[test]
 fn rejects_an_unsupported_version() {
     let packed = pack_bundle(&Bundle {
-        version: 2,
+        version: 3,
         agent: "claude-code".into(),
         created_at: String::new(),
         origin: BundleOrigin {
@@ -112,9 +112,9 @@ fn rejects_an_unsupported_version() {
     })
     .unwrap();
     let Err(error) = unpack_bundle(&packed) else {
-        panic!("a version 2 bundle unpacked");
+        panic!("a version 3 bundle unpacked");
     };
-    assert!(error.contains("unsupported bundle version 2"), "{}", error);
+    assert!(error.contains("unsupported bundle version 3"), "{}", error);
 }
 
 #[test]
@@ -204,4 +204,49 @@ fn repacking_an_unpacked_bundle_reproduces_its_bytes() {
         pack_bundle(&unpack_bundle(&packed).unwrap()).unwrap(),
         packed
     );
+}
+
+/// A bundle holding a Codex session: no ref predates it, so it carries the
+/// version a build that ignores `agent` refuses, rather than being restored
+/// there as a Claude transcript with `ok: true`.
+fn codex_bundle() -> Bundle {
+    let mut bundle = pinned_bundle();
+    bundle.sessions[1].agent = Some("codex".into());
+    bundle.sessions[1].agent_version = Some("0.166.0".into());
+    bundle.version = bundle.required_version();
+    bundle
+}
+
+#[test]
+fn claude_sessions_alone_stay_version_1() {
+    assert_eq!(pinned_bundle().required_version(), 1);
+}
+
+#[test]
+fn any_other_agents_session_makes_a_version_2_bundle() {
+    let bundle = codex_bundle();
+    assert_eq!(bundle.version, 2);
+    let packed = pack_bundle(&bundle).unwrap();
+    let json = String::from_utf8(gunzip(&packed)).unwrap();
+    // What v0.2.0 checks, and refuses as "unsupported bundle version 2".
+    assert!(json.starts_with("{\"version\":2,"), "{}", json);
+    assert!(json.contains(
+        "\"sessionId\":\"66666666-7777-4888-9999-000000000000\",\"agent\":\"codex\",\"cwd\""
+    ));
+    assert!(json.contains("\"agentVersion\":\"0.166.0\""));
+    assert_eq!(
+        bundle_ref(&packed),
+        "08f5c37e73bf5b24c31ee64aaadbbe831b076875ec8de781edf10461462a7654"
+    );
+    let back = unpack_bundle(&packed).unwrap();
+    assert_eq!(back.version, 2);
+    assert_eq!(back.sessions[1].agent.as_deref(), Some("codex"));
+    assert_eq!(pack_bundle(&back).unwrap(), packed);
+}
+
+#[test]
+fn a_bundle_whose_agent_is_not_claude_is_version_2() {
+    let mut bundle = pinned_bundle();
+    bundle.agent = "codex".into();
+    assert_eq!(bundle.required_version(), 2);
 }

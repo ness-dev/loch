@@ -577,6 +577,10 @@ impl Agent for ClaudeCode {
         transcript_cwds(raw)
     }
 
+    fn can_restore(&self) -> bool {
+        true
+    }
+
     fn restore_path(&self, _raw: &str, cwd: &str, session_id: &str) -> Option<String> {
         Some(transcript_path_for(cwd, session_id, None))
     }

@@ -791,9 +791,15 @@ empty. `save` and `list` carry the same signal ahead of time as
 **Several agents, additively.** Each session in `list`, `save` and
 `restore` carries `agent` (`claude-code`, `codex`) and `agentVersion`.
 `claudeVersion` keeps meaning Claude Code's version, so it is null on a
-Codex session rather than reused. `install` writes every agent's hooks
-unless `--agent` picks one. Its top-level `settings`/`added`/`removed`
-stay the first agent's (Claude's by default), and `agents` lists each,
+Codex session rather than reused. `list` and `save` cover every agent
+unless `--agent` picks one, but **`install` writes Claude Code's hooks alone
+unless asked** (`--agent codex`, or `--agent all`). Installing Codex's too
+by default changed what existing callers did. With `--local`, Ness's
+`install --local --command` would have started writing the user-wide
+`$CODEX_HOME/hooks.json`, putting loch in every Codex project and a review
+prompt in the next TUI. Without it, a `.codex/` would land in every
+Claude-only repo. `install`'s top-level `settings`/`added`/`removed` stay
+the first agent's (Claude's by default), and `agents` lists each,
 with `needsReview` true where the agent won't run the hooks just added
 until a person approves them. A restore of a session whose agent this
 build lacks is `"status": "unsupported"`. None of this changed a field's
@@ -806,10 +812,19 @@ the other value.
 **One bundle, several agents, unchanged refs.** A bundle's `agent` is its
 first session's, and a session of another agent carries its own `agent`
 key. The key is omitted whenever it would equal the bundle's, so a bundle
-of one agent's sessions, every Claude bundle ever made included, packs to
-the bytes it always did (`tests/bundle.rs` pins them, and
-`tests/codex.rs` checks a Claude-only `save` carries no new key). Index
-entries name their first session's agent.
+of Claude's sessions, every Claude bundle ever made included, packs to the
+bytes it always did (`tests/bundle.rs` pins them, and `tests/codex.rs`
+checks a Claude-only `save` carries no new key).
+
+**A bundle holding any other agent's session is `version: 2`.** v0.2.0 reads
+`version` and nothing about agents. Given a Codex session at version 1, it
+would write it into `~/.claude/projects` and report `"status": "restored"`,
+`ok: true`, with a `claude --resume` line: the silent failure this file keeps
+warning about. It refuses any version but 1, so at 2 it fails loudly as
+`bundle-unreadable` ("unsupported bundle version 2"). Claude-only bundles
+stay at 1 and keep their refs, and no ref of a version-2 bundle predates
+the rule, so nothing moved. `Bundle::required_version` decides it, and both
+cases are pinned. Index entries name their first session's agent.
 
 **Never the matched text.** Redaction is reported as `{"<rule>": <count>}`
 plus a `redacted` total, exactly as much as the prose summary carries and no
@@ -868,7 +883,12 @@ which hands most of the hooks' speed back on every Bash call.
   bins through a `.cmd` wrapper anyway, the shim remains and still works.
 - **Hooks:** Ness should write the binary's absolute path with `loch install
   --local --command <path>` (settings.local.json, since the path is
-  machine-specific) rather than rely on PATH.
+  machine-specific) rather than rely on PATH. That installs Claude Code's
+  hooks alone. Codex's need `--agent codex` (or `all`), and with `--local`
+  that means the user-wide `$CODEX_HOME/hooks.json`, beside Ness's own
+  status hooks there. Ness should only ask for it with the user's say-so,
+  and must not rewrite that file wholesale, or loch's hooks go with it.
+  Codex won't run them until they're trusted in `/hooks`.
 
 **Builds reproduce.** `SOURCE_DATE_EPOCH` fixes `save`'s `createdAt`, the
 one clock in a bundle's bytes, so the same sessions pack to the same ref.
@@ -965,6 +985,17 @@ search, 15s:
 The full alternation stays in the unit tests as an oracle, fuzzed against
 the fast path over 40k generated strings that exercise every rule. The test
 asserts each rule matched, so it can't pass vacuously.
+
+**Codex discovery reads every rollout, on every `list` and `save`.** Both
+cover every agent by default, so a Claude-only listing pays for it too: about
+50ms for 10MB of rollouts, linear in their total size, and the rollouts
+never age out, so a year of Codex use is paid on every listing. If it starts
+to matter, the cheap fix is a substring check for the target cwd before the
+full parse. Only the last `turn_context`'s cwd decides a match, so a rollout
+whose bytes never contain the cwd string can't match and can be skipped.
+The catch is matching through a symlink: Codex stores `-C` unresolved, so
+the check has to try the target's unresolved spellings too, or skip only
+when no form of it occurs. `--agent claude-code` avoids the scan today.
 
 **S3 is SigV4 by hand over `ureq`/rustls**, not the AWS SDK: four request
 kinds don't justify an async runtime and several MB. The signer is pinned to
@@ -1142,10 +1173,10 @@ on a scratch repository, so how the TUI flow and `needsReview` read to a
 person is untested.
 
 Codex gaps: `ingest` and `backfill` are Claude-only (SPEC.md §8's converter;
-see the tool-call note above); a moved session has no branch; `--local`
-installs into the user's hooks file, so loch runs for every Codex project on
-the machine (it refuses `/` and home, as always); a fork has no title;
-`archived_sessions` isn't searched.
+see the tool-call note above); a moved session has no branch; `install
+--agent codex --local` installs into the user's hooks file, so loch runs for
+every Codex project on the machine (it refuses `/` and home, as always); a
+fork has no title; `archived_sessions` isn't searched.
 
 Also missing: `restore --map` (design intent recorded above, deliberately
 not built on this branch), any other index dimension (`cwd` is the

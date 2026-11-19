@@ -425,7 +425,7 @@ pub fn command_save(argv: &[String]) -> Run {
         });
         redactions.push(scrubbed.counts);
     }
-    let bundle = Bundle {
+    let mut bundle = Bundle {
         version: BUNDLE_VERSION,
         agent: bundle_agent.into(),
         created_at: sys::iso_timestamp(sys::creation_time()),
@@ -436,6 +436,7 @@ pub fn command_save(argv: &[String]) -> Run {
         },
         sessions: packed_sessions,
     };
+    bundle.version = bundle.required_version();
     let packed = bundle::pack_bundle(&bundle).map_err(|e| Failure::Internal(e.0))?;
     let ref_ = bundle::bundle_ref(&packed);
     let store = open_store(args.str("store").as_deref())?;
@@ -578,10 +579,7 @@ pub fn command_restore(argv: &[String]) -> Run {
         let agent_id = session.agent_of(&bundle).to_string();
         // A bundle from a build that knows agents this one doesn't, or one
         // whose adapter can't restore.
-        let Some(adapter) = agent::by_id(&agent_id).filter(|a| {
-            a.restore_path("", &target_cwd, &session.session_id)
-                .is_some()
-        }) else {
+        let Some(adapter) = agent::by_id(&agent_id).filter(|a| a.can_restore()) else {
             restored.push(Restored {
                 agent: agent_id,
                 session_id: session.session_id.clone(),
@@ -959,7 +957,10 @@ pub fn command_install(argv: &[String]) -> Run {
         .option("--command")
         .option("--agent");
     let args = p.parse(argv)?;
-    let agents = agents_arg(args.str("agent").as_deref())?;
+    // Claude Code's alone unless asked: an install that also wrote Codex's
+    // hooks would, with --local, put loch in every Codex project on the
+    // machine, and without it drop a .codex/ into repos that never use Codex.
+    let agents = agents_arg(Some(args.str("agent").as_deref().unwrap_or(AGENT)))?;
     let cwd = args
         .str("cwd")
         .filter(|c| !c.is_empty())
@@ -1495,7 +1496,7 @@ pub fn command_ask(argv: &[String]) -> Run {
     let link = blamed.links[owner].clone();
     let Some(adapter) = agent::by_id(&link.agent) else {
         return err(
-            "transcript-missing",
+            "unsupported-agent",
             format!(
                 "session {} wrote it, but this build doesn't know its agent, {}",
                 link.session_id, link.agent

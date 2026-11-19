@@ -105,6 +105,11 @@ pub trait Agent: Sync {
     fn transcript_cwds(&self, _raw: &str) -> Vec<(String, usize)> {
         Vec::new()
     }
+    /// Whether `restore` can file a session of this agent's: the transport
+    /// tier is implemented.
+    fn can_restore(&self) -> bool {
+        false
+    }
     /// Where a restored transcript goes. `raw` is the rewritten transcript.
     fn restore_path(&self, _raw: &str, _cwd: &str, _session_id: &str) -> Option<String> {
         None
@@ -158,9 +163,10 @@ pub fn by_id(id: &str) -> Option<&'static dyn Agent> {
 }
 
 /// The agents `--agent` names, or every one.
+/// `all` names every agent too.
 pub fn selected(id: Option<&str>) -> Result<Vec<&'static dyn Agent>, String> {
     match id.filter(|id| !id.is_empty()) {
-        None => Ok(all().to_vec()),
+        None | Some("all") => Ok(all().to_vec()),
         Some(id) => by_id(id).map(|agent| vec![agent]).ok_or_else(|| {
             let known: Vec<&str> = all().iter().map(|a| a.id()).collect();
             format!("unknown agent {} (known: {})", id, known.join(", "))

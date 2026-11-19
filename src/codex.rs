@@ -307,12 +307,15 @@ pub fn current_turn(transcript: &str, event: &Map, for_next: bool) -> TurnInfo {
 /// timestamp. Codex names its own files in local time; the name is a label,
 /// and `resume` finds a session by the id it ends with.
 fn rollout_path(stamp: &str, session_id: &str) -> String {
-    let valid = stamp.len() >= 19
-        && stamp.as_bytes()[4] == b'-'
-        && stamp.as_bytes()[10] == b'T'
-        && stamp[..19]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'T' | b':'));
+    // The prefix is checked as ASCII before anything slices it: the stamp
+    // comes from a bundle, and a cut inside a character would panic.
+    let valid = stamp.get(..19).is_some_and(|prefix| {
+        prefix.as_bytes()[4] == b'-'
+            && prefix.as_bytes()[10] == b'T'
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'T' | b':'))
+    });
     let stamp = if valid {
         stamp.to_string()
     } else {
@@ -537,6 +540,10 @@ impl Agent for Codex {
     }
 
     /// Filed under the day it began, as Codex would have.
+    fn can_restore(&self) -> bool {
+        true
+    }
+
     fn restore_path(&self, raw: &str, _cwd: &str, session_id: &str) -> Option<String> {
         Some(rollout_path(
             &started_at(raw).unwrap_or_default(),

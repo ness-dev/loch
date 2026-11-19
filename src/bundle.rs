@@ -11,7 +11,16 @@ use crate::sys;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
+/// A bundle of Claude Code sessions alone: every bundle made before Codex,
+/// and every one since that holds only Claude sessions, keeps this, and its
+/// bytes.
 pub const BUNDLE_VERSION: i64 = 1;
+
+/// A bundle holding any other agent's session. A build that predates agents
+/// ignores `agent` and would restore a Codex session as a Claude transcript
+/// while reporting success; it refuses any version but 1, so this makes it
+/// fail loudly instead.
+pub const AGENTS_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct BundleOrigin {
@@ -45,6 +54,21 @@ impl BundleSession {
         self.claude_version
             .as_deref()
             .or(self.agent_version.as_deref())
+    }
+}
+
+impl Bundle {
+    /// The version these sessions need: 1 unless any isn't Claude Code's.
+    pub fn required_version(&self) -> i64 {
+        let claude_only = self
+            .sessions
+            .iter()
+            .all(|s| s.agent_of(self) == crate::claude::AGENT);
+        if claude_only {
+            BUNDLE_VERSION
+        } else {
+            AGENTS_VERSION
+        }
     }
 }
 
@@ -192,16 +216,21 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
     })?;
     let root = value.as_object().ok_or("the bundle is not a JSON object")?;
     let version = root.get("version");
-    let current = matches!(version, Some(Value::Int(d)) if d == "1")
+    let read = if matches!(version, Some(Value::Int(d)) if d == "1")
         || matches!(version, Some(Value::Bool(true)))
-        || matches!(version, Some(Value::Float(f)) if *f == 1.0);
-    if !current {
+        || matches!(version, Some(Value::Float(f)) if *f == 1.0)
+    {
+        BUNDLE_VERSION
+    } else if matches!(version, Some(Value::Int(d)) if d == "2") {
+        AGENTS_VERSION
+    } else {
         return Err(format!(
-            "unsupported bundle version {} (this build reads {})",
+            "unsupported bundle version {} (this build reads {} and {})",
             py_str(version),
-            BUNDLE_VERSION
+            BUNDLE_VERSION,
+            AGENTS_VERSION
         ));
-    }
+    };
     let empty = Map::new();
     let origin = match root.get("origin") {
         None => &empty,
@@ -248,7 +277,7 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
         });
     }
     Ok(Bundle {
-        version: BUNDLE_VERSION,
+        version: read,
         agent: text_of(root, "agent"),
         created_at: text_of(root, "createdAt"),
         origin: BundleOrigin {

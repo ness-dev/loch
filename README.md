@@ -114,6 +114,10 @@ is closed by your next prompt or by the session ending, so its edits are still
 its own. Each session's transcript is copied into the store too — Claude Code
 deletes its own after 30 days.
 
+For history from before the hooks, `loch backfill` rebuilds what it can from
+the transcripts' edit calls and the commits the agent made, and marks those
+turns as backfilled.
+
 Snapshots are only needed until a turn is recorded, so loch deletes old ones
 itself every 50 snapshots, keeping about one compressed copy of each project;
 `loch gc` does it on demand.

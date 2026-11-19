@@ -6,6 +6,7 @@
 
 pub mod argparse;
 pub mod attribution;
+pub mod backfill;
 pub mod blame_html;
 pub mod bundle;
 pub mod claude;

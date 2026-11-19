@@ -237,6 +237,7 @@ fn close_turn(
         ended: info.ended.unwrap_or_else(|| sys::iso_timestamp(sys::now())),
         prompt: info.prompt,
         interrupted,
+        backfilled: false,
         files,
     });
     attribution::save_local(&record)?;

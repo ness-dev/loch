@@ -150,6 +150,9 @@ pub struct TurnRecord {
     /// closed by the next prompt or the session's end rather than by `Stop`,
     /// so it ends where the workspace stood then.
     pub interrupted: bool,
+    /// Reconstructed afterwards by `loch backfill` from the transcript and
+    /// the agent's commits, rather than recorded by the hooks as it happened.
+    pub backfilled: bool,
     pub files: Vec<FileChange>,
 }
 
@@ -196,6 +199,7 @@ impl EditRecord {
                     "ended" => turn.ended.as_str(),
                     "prompt" => opt(&turn.prompt),
                     "interrupted" => turn.interrupted,
+                    "backfilled" => turn.backfilled,
                     "files" => files,
                 })
             })
@@ -243,6 +247,7 @@ impl EditRecord {
                 ended: text(turn, "ended")?,
                 prompt: text(turn, "prompt"),
                 interrupted: turn.get("interrupted").is_some_and(Value::truthy),
+                backfilled: turn.get("backfilled").is_some_and(Value::truthy),
                 files,
             });
         }
@@ -458,7 +463,10 @@ pub struct TurnRef {
 /// nothing and five consecutive lines a turn wrote together prove a lot.
 /// Turns are applied oldest first, so a later turn that rewrote the same text
 /// takes it: blame answers "who last wrote this", as git's does.
-pub fn attribute(text: &str, path: &str, records: &[EditRecord]) -> Vec<Option<TurnRef>> {
+///
+/// `paths` is every name the file has had: a turn recorded it under the name
+/// it had then, and a rename since must not sever the link.
+pub fn attribute(text: &str, paths: &[String], records: &[EditRecord]) -> Vec<Option<TurnRef>> {
     let lines: Vec<&str> = text.lines().collect();
     let hashes: Vec<String> = lines.iter().map(|l| line_hash(l)).collect();
     let weak: Vec<bool> = lines.iter().map(|l| is_weak(l)).collect();
@@ -482,7 +490,7 @@ pub fn attribute(text: &str, path: &str, records: &[EditRecord]) -> Vec<Option<T
 
     let mut owner: Vec<Option<TurnRef>> = vec![None; lines.len()];
     for (reference, turn) in turns {
-        for file in turn.files.iter().filter(|f| f.path == path) {
+        for file in turn.files.iter().filter(|f| paths.contains(&f.path)) {
             for hunk in &file.hunks {
                 for (j, hash) in hunk.lines.iter().enumerate() {
                     for &i in at.get(hash.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
@@ -549,6 +557,7 @@ mod tests {
                     ended: ended.into(),
                     prompt: None,
                     interrupted: false,
+                    backfilled: false,
                     files: vec![FileChange {
                         path: "f.py".into(),
                         hunks: vec![Hunk {
@@ -564,7 +573,11 @@ mod tests {
     #[test]
     fn a_lone_weak_line_is_not_evidence_but_joins_a_run() {
         let records = vec![record(vec![("1", vec!["def go():", "    return 1", "}"])])];
-        let owners = attribute("}\nx = 1\ndef go():\n    return 1\n}\n", "f.py", &records);
+        let owners = attribute(
+            "}\nx = 1\ndef go():\n    return 1\n}\n",
+            &["f.py".into()],
+            &records,
+        );
         let claimed: Vec<bool> = owners.iter().map(Option::is_some).collect();
         assert_eq!(claimed, vec![false, false, true, true, true]);
     }
@@ -575,13 +588,13 @@ mod tests {
             ("2", vec!["value = compute()"]),
             ("1", vec!["value = compute()"]),
         ])];
-        let owners = attribute("value = compute()\n", "f.py", &records);
+        let owners = attribute("value = compute()\n", &["f.py".into()], &records);
         assert_eq!(owners, vec![Some(TurnRef { record: 0, turn: 0 })]);
     }
 
     #[test]
     fn reindentation_keeps_the_link() {
         let records = vec![record(vec![("1", vec!["return compute(x)"])])];
-        assert!(attribute("        return compute(x)\n", "f.py", &records)[0].is_some());
+        assert!(attribute("        return compute(x)\n", &["f.py".into()], &records)[0].is_some());
     }
 }

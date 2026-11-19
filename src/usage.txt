@@ -16,6 +16,8 @@ Usage:
   loch log     <file>[:<line>[-<end>]] [--store <uri>]
   loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
                [--store <uri>]
+  loch backfill [--cwd <path>] [--store <uri>]
+                                  attribute turns from before the hooks
   loch gc                         delete snapshots nothing needs (the hooks
                                   also do this every 50 snapshots)
   loch hook    prompt | stop | end   (run by the agent's harness)

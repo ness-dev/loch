@@ -106,9 +106,28 @@ requirements fixed the rest of the design:
   window are the turn's. Changes between turns are not, provided the prompt
   hook ran.
 
-Git is still *read*, in two places: a project's identity is its root commit
-(the same on every clone and immune to history rewrites), and `list`'s
-default branch. Nothing loch records goes into git.
+Git is still *read*, never written: for a project's identity (its root
+commit, the same on every clone and immune to history rewrites), for `list`'s
+default branch, for a file's earlier names (`git log --follow`, so blame finds
+turns that wrote it before a rename), and by `backfill`.
+
+**History from before the hooks is backfilled, honestly labelled.**
+`loch backfill` rebuilds turns from what survives, marked `backfilled`:
+- **The transcripts' `Edit`/`Write`/`MultiEdit` calls,** which carry the exact
+  text written. Failed edits are skipped. Fragment edits (part of a line)
+  can't match a full line and are missed.
+- **The commits the agent made,** whose diffs catch shell edits. A commit is
+  credited only on an exact match: an old git note naming the call, or
+  exactly one Bash call — across every session — containing the commit's
+  subject and bracketing its time. A contested commit stays unlinked, since a
+  wrong link looks exactly like a right one. A commit's lines that the same
+  session's tool edits already explain are left to those edits, the more
+  precise source.
+
+Hook-recorded turns are never replaced, and a re-run replaces only earlier
+backfilled turns. On this repository it rebuilt 21 turns across 2 sessions,
+and with rename-following, files written before the crate moved out of
+`rust/` went from 1–16% attributed to 96–99%.
 
 **Snapshots are disposable, so they are collected.** Nothing reads a snapshot
 once its turn is diffed; blame works from the records' hashes. A
@@ -198,7 +217,7 @@ binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
-│                 #   blame/log/ask/gc/hook/help/version
+│                 #   blame/log/ask/backfill/gc/hook/help/version
 ├── claude.rs     # Claude Code adapter: path encoding, session discovery, metadata
 ├── bundle.rs     # bundle format, gzip, content-addressed ref
 ├── format.rs     # loch format: turn and content ids, derived files
@@ -206,6 +225,7 @@ src/
 ├── index.rs      # store key layout, derived index entries, delete and reindex
 ├── snapshot.rs   # on-demand workspace snapshots with a stat cache, like git's index
 ├── attribution.rs # per-turn added lines, edit records, and blame's matcher
+├── backfill.rs   # turns from before the hooks, from transcripts and commits
 ├── hook.rs       # `loch hook prompt|stop|end`: turn boundaries, closing, collection
 ├── trace.rs      # install, finding transcripts, describing turns, ask's fork
 ├── git.rs        # git by subprocess: a project's root commit, the current branch
@@ -222,6 +242,7 @@ src/
 tests/            # integration tests, one file per module plus cli.rs
 ├── derived_reader/ # a verifying reader for derived files, shared by three tests
 ├── trace.rs      # hooks, blame, log and ask end to end, squash and clone included
+├── backfill.rs   # backfill's two sources, contested commits, renames
 └── corpus.rs     # opt-in, against this machine's transcripts (LOCH_CORPUS=1)
 examples/bench_hook.rs # per-call wall clock of `loch hook`, any number of binaries
 npm/              # @ness-dev/loch and its per-platform packages
@@ -880,8 +901,6 @@ migrated: they sit on commits `main` no longer contains.
 Known gaps:
 - **A crash nobody resumes** loses its turn's attribution: nothing ever says
   when that turn ended. Its state expires after 7 days.
-- **The file index keys on path,** so a file renamed after the turn that
-  wrote it is not found under its new name.
 - **Sessions running at once in one workspace** each record the other's
   changes as their own.
 - **The transcript snapshot** is one mutable key per session rather than

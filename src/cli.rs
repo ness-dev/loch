@@ -988,7 +988,53 @@ struct Located {
     text: String,
     project: String,
     relative: String,
+    /// `relative` and every earlier name git knows the file by.
+    names: Vec<String>,
     records: Vec<EditRecord>,
+}
+
+/// The names a file has had, newest first, by git's rename tracking — read
+/// only, and only where there is a repository to ask.
+fn past_names(root: &str, relative: &str) -> Vec<String> {
+    let mut names = vec![relative.to_string()];
+    if snapshot::has_git_marker(root) {
+        let log = trace::git_unchecked(
+            root,
+            &[
+                "log",
+                "--follow",
+                "--name-only",
+                "--format=",
+                "--",
+                relative,
+            ],
+        );
+        for name in log.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Every record that wrote the file under any of its names, one per session,
+/// the one with more turns winning where two copies of a session meet.
+fn records_named(store: Option<&dyn Store>, project: &str, names: &[String]) -> Vec<EditRecord> {
+    let mut by_session: HashMap<String, EditRecord> = HashMap::new();
+    for name in names {
+        for record in attribution::records_for(store, project, name) {
+            let better = by_session
+                .get(&record.session)
+                .is_none_or(|have| record.turns.len() > have.turns.len());
+            if better {
+                by_session.insert(record.session.clone(), record);
+            }
+        }
+    }
+    let mut records: Vec<EditRecord> = by_session.into_values().collect();
+    records.sort_by(|a, b| a.session.cmp(&b.session));
+    records
 }
 
 /// Finds the records that wrote `file`. In a git checkout the root is the
@@ -1021,22 +1067,25 @@ fn locate(file: &str, store: Option<&dyn Store>) -> std::result::Result<Located,
     for candidate in candidates {
         let project = attribution::project_id(&candidate);
         let relative = sys::relpath(&real, &candidate);
-        let records = attribution::records_for(store, &project, &relative);
+        let names = past_names(&candidate, &relative);
+        let records = records_named(store, &project, &names);
         if !records.is_empty() {
             return Ok(Located {
                 text,
                 project,
                 relative,
+                names,
                 records,
             });
         }
-        first.get_or_insert((project, relative));
+        first.get_or_insert((project, relative, names));
     }
-    let (project, relative) = first.expect("there is always one candidate");
+    let (project, relative, names) = first.expect("there is always one candidate");
     Ok(Located {
         text,
         project,
         relative,
+        names,
         records: Vec::new(),
     })
 }
@@ -1050,7 +1099,7 @@ struct Blamed {
 
 fn blame_file(file: &str, store: Option<&dyn Store>) -> std::result::Result<Blamed, Failure> {
     let located = locate(file, store)?;
-    let owners = attribution::attribute(&located.text, &located.relative, &located.records);
+    let owners = attribution::attribute(&located.text, &located.names, &located.records);
     let mut resolver = Resolver::new(store);
     let mut index_of: HashMap<attribution::TurnRef, usize> = HashMap::new();
     let mut links = Vec::new();
@@ -1270,7 +1319,11 @@ pub fn command_log(argv: &[String]) -> Run {
             let mut all = Vec::new();
             for record in &blamed.located.records {
                 for (index, turn) in record.turns.iter().enumerate() {
-                    if turn.files.iter().any(|f| f.path == blamed.located.relative) {
+                    if turn
+                        .files
+                        .iter()
+                        .any(|f| blamed.located.names.contains(&f.path))
+                    {
                         all.push(
                             resolver
                                 .describe(record, index)
@@ -1444,6 +1497,57 @@ fn exec_claude(root: &str, command: &[String]) -> Run {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+// -- backfill ----------------------------------------------------------------------
+
+/// Reconstructs attribution for turns from before the hooks, from the
+/// transcripts' edit calls and the commits the agent made.
+pub fn command_backfill(argv: &[String]) -> Run {
+    let mut p = parser("backfill");
+    p.option("--cwd").option("--store");
+    let args = p.parse(argv)?;
+    let cwd = args
+        .str("cwd")
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(sys::getcwd);
+    let root = snapshot::workspace_root(&cwd);
+    let store = store_or_none(args.str("store").as_deref());
+    let results = crate::backfill::backfill(&cwd, store.as_deref());
+    let mut text = String::new();
+    for r in &results {
+        text.push_str(&format!(
+            "  session {}  {} turn(s): {} line(s) from edits, {} from {} commit(s)\n",
+            py::truncate(&r.session, 8),
+            r.turns,
+            r.edit_lines,
+            r.commit_lines,
+            r.commits
+        ));
+    }
+    let turns: usize = results.iter().map(|r| r.turns).sum();
+    text.push_str(&format!(
+        "backfilled {} turn(s) across {} session(s) in {}\n",
+        turns,
+        results.len(),
+        root
+    ));
+    Ok(Outcome::with(
+        "backfill",
+        object! {
+            "root" => root.as_str(),
+            "project" => attribution::project_id(&root),
+            "turns" => turns,
+            "sessions" => results.iter().map(|r| Value::Object(object! {
+                "session" => r.session.as_str(),
+                "turns" => r.turns,
+                "editLines" => r.edit_lines,
+                "commitLines" => r.commit_lines,
+                "commits" => r.commits,
+            })).collect::<Vec<_>>(),
+        },
+        text,
+    ))
+}
+
 // -- gc ------------------------------------------------------------------------------
 
 /// Deletes the snapshots nothing needs: the hooks do this on their own every
@@ -1501,6 +1605,7 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "log" => command_log(argv),
         "hook" => command_hook(argv),
         "gc" => command_gc(argv),
+        "backfill" => command_backfill(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),
         _ => return None,

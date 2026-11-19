@@ -301,6 +301,7 @@ pub struct Link {
     pub conversation: Option<String>,
     pub title: Option<String>,
     pub prompt: Option<String>,
+    pub backfilled: bool,
 }
 
 impl Link {
@@ -315,6 +316,7 @@ impl Link {
             "conversation" => Value::opt_str(self.conversation.as_deref()),
             "title" => Value::opt_str(self.title.as_deref()),
             "prompt" => Value::opt_str(self.prompt.as_deref()),
+            "backfilled" => self.backfilled,
         }
     }
 }
@@ -413,6 +415,7 @@ impl<'a> Resolver<'a> {
             conversation,
             title: title_of("title").or_else(|| title_of("aiTitle")),
             prompt: turn.prompt.clone(),
+            backfilled: turn.backfilled,
         })
     }
 }

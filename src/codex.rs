@@ -539,11 +539,11 @@ impl Agent for Codex {
         transcript_cwds(raw)
     }
 
-    /// Filed under the day it began, as Codex would have.
     fn can_restore(&self) -> bool {
         true
     }
 
+    /// Filed under the day it began, as Codex would have.
     fn restore_path(&self, raw: &str, _cwd: &str, session_id: &str) -> Option<String> {
         Some(rollout_path(
             &started_at(raw).unwrap_or_default(),

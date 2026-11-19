@@ -19,8 +19,8 @@ loch is a single static binary. Take the one for your platform from
 [GitHub releases](https://github.com/ness-dev/loch/releases), for example:
 
 ```sh
-curl -L https://github.com/ness-dev/loch/releases/download/v0.1.0/loch-0.1.0-aarch64-apple-darwin.tar.gz \
-  | tar xz --strip-components 1 -C ~/.local/bin loch-0.1.0-aarch64-apple-darwin/loch
+curl -L https://github.com/ness-dev/loch/releases/download/v0.2.0/loch-0.2.0-aarch64-apple-darwin.tar.gz \
+  | tar xz --strip-components 1 -C ~/.local/bin loch-0.2.0-aarch64-apple-darwin/loch
 loch --version
 ```
 
@@ -140,7 +140,7 @@ ref=$(loch save --json --store /tmp/outbound | jq -r .ref)
 loch restore --json "$ref" --into /path/to/repo --store /tmp/outbound
 
 loch --version --json
-# {"schema":2,"ok":true,"command":"version","version":"0.1.0"}
+# {"schema":2,"ok":true,"command":"version","version":"0.2.0"}
 ```
 
 Failures are documents too, on stdout, so one stream carries both outcomes:

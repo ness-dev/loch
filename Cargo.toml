@@ -1,0 +1,47 @@
+[package]
+name = "loch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+description = "Save and restore agent coding sessions across machines"
+publish = false
+
+[[bin]]
+name = "loch"
+path = "src/main.rs"
+
+[dependencies]
+indexmap = "2"
+# Python's `re` has lookarounds, which the `regex` crate deliberately lacks;
+# fancy-regex adds them and hands everything else to `regex`.
+fancy-regex = "0.14"
+# Linear-time search for the redaction rules once their lookarounds are
+# checked by hand; see redact.rs.
+regex = "1"
+# zlib itself, built from source and linked statically: the ref is a hash of
+# the gzip bytes, and only zlib's own deflate reproduces zlib's output.
+# miniz_oxide (flate2's default) compresses differently.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+libz-sys = { version = "1", default-features = false, features = ["static", "libc"] } # flate2's backend, built from source and linked statically
+getrandom = "0.2"
+# Walks a workspace the way git sees it: .gitignore, nested ignores, the global
+# excludes file. Used by snapshots, which must skip what the user ignores.
+ignore = "0.4"
+# Line diffs between a turn's start and end snapshots.
+similar = "2"
+sha2 = "0.10"
+hmac = "0.12"
+# Blocking and rustls-only: no async runtime and no system OpenSSL, so the
+# binary stays static. Used by the S3 backend alone.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

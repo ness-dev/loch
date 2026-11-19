@@ -1,11 +1,7 @@
-.venv/
-__pycache__/
-*.pyc
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-dist/
-*.loch
-!test/fixtures/*.loch
+target/
 .DS_Store
 .claude/settings.local.json
+*.loch
+# Python tooling a contributor might still run beside the repo.
+__pycache__/
+.venv/

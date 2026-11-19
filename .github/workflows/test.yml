@@ -2,7 +2,7 @@ name: test
 
 on:
   # Tags are excluded because the release workflow calls this one, and a tag
-  # push would otherwise run the whole matrix twice.
+  # push would otherwise run it twice.
   push:
     tags-ignore: ["**"]
   pull_request:
@@ -14,29 +14,19 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the ceiling of the supported range, where breakage
-        # appears; 3.12 is what development happens on.
-        python: ["3.10", "3.12", "3.13"]
+        # Linux and macOS because the hooks' native git fast path is Unix-only
+        # and its filesystem details (realpath, ownership) differ between them.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python }}
-
-      - run: pipx install poetry
-
-      # Poetry otherwise builds the environment against its own interpreter
-      # rather than the one this matrix leg is for.
-      - run: poetry env use python
-      - run: poetry install
-
-      - run: poetry run ruff check
-      - run: poetry run ruff format --check
-      - run: poetry run mypy .
-      - run: poetry run pytest
+      # rustup ships on both runner images and installs the version
+      # rust-toolchain.toml pins on first use; this makes that explicit.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets --locked -- -D warnings
+      - run: cargo test --release --locked

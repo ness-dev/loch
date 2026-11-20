@@ -604,3 +604,76 @@ fn another_repository_s_sessions_are_not_picked_up() {
         vec![None; FEATURE.lines().count()]
     );
 }
+
+#[test]
+fn a_removed_worktree_nested_inside_the_main_checkout_is_recognized() {
+    let w = World::new();
+    // Claude Code's own layout: the gone directory's nearest checkout is the
+    // main one, which must be its floor rather than its root.
+    let tree = w.repo.join(".claude/worktrees/nested");
+    w.git(&["worktree", "add", "-q", "-b", "nested", &s(&tree)]);
+    let file = tree.join("nested.py");
+    fs::write(&file, FEATURE).unwrap();
+    let mut records = vec![w.prompt_in(&tree, ONE, "p1", "2026-08-01T00:00:00Z", "nest it")];
+    records.extend(w.write_call(&tree, ONE, 1, &file, FEATURE));
+    w.transcript_in(&tree, ONE, &records);
+    w.git(&["-C", &s(&tree), "add", "nested.py"]);
+    w.git(&["-C", &s(&tree), "commit", "-q", "-m", "nested"]);
+    w.git(&["merge", "-q", "nested"]);
+    w.git(&["worktree", "remove", "--force", &s(&tree)]);
+    w.git(&["branch", "-q", "-D", "nested"]);
+    assert!(!tree.exists());
+
+    let result = w.loch(&["backfill"], "");
+    assert_eq!(sessions(&result), vec![(ONE.to_string(), s(&tree))]);
+    let lines = owners(&w.loch(&["blame", "nested.py"], ""));
+    assert!(lines.iter().all(|l| l == &some("nest it")), "{:?}", lines);
+}
+
+#[test]
+fn two_roots_with_equal_evidence_decide_nothing() {
+    let w = World::new();
+    // The repository holds the same text at `f.py` and `a/f.py`, so a gone
+    // `<x>/a/f.py` fits a root at `<x>` exactly as well as one at `<x>/a`.
+    w.write("f.py", FEATURE);
+    w.write("a/f.py", FEATURE);
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "twice"]);
+    let gone = w.root.join("gone/x/a");
+    let mut records = vec![w.prompt_in(&gone, ONE, "p1", "2026-08-01T00:00:00Z", "which root")];
+    records.extend(w.write_call(&gone, ONE, 1, &gone.join("f.py"), FEATURE));
+    w.transcript_in(&gone, ONE, &records);
+
+    assert_eq!(sessions(&w.loch(&["backfill"], "")), vec![]);
+    // With one of the two gone, the same evidence decides.
+    w.git(&["rm", "-q", "f.py"]);
+    w.git(&["commit", "-q", "-m", "once"]);
+    assert_eq!(
+        sessions(&w.loch(&["backfill"], "")),
+        vec![(ONE.to_string(), s(&w.root.join("gone/x")))]
+    );
+}
+
+#[test]
+fn a_directory_that_still_exists_outside_any_checkout_is_not_a_former_worktree() {
+    let w = World::new();
+    w.write("shared.py", FEATURE);
+    w.git(&["add", "shared.py"]);
+    w.git(&["commit", "-q", "-m", "shared"]);
+    // A plain copy of the text, in a directory that is there and is no
+    // checkout: it is what it is, however much it matches.
+    let scratch = w.root.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    fs::write(scratch.join("shared.py"), FEATURE).unwrap();
+    let mut records = vec![w.prompt_in(&scratch, ONE, "p1", "2026-08-01T00:00:00Z", "scratch")];
+    records.extend(w.write_call(&scratch, ONE, 1, &scratch.join("shared.py"), FEATURE));
+    w.transcript_in(&scratch, ONE, &records);
+
+    assert_eq!(sessions(&w.loch(&["backfill"], "")), vec![]);
+    // Gone, the same session would have been a former worktree.
+    fs::remove_dir_all(&scratch).unwrap();
+    assert_eq!(
+        sessions(&w.loch(&["backfill"], "")),
+        vec![(ONE.to_string(), s(&scratch))]
+    );
+}

@@ -377,7 +377,32 @@ impl Repo {
             .filter(|b| !self.blobs.contains_key(*b))
             .map(String::as_str)
             .collect();
-        for (blob, object) in missing.iter().zip(batch(&self.root, &missing)) {
+        // Sized first, so a lockfile at hundreds of tips is never held whole
+        // at once: anything over `BLOB_CAP` is skipped (generated files are
+        // poor evidence anyway), and the rest is read `BATCH_BYTES` at a time.
+        let mut chunk: Vec<&str> = Vec::new();
+        let mut bytes = 0;
+        for (blob, size) in missing.iter().zip(sizes(&self.root, &missing)) {
+            match size {
+                Some(size) if size <= BLOB_CAP => {
+                    if bytes + size > BATCH_BYTES && !chunk.is_empty() {
+                        self.read(&chunk);
+                        chunk.clear();
+                        bytes = 0;
+                    }
+                    chunk.push(blob);
+                    bytes += size;
+                }
+                _ => {
+                    self.blobs.insert(blob.to_string(), HashSet::new());
+                }
+            }
+        }
+        self.read(&chunk);
+    }
+
+    fn read(&mut self, blobs: &[&str]) {
+        for (blob, object) in blobs.iter().zip(batch(&self.root, blobs)) {
             let lines = object
                 .map(|(_, data)| {
                     String::from_utf8_lossy(&data)
@@ -397,6 +422,32 @@ impl Repo {
             .filter(|w| path == w.as_str() || inside(path, w).is_some())
             .max_by_key(|w| w.len())
     }
+}
+
+/// The largest blob read for evidence, and how much is read in one go.
+const BLOB_CAP: usize = 1 << 20;
+const BATCH_BYTES: usize = 16 << 20;
+
+/// Each named object's size, from `cat-file --batch-check`; `None` for one
+/// that doesn't exist.
+fn sizes(root: &str, names: &[&str]) -> Vec<Option<usize>> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let input: String = names.iter().map(|n| format!("{}\n", n)).collect();
+    let out = git::git(root, &["cat-file", "--batch-check"], Some(&input)).unwrap_or_default();
+    let mut found: Vec<Option<usize>> = out
+        .lines()
+        .map(|line| {
+            let parts: Vec<&str> = line.split(' ').collect();
+            match parts.as_slice() {
+                [_, _, size] => size.parse().ok(),
+                _ => None,
+            }
+        })
+        .collect();
+    found.resize(names.len(), None);
+    found
 }
 
 /// Each named object as `cat-file --batch` gives it, `(id, contents)`, in the
@@ -482,6 +533,13 @@ fn place(cwd: &str, repo: &Repo) -> Place {
             if repo.worktrees.contains(checkout) {
                 return Place::Root(checkout.clone());
             }
+        }
+        // A directory that is still there and is no checkout of this
+        // repository — scratch space, an unpacked tarball, a `cp -r` — is
+        // what it is, whatever it wrote. Only one that is gone can have been
+        // a worktree git has forgotten.
+        if live.is_none() {
+            return Place::Elsewhere;
         }
     }
     // A checkout above a directory that is gone is the one it was in — unless

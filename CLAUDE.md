@@ -137,7 +137,11 @@ turns that wrote it before a rename), and by `backfill`.
   tip of any branch, tag or worktree — at least 5 distinct lines, and
   strictly more than any other prefix. A tie, or less, includes nothing. A
   cwd inside another repository's checkout is never considered, whatever it
-  wrote. The repository's tips are read as one tree walk per depth through
+  wrote, and nor is a directory that still exists but is no checkout of this
+  repository (scratch space, a `cp -r`): only a directory that is gone can
+  be a worktree git has forgotten. Blobs over 1MB are not read for evidence
+  and the rest are read 16MB at a time, so a lockfile at hundreds of tips
+  never sits in memory whole. The repository's tips are read as one tree walk per depth through
   `cat-file --batch`, since hundreds of branches share nearly every subtree
   (claude-harness: 666 tips, 7s by `ls-tree` per tip, 0.3s this way), and a
   transcript is fully parsed only if a `file_path` in its raw text could land
@@ -145,7 +149,11 @@ turns that wrote it before a rename), and by `backfill`.
   turns to 185 across 45 sessions in 39 worktrees, and `src/main/loch.ts`,
   written in a since-removed worktree, from 0 to 383 of 439 lines.
   The honest limits: a removed worktree whose work never reached any ref
-  leaves no evidence (nor anything to blame), and a squash-merged commit
+  leaves no evidence (nor anything to blame); a session in a removed
+  worktree that worked only through Bash has no tool edits to be recognized
+  by, so it is skipped with its commits even when they are still reachable
+  (recognizing a gone cwd by an exactly-credited commit would fix that, and
+  is exact by construction); and a squash-merged commit
   can't be credited by the commit rule, since its time is the merge's, not
   the Bash call's — its lines come from the tool edits or not at all.
 

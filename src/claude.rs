@@ -3,7 +3,7 @@
 //! and how a conversation is forked.
 
 pub use crate::agent::SessionMeta;
-use crate::agent::{Agent, HookEvent, TurnInfo};
+use crate::agent::{Agent, HookEvent, Scope, TurnInfo};
 use crate::json::{self, Map, Value};
 use crate::object;
 use crate::py;
@@ -521,18 +521,18 @@ impl Agent for ClaudeCode {
         HOOK_EVENTS
     }
 
-    /// The project's settings file, or with `local` the uncommitted one, since
-    /// a `--local` command is a machine-specific path.
-    fn hooks_file(&self, root: &str, local: bool) -> String {
-        let name = if local {
-            "settings.local.json"
-        } else {
-            "settings.json"
-        };
-        sys::join(&sys::join(root, ".claude"), name)
+    /// The user's settings under `config_dir` (so `CLAUDE_CONFIG_DIR` picks
+    /// the account, as it does for transcripts), the project's committed
+    /// settings, or its uncommitted `settings.local.json`.
+    fn hooks_file(&self, scope: Scope, root: &str) -> String {
+        match scope {
+            Scope::User => sys::join(&config_dir(None), "settings.json"),
+            Scope::Project => sys::join(&sys::join(root, ".claude"), "settings.json"),
+            Scope::Local => sys::join(&sys::join(root, ".claude"), "settings.local.json"),
+        }
     }
 
-    fn install_note(&self) -> &'static str {
+    fn install_note(&self, _scope: Scope) -> &'static str {
         "restart Claude Code sessions here to pick them up"
     }
 

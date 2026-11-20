@@ -5,7 +5,7 @@
 //! What an adapter has to provide comes in tiers, and each tier is useful on
 //! its own:
 //!
-//! 1. **Attribution** — `id`, `hook_events`, `hooks_file`. Blame and log need
+//! 1. **Attribution** — `id`, `hook_events`, `hooks_file` per `Scope`. Blame and log need
 //!    nothing else: a hook at a turn's start and end, carrying a session id
 //!    and a cwd. `current_turn` (what the transcript says the turn was) only
 //!    sharpens the record, and the default says nothing.
@@ -55,6 +55,45 @@ pub struct TurnInfo {
 /// `("UserPromptSubmit", "prompt")`.
 pub type HookEvent = (&'static str, &'static str);
 
+/// Where `install` puts hooks, from the widest to the narrowest. An agent
+/// runs every scope's hooks for the same event, so a wider scope's hook
+/// defers to a narrower one's in the same project (`hook::run`): a turn is
+/// recorded once, by the most specific install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The user's own hooks file: every project on the machine.
+    User,
+    /// The project's committed hooks file.
+    Project,
+    /// The project's hooks file for this machine alone, where the agent has one.
+    Local,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::User => "user",
+            Scope::Project => "project",
+            Scope::Local => "local",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Scope> {
+        [Scope::User, Scope::Project, Scope::Local]
+            .into_iter()
+            .find(|scope| scope.as_str() == text)
+    }
+
+    /// The scopes a hook of this one defers to.
+    pub fn narrower(self) -> &'static [Scope] {
+        match self {
+            Scope::User => &[Scope::Local, Scope::Project],
+            Scope::Project => &[Scope::Local],
+            Scope::Local => &[],
+        }
+    }
+}
+
 pub trait Agent: Sync {
     /// Stable identifier: edit records, store keys, bundles, `--agent`.
     fn id(&self) -> &'static str;
@@ -65,10 +104,17 @@ pub trait Agent: Sync {
 
     /// The events loch hooks, and the subcommand each runs.
     fn hook_events(&self) -> &'static [HookEvent];
-    /// The hooks file `install` writes, for a workspace root.
-    fn hooks_file(&self, root: &str, local: bool) -> String;
+    /// The hooks file `install` writes for a scope; `root` is the workspace
+    /// root, which the user scope ignores.
+    fn hooks_file(&self, scope: Scope, root: &str) -> String;
+    /// Whether the agent will run the hooks `file` holds for `event` in the
+    /// project at `root`. A wider scope's hook defers to these only if so,
+    /// since deferring to a hook that never runs would lose the turn.
+    fn hooks_active(&self, _file: &str, _root: &str, _event: &str) -> bool {
+        true
+    }
     /// What `install` says after writing, beyond the file it wrote.
-    fn install_note(&self) -> &'static str;
+    fn install_note(&self, scope: Scope) -> &'static str;
     /// Hooks this agent won't run until a person approves them.
     fn hooks_need_review(&self) -> bool {
         false

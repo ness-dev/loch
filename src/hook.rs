@@ -20,13 +20,14 @@
 //! and nothing is written to stdout: a hook that breaks the agent gets
 //! uninstalled.
 
-use crate::agent::{self, Agent, TurnInfo};
+use crate::agent::{self, Agent, Scope, TurnInfo};
 use crate::attribution::{self, EditRecord, TurnRecord};
 use crate::json::{self, Map, Value};
 use crate::object;
 use crate::snapshot;
 use crate::store::{self, Store};
 use crate::sys;
+use crate::trace;
 use std::fs;
 use std::path::PathBuf;
 
@@ -335,9 +336,48 @@ pub fn snapshot_transcript(
     Ok(Some(key))
 }
 
+/// Whether a hook installed at `scope` records this event, decided before
+/// anything is opened, since a user-wide hook runs in every directory the
+/// agent does.
+///
+/// - **A user-wide hook records only in a git repository.** Anywhere else it
+///   would snapshot whatever directory a session happened to start in
+///   (`~/Downloads`, a scratch dir), which nobody asked for by installing
+///   loch once. A project-level install still records a plain directory:
+///   that was asked for.
+/// - **A wider scope's hook defers to a narrower one's** in the same project,
+///   when that file holds loch's hook for the same event and the agent will
+///   run it. Every scope's hooks run, in parallel, so two would snapshot one
+///   turn twice and race over its state.
+///
+/// A line naming no scope (local ones, and every line before scopes) records
+/// as it always did.
+pub fn applies(agent: &dyn Agent, scope: Option<Scope>, name: &str, event: &Map) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let root = snapshot::workspace_root(&event_cwd(event));
+    // A home directory that is itself a repository (dotfiles) is the root of
+    // every directory under it, and is refused before any store is opened.
+    if scope == Scope::User && !(snapshot::has_git_marker(&root) && snapshot::snapshottable(&root))
+    {
+        return false;
+    }
+    let Some((event_name, _)) = agent.hook_events().iter().find(|(_, n)| *n == name) else {
+        return true;
+    };
+    let own = agent.hooks_file(scope, &root);
+    !scope.narrower().iter().any(|narrower| {
+        let file = agent.hooks_file(*narrower, &root);
+        file != own
+            && trace::holds_hook(&file, event_name, name, agent)
+            && agent.hooks_active(&file, &root, event_name)
+    })
+}
+
 /// Run by the harness with the event as JSON on stdin. An agent this build
 /// doesn't know does nothing, like every other failure here.
-pub fn run(name: &str, agent_id: &str, stdin: &[u8]) {
+pub fn run(name: &str, agent_id: &str, scope: Option<Scope>, stdin: &[u8]) {
     let Some(agent) = agent::by_id(agent_id) else {
         return;
     };
@@ -348,6 +388,9 @@ pub fn run(name: &str, agent_id: &str, stdin: &[u8]) {
     let Ok(Value::Object(event)) = json::loads(text) else {
         return;
     };
+    if !applies(agent, scope, name, &event) {
+        return;
+    }
     let store = || store::create_store(&store::resolve_store_uri(None)).ok();
     let _ = match name {
         "prompt" => prompt(agent, &event, store().as_deref()),

@@ -717,13 +717,15 @@ fn a_bundle_of_claude_sessions_alone_has_no_agent_fields() {
 #[test]
 fn install_adds_codex_hooks_beside_the_ones_already_there() {
     let world = World::new();
-    let hooks = world.repo.join(".codex/hooks.json");
+    // Ness's status hooks live in the user's file.
+    let hooks = world.home.join(".codex/hooks.json");
     fs::create_dir_all(hooks.parent().unwrap()).unwrap();
     let theirs = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"their-status-hook","timeout":5}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"their-tool-hook"}]}]}}"#;
     fs::write(&hooks, theirs).unwrap();
 
     let installed = world.ok(&["install", "--agent", "codex"]);
     assert_eq!(text(&installed, "command"), "install");
+    assert_eq!(text(&installed, "scope"), "user");
     assert_eq!(text(&installed, "hookCommand"), "loch");
     let codex = &items(&installed, "agents")[0];
     assert_eq!(text(codex, "agent"), "codex");
@@ -741,25 +743,30 @@ fn install_adds_codex_hooks_beside_the_ones_already_there() {
     let line = |group: &Value| text(&items(group, "hooks")[0], "command").to_string();
     assert_eq!(
         line(&stop[1]),
-        "loch hook stop --agent codex 2>/dev/null || true"
+        "loch hook stop --agent codex --scope user 2>/dev/null || true"
     );
     assert_eq!(groups("PreToolUse").len(), 1);
     assert_eq!(
         line(&groups("UserPromptSubmit")[0]),
-        "loch hook prompt --agent codex 2>/dev/null || true"
+        "loch hook prompt --agent codex --scope user 2>/dev/null || true"
     );
     assert_eq!(
         line(&groups("SessionEnd")[0]),
-        "loch hook end --agent codex 2>/dev/null || true"
+        "loch hook end --agent codex --scope user 2>/dev/null || true"
     );
+    assert!(!world.repo.join(".codex").exists());
 
     let again = world.ok(&["install", "--agent", "codex"]);
     let codex = &items(&again, "agents")[0];
     assert!(items(codex, "added").is_empty());
     assert_eq!(at(codex, "needsReview"), &Value::Bool(false));
-    assert_eq!(groups("Stop").len(), 2);
+    let written = json::loads(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    assert_eq!(
+        at(at(&written, "hooks"), "Stop").as_array().unwrap().len(),
+        2
+    );
 
-    // --local is machine-specific, so it goes to the user's file.
+    // Codex has no uncommitted project file, so --local is the project's.
     let local = world.ok(&[
         "install",
         "--agent",
@@ -768,9 +775,11 @@ fn install_adds_codex_hooks_beside_the_ones_already_there() {
         "--command",
         "/opt/loch",
     ]);
+    let codex = &items(&local, "agents")[0];
+    assert_eq!(text(codex, "scope"), "local");
     assert_eq!(
-        text(&items(&local, "agents")[0], "settings"),
-        s(&world.home.join(".codex/hooks.json"))
+        text(codex, "settings"),
+        s(&world.repo.join(".codex/hooks.json"))
     );
 }
 
@@ -778,15 +787,22 @@ fn install_adds_codex_hooks_beside_the_ones_already_there() {
 fn install_sets_up_claude_alone_unless_asked() {
     let world = World::new();
     // What existing callers (Ness's `install --local --command`) run: it must
-    // not start writing Codex's user-wide hooks file.
+    // write this worktree's Claude settings and nothing of Codex's.
     let local = world.ok(&["install", "--local", "--command", "/opt/loch"]);
     assert_eq!(items(&local, "agents").len(), 1);
+    assert_eq!(
+        text(&local, "settings"),
+        s(&world.repo.join(".claude/settings.local.json"))
+    );
+    let written = fs::read_to_string(world.repo.join(".claude/settings.local.json")).unwrap();
+    assert!(written.contains("\"/opt/loch hook stop 2>/dev/null || true\""));
     assert!(!world.home.join(".codex").exists());
+    assert!(!world.repo.join(".codex").exists());
     let plain = world.ok(&["install"]);
     assert_eq!(text(&items(&plain, "agents")[0], "agent"), "claude-code");
-    assert!(!world.repo.join(".codex").exists());
+    assert!(!world.home.join(".codex").exists());
 
-    let installed = world.ok(&["install", "--agent", "all"]);
+    let installed = world.ok(&["install", "--agent", "all", "--project"]);
     let agents: Vec<&str> = items(&installed, "agents")
         .iter()
         .map(|a| text(a, "agent"))
@@ -799,7 +815,59 @@ fn install_sets_up_claude_alone_unless_asked() {
     );
     assert!(world.repo.join(".codex/hooks.json").exists());
     let claude = fs::read_to_string(world.repo.join(".claude/settings.json")).unwrap();
-    assert!(claude.contains("\"loch hook stop 2>/dev/null || true\""));
+    assert!(claude.contains("\"loch hook stop --scope project 2>/dev/null || true\""));
+}
+
+/// A user-wide hook defers to a project's own only where Codex will run the
+/// project's: in a trusted project, once its hook is trusted. Deferring to a
+/// hook Codex skips would lose the turn.
+#[test]
+fn a_user_wide_codex_hook_defers_only_to_project_hooks_codex_runs() {
+    let world = World::new();
+    world.ok(&[
+        "install",
+        "--agent",
+        "codex",
+        "--local",
+        "--command",
+        "/opt/loch",
+    ]);
+    let project_hooks = world.repo.join(".codex/hooks.json");
+    let state = world
+        .home
+        .join(".loch/sessions")
+        .join(format!("{}.json", SESSION));
+    let prompt = |world: &World| {
+        let _ = fs::remove_file(&state);
+        let event = world.event(SESSION, Some(TURN_A), Some("hi"));
+        let out = world.loch_with(
+            &["hook", "prompt", "--agent", "codex", "--scope", "user"],
+            &event,
+        );
+        assert!(out.status.success() && out.stdout.is_empty());
+        state.exists()
+    };
+    assert!(prompt(&world), "no config: the project's hooks don't run");
+
+    let config = world.home.join(".codex/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let trusted_project = format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        s(&world.repo)
+    );
+    fs::write(&config, &trusted_project).unwrap();
+    assert!(
+        prompt(&world),
+        "a trusted project, its hook not yet trusted"
+    );
+
+    let trusted_hook = format!(
+        "{}\n[hooks.state.\"{}:user_prompt_submit:0:0\"]\ntrusted_hash = \"sha256:00\"\n",
+        trusted_project,
+        s(&project_hooks)
+    );
+    fs::write(&config, trusted_hook).unwrap();
+    assert!(!prompt(&world), "the project's hook records this turn");
 }
 
 #[test]

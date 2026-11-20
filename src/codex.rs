@@ -19,7 +19,7 @@
 //! - **A turn has an id.** Hooks carry `turn_id` and records name it, so a
 //!   turn's start and end in the transcript are that id, not a record.
 
-use crate::agent::{Agent, HookEvent, SessionMeta, TurnInfo};
+use crate::agent::{Agent, HookEvent, Scope, SessionMeta, TurnInfo};
 use crate::claude::{display_summary, home_dir, resolve_cwd};
 use crate::json::{self, Map, Value};
 use crate::py;
@@ -31,6 +31,30 @@ use std::fs;
 use std::path::Path;
 
 pub const AGENT: &str = "codex";
+
+/// `UserPromptSubmit` → `user_prompt_submit`, as trust keys name events.
+fn snake_case(event: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in event.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// The quoted key of a TOML table header under `prefix`:
+/// `[projects."/a/b"]` with `projects.` is `/a/b`.
+fn toml_key<'a>(header: &'a str, prefix: &str) -> Option<&'a str> {
+    header
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim()
+        .strip_prefix(prefix)?
+        .strip_prefix('"')?
+        .strip_suffix('"')
+}
 
 /// `CODEX_HOME` when set, else `~/.codex` — the rule Codex follows, and the
 /// only place consulted, for the reason `claude::config_dir` gives.
@@ -485,20 +509,71 @@ impl Agent for Codex {
         HOOK_EVENTS
     }
 
-    /// The project's `.codex/hooks.json`, or with `local` the user's
-    /// `$CODEX_HOME/hooks.json`: Codex has no uncommitted project file, and a
-    /// `--local` command is a machine-specific path. The user's file applies
-    /// to every project, which attribution handles — it refuses `/` and home.
-    fn hooks_file(&self, root: &str, local: bool) -> String {
-        if local {
-            sys::join(&codex_home(), "hooks.json")
-        } else {
-            sys::join(&sys::join(root, ".codex"), "hooks.json")
+    /// The user's `$CODEX_HOME/hooks.json`, or the project's
+    /// `.codex/hooks.json` for both narrower scopes: Codex has no uncommitted
+    /// project file, so a `--local` install is one git sees.
+    fn hooks_file(&self, scope: Scope, root: &str) -> String {
+        match scope {
+            Scope::User => sys::join(&codex_home(), "hooks.json"),
+            Scope::Project | Scope::Local => sys::join(&sys::join(root, ".codex"), "hooks.json"),
         }
     }
 
-    fn install_note(&self) -> &'static str {
-        "Codex runs new hooks only once trusted: open /hooks in Codex and trust loch's"
+    /// Codex runs a project's hooks only in a project trusted in
+    /// `config.toml`, and each hook only once a person has trusted it. The
+    /// second is read from whether a trust entry exists for the file and
+    /// event, not whether its hash is current, which loch can't compute.
+    fn hooks_active(&self, file: &str, root: &str, event: &str) -> bool {
+        if file == self.hooks_file(Scope::User, root) {
+            return true;
+        }
+        let Ok(config) = fs::read_to_string(sys::join(&codex_home(), "config.toml")) else {
+            return false;
+        };
+        let roots = [root.to_string(), resolve_cwd(root)];
+        let files = [file.to_string(), resolve_cwd(file)];
+        let event = snake_case(event);
+        let mut trusted_project = false;
+        let mut trusted_hook = false;
+        let mut table = String::new();
+        for line in config.lines().map(str::trim) {
+            if line.starts_with('[') {
+                table = line.to_string();
+                if let Some(key) = toml_key(line, "hooks.state.") {
+                    trusted_hook |= files
+                        .iter()
+                        .any(|f| key.starts_with(&format!("{}:{}:", f, event)));
+                }
+                continue;
+            }
+            if let Some(project) = toml_key(&table, "projects.") {
+                let covers = roots.iter().any(|r| {
+                    r == project || r.starts_with(&format!("{}/", project.trim_end_matches('/')))
+                });
+                let value = line.split_once('=').map(|(k, v)| (k.trim(), v.trim()));
+                if covers && value == Some(("trust_level", "\"trusted\"")) {
+                    trusted_project = true;
+                }
+            }
+        }
+        trusted_project && trusted_hook
+    }
+
+    fn install_note(&self, scope: Scope) -> &'static str {
+        match scope {
+            Scope::User => {
+                "Codex runs new hooks only once trusted: open /hooks in Codex and trust loch's"
+            }
+            Scope::Project => {
+                "Codex runs a project's hooks only in a project it trusts, and new hooks only \
+                 once trusted: open /hooks in Codex and trust loch's"
+            }
+            Scope::Local => {
+                "Codex has no uncommitted hooks file, so these are in the project's, which git \
+                 sees. Codex runs them only in a project it trusts, and only once trusted: open \
+                 /hooks in Codex and trust loch's"
+            }
+        }
     }
 
     fn hooks_need_review(&self) -> bool {

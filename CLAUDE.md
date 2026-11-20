@@ -263,6 +263,51 @@ and unpacking. That is what makes `reindex` a repair command and what
 makes a half-failed `save` leave a recoverable store rather than a corrupt
 one. Nothing may end up knowable only from the index.
 
+**Push and pull, git style.** The local store (`~/.loch/store`) is where
+everything is recorded first. Named remotes (`loch remote`, kept in
+`~/.loch/config`) are where `push` sends and `pull` fetches from, as git's
+remotes are. `blame`, `log` and `ask` read only the local store, so a
+teammate's turns arrive by `pull`, never by a read that waits on the network.
+- **What moves.** `push` sends every bundle with its branch entries, and the
+  current project's edit records, file index and transcripts (`--all` for
+  every project's). Bundles were redacted by `save` and go as they are, so a
+  ref is the same everywhere. Transcripts are kept verbatim locally and
+  redacted on the way out, and a surviving match fails the push as
+  `redaction-failed`. Edit records hold line hashes, and their `prompt` was
+  redacted when recorded. `pull` fetches records that know more turns than
+  this machine's copy, with their transcripts. Bundles are not pulled.
+- **What has been sent is remembered here, not there.** `~/.loch/pushed/<uri
+  hash>.json` maps each key to the hash of the local bytes last sent, so the
+  remote stays a set of independent objects (no manifest, per "No single
+  index object") and a second push sends only what changed. Losing that file
+  only re-sends. Push sends a bundle before its entries and a record before
+  its file index, the order `save` and the hooks keep, so a push cut short
+  leaves what `reindex` can repair.
+- **A delete on a remote stays deleted.** A tombstone (`tombstones/bundle/
+  <ref>`, `tombstones/session/<agent>/<id>`) is one new key per delete and
+  holds no content. Every push reads them first and sends nothing they cover,
+  so a teammate's copy can't bring a deleted session back. It reads them
+  again afterwards and withdraws what a delete racing it covered, which
+  closes the race in practice but not atomically. Every pull copies them here
+  and forgets loch's copies of what they cover, but never an agent's
+  transcript in its own directory. Being able to delete is why loch uses
+  object storage, so this is stricter than git on purpose. Whether a local
+  tombstone should hold for every remote is to be tested against use.
+- **A remote's keys are someone else's input.** `FileStore` refuses a key
+  with an empty, `.` or `..` segment, and `pull` takes a record only for an
+  agent this build knows, an id `is_safe_session_id` accepts, and contents
+  that name the session and project its key does. Anything else is counted
+  as `refused` and never written.
+- **The remote is never guessed.** A command names a remote or a URI, else
+  `LOCH_REMOTE`, else `LOCH_STORE` (its old meaning, with a warning on
+  stderr in text mode and `"deprecated": "LOCH_STORE"` in JSON), else
+  `origin`, else the only remote. Several remotes and no `origin` is
+  `ambiguous-remote`, since a push to the wrong one publishes transcripts. A
+  URI scheme the store doesn't know is `invalid-uri`: `create_store` reads
+  anything else as a relative path, so `ssh://host` would have become a
+  local directory a push succeeded into. The local store itself is refused
+  as a remote.
+
 ## Empirical findings about Claude Code's storage
 
 These were verified by experiment, not documentation, and are not stable
@@ -483,7 +528,7 @@ binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
-│                 #   blame/log/ask/backfill/gc/hook/help/version
+│                 #   blame/log/ask/backfill/push/pull/remote/gc/hook/help/version
 ├── agent.rs      # the adapter boundary: what loch needs from one agent harness
 ├── claude.rs     # Claude Code adapter: path encoding, discovery, metadata, turns, fork
 ├── codex.rs      # Codex adapter: rollout discovery, live cwd, turns by id, prefix fork
@@ -501,7 +546,9 @@ src/
 ├── output.rs     # result envelope, the two renderers, structured failures
 ├── redact.rs     # secret scrubbing, applied on save before packing
 ├── rewrite.rs    # path rewriting (the load-bearing logic)
-├── store.rs      # Store interface + local-fs backend
+├── store.rs      # Store interface + local-fs backend, the local store
+├── remote.rs     # named remotes in ~/.loch/config, and which one a command means
+├── sync.rs       # push and pull: markers of what was sent, tombstones
 ├── s3.rs         # the S3-compatible backend, SigV4 by hand
 ├── json.rs       # JSON reading and writing, RFC 8785 canonical form
 ├── argparse.rs   # command-line parsing, usage errors and -h
@@ -851,6 +898,12 @@ never a code. The set today:
 | `turn-not-found` | the transcript no longer holds the record a turn ended on |
 | `unknown-agent` | `--agent` named an agent this build doesn't know |
 | `unsupported-agent` | `ask` on a turn whose agent's adapter can't fork or resume |
+| `no-remote` | `push`/`pull` named no remote and none is configured |
+| `ambiguous-remote` | several remotes are configured, none is `origin`, and none was named |
+| `unknown-remote` | no remote by that name |
+| `remote-exists` | `remote add` of a name already taken |
+| `invalid-uri` | a remote URI no store understands, or the local store itself |
+| `config-unreadable` | `~/.loch/config` exists and won't parse (it is never overwritten) |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |

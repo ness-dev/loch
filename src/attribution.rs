@@ -355,20 +355,56 @@ fn local_records() -> Vec<EditRecord> {
 pub fn publish(store: &dyn Store, record: &EditRecord) -> Result<(), StoreError> {
     let body = json::dumps(&record.to_json(), json::COMPACT_UNICODE);
     store.put(&edits_key(&record.agent, &record.session), body.as_bytes())?;
-    for path in record.paths() {
-        let key = index::index_key(
-            FILE,
-            Some(&file_value(&record.project, &path)),
-            &record.session,
-        );
-        let entry =
-            object! {"agent" => record.agent.as_str(), "session" => record.session.as_str()};
-        store.put(
-            &key,
-            json::dumps(&Value::Object(entry), json::DEFAULT).as_bytes(),
-        )?;
+    for (key, entry) in file_entries(record) {
+        store.put(&key, &entry)?;
     }
     Ok(())
+}
+
+/// The file index's entry for each path a record changed, keyed as stored.
+pub fn file_entries(record: &EditRecord) -> Vec<(String, Vec<u8>)> {
+    let entry = object! {"agent" => record.agent.as_str(), "session" => record.session.as_str()};
+    let body = json::dumps(&Value::Object(entry), json::DEFAULT).into_bytes();
+    record
+        .paths()
+        .iter()
+        .map(|path| {
+            (
+                index::index_key(
+                    FILE,
+                    Some(&file_value(&record.project, path)),
+                    &record.session,
+                ),
+                body.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Forgets a session on this machine: the hooks' working copy of its record
+/// and the local store's copy, with its file index. `pull` does this for a
+/// session a remote has tombstoned.
+/// Returns whether there was anything to forget.
+pub fn forget_local(store: &dyn Store, agent: &str, session: &str) -> Result<bool, StoreError> {
+    let key = edits_key(agent, session);
+    let stored = store
+        .get(&key)
+        .ok()
+        .and_then(|data| String::from_utf8(data).ok())
+        .and_then(|text| json::loads(&text).ok())
+        .and_then(|v| EditRecord::from_json(&v));
+    let working = load_local(agent, session);
+    if stored.is_none() && working.is_none() {
+        return Ok(false);
+    }
+    for record in stored.iter().chain(working.iter()) {
+        for (entry, _) in file_entries(record) {
+            store.delete(&entry)?;
+        }
+    }
+    store.delete(&key)?;
+    let _ = fs::remove_file(local_path(agent, session));
+    Ok(true)
 }
 
 /// Every edit record that changed `path` in `project`: the store's, by its

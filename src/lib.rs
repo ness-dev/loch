@@ -27,5 +27,6 @@ pub mod rewrite;
 pub mod s3;
 pub mod snapshot;
 pub mod store;
+pub mod sync;
 pub mod sys;
 pub mod trace;

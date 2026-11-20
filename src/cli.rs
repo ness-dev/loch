@@ -15,10 +15,11 @@ use crate::object;
 use crate::output::{fail, CommandError, Outcome, JSON_FLAG};
 use crate::py;
 use crate::redact;
-use crate::remote::{self, RemoteError};
+use crate::remote::{self, Remote, RemoteError};
 use crate::rewrite::{self, ForeignCwd, RewriteSpec};
 use crate::snapshot;
 use crate::store::{create_store, resolve_store_uri, Store, StoreError};
+use crate::sync::{self, SyncError};
 use crate::sys;
 use crate::trace::{self, Link, Resolver, TraceError};
 use std::collections::HashMap;
@@ -1714,6 +1715,125 @@ pub fn command_backfill(argv: &[String]) -> Run {
     ))
 }
 
+// -- push / pull ----------------------------------------------------------------------
+
+fn sync_error(remote: &Remote, error: SyncError) -> Failure {
+    match error {
+        SyncError::Store(e) => store_error(&format!("could not reach {}", remote.label()), e),
+        SyncError::Redaction(message) => {
+            Failure::Error(CommandError::new("redaction-failed", message))
+        }
+    }
+}
+
+/// The remote a command named, opened, and refused if it is this machine's
+/// own store: pushing there would mark everything sent and send nothing.
+fn open_remote(asked: Option<&str>) -> std::result::Result<(Remote, Box<dyn Store>), Failure> {
+    let remote = remote::resolve(asked).map_err(remote_error)?;
+    let opened = remote.open().map_err(remote_error)?;
+    if sys::abspath(remote.uri.trim_start_matches("file://"))
+        == sys::abspath(&crate::store::default_store())
+    {
+        return err(
+            "invalid-uri",
+            format!("{} is this machine's own store, not a remote", remote.uri),
+        );
+    }
+    Ok((remote, opened))
+}
+
+/// The project a sync covers: the one `--cwd` (or the current directory) is
+/// in, or every project with `--all`.
+fn sync_scope(args: &crate::argparse::Args) -> Option<String> {
+    if args.flag("all") {
+        return None;
+    }
+    let cwd = args
+        .str("cwd")
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(sys::getcwd);
+    Some(attribution::project_id(&snapshot::workspace_root(&cwd)))
+}
+
+fn with_remote(mut payload: crate::json::Map, remote: &Remote) -> crate::json::Map {
+    payload.insert("remote".into(), remote.payload());
+    if remote.deprecated {
+        payload.insert("deprecated".into(), Value::str("LOCH_STORE"));
+    }
+    payload
+}
+
+pub fn command_push(argv: &[String]) -> Run {
+    let mut p = parser("push");
+    p.positional("remote", Nargs::Optional)
+        .option("--cwd")
+        .flag("--all", None)
+        .flag("--dry-run", None);
+    let args = p.parse(argv)?;
+    let (remote, opened) = open_remote(args.str("remote").as_deref())?;
+    let project = sync_scope(&args);
+    let local = crate::store::local_store();
+    let mut report = sync::PushReport::new(args.flag("dry_run"));
+    let result = sync::push(
+        &local,
+        opened.as_ref(),
+        &remote.uri,
+        project.as_deref(),
+        &mut report,
+    );
+    let mut payload = report.payload();
+    payload.insert("project".into(), Value::opt_str(project.as_deref()));
+    let payload = with_remote(payload, &remote);
+    if let Err(error) = result {
+        return Err(match sync_error(&remote, error) {
+            Failure::Error(mut failure) => {
+                failure.payload = payload;
+                Failure::Error(failure)
+            }
+            other => other,
+        });
+    }
+    let mut outcome = Outcome::with(
+        "push",
+        payload,
+        format!("{}: {}", remote.label(), report.text()),
+    );
+    outcome.warnings.extend(remote.warning());
+    Ok(outcome)
+}
+
+pub fn command_pull(argv: &[String]) -> Run {
+    let mut p = parser("pull");
+    p.positional("remote", Nargs::Optional)
+        .option("--cwd")
+        .flag("--all", None);
+    let args = p.parse(argv)?;
+    let (remote, opened) = open_remote(args.str("remote").as_deref())?;
+    let project = sync_scope(&args);
+    let local = crate::store::local_store();
+    let mut report = sync::PullReport::default();
+    let result = sync::pull(&local, opened.as_ref(), project.as_deref(), &mut report);
+    let mut payload = report.payload();
+    payload.insert("project".into(), Value::opt_str(project.as_deref()));
+    let payload = with_remote(payload, &remote);
+    if let Err(error) = result {
+        return Err(match sync_error(&remote, error) {
+            Failure::Error(mut failure) => {
+                failure.payload = payload;
+                Failure::Error(failure)
+            }
+            other => other,
+        });
+    }
+    let mut outcome = Outcome::with(
+        "pull",
+        payload,
+        format!("{}: {}", remote.label(), report.text()),
+    );
+    outcome.warnings.extend(remote.warning());
+    Ok(outcome)
+}
+
 // -- remote ---------------------------------------------------------------------------
 
 fn remote_error(error: RemoteError) -> Failure {
@@ -1862,6 +1982,8 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "hook" => command_hook(argv),
         "gc" => command_gc(argv),
         "remote" => command_remote(argv),
+        "push" => command_push(argv),
+        "pull" => command_pull(argv),
         "backfill" => command_backfill(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),

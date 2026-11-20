@@ -18,6 +18,11 @@ Usage:
   loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
   loch backfill [--cwd <path>]
                                   attribute turns from before the hooks
+  loch push    [<remote>] [--all] [--cwd <path>] [--dry-run]
+                                  send this project's records, transcripts
+                                  and every saved bundle to a remote
+  loch pull    [<remote>] [--all] [--cwd <path>]
+                                  fetch this project's records and transcripts
   loch remote  [list] | add <name> <uri> | remove <name>
                                   the stores push and pull reach (~/.loch/config)
   loch gc                         delete snapshots nothing needs (the hooks
@@ -35,7 +40,12 @@ Stores:
   <path>              local directory
   s3://bucket/prefix  any S3-compatible endpoint
 
+A remote is a name from `loch remote` or a URI. Without one, push and pull
+take LOCH_REMOTE, then `origin`, then the only remote there is. Transcripts are
+redacted on the way out; blame, log and ask read only what is here.
+
 Environment:
+  LOCH_REMOTE       the remote push and pull use, ahead of the configured one
   LOCH_STORE        default store URI
   SOURCE_DATE_EPOCH fixed createdAt for save, so a bundle is reproducible
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)

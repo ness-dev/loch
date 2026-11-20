@@ -344,6 +344,11 @@ formatter re-indenting a turn's code doesn't sever the link.
   it is `git:` plus the repository's root commit (the smallest, if there are
   several): read once, and immune to anything later history does. Anywhere
   else it is `dir:` plus the root's directory name, which is weaker.
+- **`root`** is the worktree the session worked in, and paths are relative to
+  it. It is informational, since matching is by `project` and path: a turn
+  written in any worktree of a repository blames in every other one once its
+  lines arrive there. A root may name a directory that no longer exists,
+  which is how a removed worktree's history survives.
 
 **Store layout:**
 

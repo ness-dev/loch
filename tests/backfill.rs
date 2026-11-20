@@ -132,7 +132,13 @@ impl World {
 
     /// A transcript as Claude Code files it, from (record) lines.
     fn transcript(&self, session: &str, records: &[String]) -> PathBuf {
-        let encoded: String = s(&self.repo)
+        self.transcript_in(&self.repo, session, records)
+    }
+
+    /// A transcript filed under `cwd`, as Claude Code files a session
+    /// started there.
+    fn transcript_in(&self, cwd: &Path, session: &str, records: &[String]) -> PathBuf {
+        let encoded: String = s(cwd)
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
@@ -144,11 +150,15 @@ impl World {
     }
 
     fn prompt(&self, session: &str, uuid: &str, at: &str, text: &str) -> String {
+        self.prompt_in(&self.repo, session, uuid, at, text)
+    }
+
+    fn prompt_in(&self, cwd: &Path, session: &str, uuid: &str, at: &str, text: &str) -> String {
         format!(
             r#"{{"type": "user", "uuid": "{}", "sessionId": "{}", "cwd": "{}", "timestamp": "{}", "message": {{"role": "user", "content": "{}"}}}}"#,
             uuid,
             session,
-            s(&self.repo),
+            s(cwd),
             at,
             text
         )
@@ -173,6 +183,46 @@ impl World {
             name,
             input
         )
+    }
+
+    /// A successful `Write` of `text` to `file`, made from `cwd`.
+    fn write_call(
+        &self,
+        cwd: &Path,
+        session: &str,
+        n: usize,
+        file: &Path,
+        text: &str,
+    ) -> Vec<String> {
+        let at = |s: usize| format!("2026-08-01T00:{:02}:{:02}Z", n, s);
+        let input = format!(
+            r#"{{"file_path": "{}", "content": {}}}"#,
+            s(file),
+            json::dumps(&Value::Str(text.to_string()), json::DEFAULT)
+        );
+        let swap = |line: String| {
+            line.replace(
+                &format!("\"cwd\": \"{}\"", s(&self.repo)),
+                &format!("\"cwd\": \"{}\"", s(cwd)),
+            )
+        };
+        vec![
+            swap(self.tool(
+                session,
+                &format!("a{}", n),
+                &at(1),
+                &format!("t{}", n),
+                "Write",
+                &input,
+            )),
+            swap(self.result(
+                session,
+                &format!("r{}", n),
+                &at(2),
+                &format!("t{}", n),
+                false,
+            )),
+        ]
     }
 
     fn result(&self, session: &str, uuid: &str, at: &str, id: &str, error: bool) -> String {
@@ -435,5 +485,195 @@ fn blame_follows_a_file_through_a_rename() {
     assert_eq!(
         owners(&w.loch(&["blame", "new_name.rs"], "")),
         vec![some("write it")]
+    );
+}
+
+fn sessions(result: &Value) -> Vec<(String, String)> {
+    result
+        .get("sessions")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s.get("session").unwrap().as_str().unwrap().to_string(),
+                s.get("root").unwrap().as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+const FEATURE: &str = "def configure_feature(options):\n    threshold = options.get('threshold', 10)\n    enabled_flags = [f for f in options['flags'] if f]\n    return build_feature(threshold, enabled_flags)\n\ndef build_feature(threshold, flags):\n    return {'threshold': threshold, 'flags': flags}\n";
+
+#[test]
+fn a_session_in_a_sibling_worktree_is_backfilled_from_the_main_checkout() {
+    let w = World::new();
+    // Nowhere near a `<repo>-worktrees` directory: git's list is what counts.
+    let tree = w.root.join("elsewhere/feature-tree");
+    w.git(&["worktree", "add", "-q", "-b", "feature", &s(&tree)]);
+    let file = tree.join("wt.py");
+    fs::write(&file, FEATURE).unwrap();
+    let mut records =
+        vec![w.prompt_in(&tree, ONE, "p1", "2026-08-01T00:00:00Z", "add the feature")];
+    records.extend(w.write_call(&tree, ONE, 1, &file, FEATURE));
+    w.transcript_in(&tree, ONE, &records);
+    w.git(&["-C", &s(&tree), "add", "wt.py"]);
+    w.git(&["-C", &s(&tree), "commit", "-q", "-m", "feature"]);
+    w.git(&["merge", "-q", "feature"]);
+
+    let result = w.loch(&["backfill"], "");
+    assert_eq!(sessions(&result), vec![(ONE.to_string(), s(&tree))]);
+    let lines = owners(&w.loch(&["blame", "wt.py"], ""));
+    assert!(
+        lines.iter().all(|l| l == &some("add the feature")),
+        "{:?}",
+        lines
+    );
+}
+
+#[test]
+fn a_removed_worktree_is_recognized_by_what_it_wrote_and_its_paths_are_made_relative_to_it() {
+    let w = World::new();
+    // A branch-shaped, nested path, and a session whose cwd is a
+    // subdirectory of it: the root has to be found, not assumed.
+    let tree = w.root.join("trees/feat/remove-me");
+    w.git(&["worktree", "add", "-q", "-b", "feat/remove-me", &s(&tree)]);
+    let sub = tree.join("src");
+    let file = sub.join("feature.py");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(&file, FEATURE).unwrap();
+    let mut records = vec![w.prompt_in(&sub, ONE, "p1", "2026-08-01T00:00:00Z", "build it")];
+    records.extend(w.write_call(&sub, ONE, 1, &file, FEATURE));
+    w.transcript_in(&tree, ONE, &records);
+    w.git(&["-C", &s(&tree), "add", "-A"]);
+    w.git(&["-C", &s(&tree), "commit", "-q", "-m", "feature"]);
+    // Squash-merged, then the worktree and its branch are gone.
+    w.git(&["merge", "-q", "--squash", "feat/remove-me"]);
+    w.git(&["commit", "-q", "-m", "feature (#12)"]);
+    w.git(&["worktree", "remove", "--force", &s(&tree)]);
+    w.git(&["branch", "-q", "-D", "feat/remove-me"]);
+    assert!(!tree.exists());
+
+    let result = w.loch(&["backfill"], "");
+    assert_eq!(sessions(&result), vec![(ONE.to_string(), s(&tree))]);
+    let record = json::loads(
+        &fs::read_to_string(
+            w.home
+                .join(".loch/edits/claude-code")
+                .join(format!("{}.json", ONE)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let text = json::dumps(&record, json::DEFAULT);
+    assert!(text.contains("\"src/feature.py\""), "{}", text);
+    let lines = owners(&w.loch(&["blame", "src/feature.py"], ""));
+    assert!(lines.iter().all(|l| l == &some("build it")), "{:?}", lines);
+}
+
+#[test]
+fn another_repository_s_sessions_are_not_picked_up() {
+    let w = World::new();
+    w.write("shared.py", FEATURE);
+    w.git(&["add", "shared.py"]);
+    w.git(&["commit", "-q", "-m", "shared"]);
+
+    // A live checkout of an unrelated repository, writing the very same text
+    // at the very same path: it is that repository's, whatever it wrote.
+    let other = w.root.join("other");
+    fs::create_dir_all(&other).unwrap();
+    w.git(&["-C", &s(&other), "init", "-q", "-b", "main"]);
+    let mut records = vec![w.prompt_in(&other, ONE, "p1", "2026-08-01T00:00:00Z", "other repo")];
+    records.extend(w.write_call(&other, ONE, 1, &other.join("shared.py"), FEATURE));
+    w.transcript_in(&other, ONE, &records);
+
+    // A directory that is gone, which wrote a path this repository has but
+    // none of the text it holds there.
+    let gone = w.root.join("gone/project");
+    let unrelated =
+        "print('an entirely different program')\nraise SystemExit('nothing in common here')\n";
+    let mut records = vec![w.prompt_in(&gone, TWO, "p1", "2026-08-01T00:00:00Z", "gone repo")];
+    records.extend(w.write_call(&gone, TWO, 1, &gone.join("shared.py"), unrelated));
+    w.transcript_in(&gone, TWO, &records);
+
+    let result = w.loch(&["backfill"], "");
+    assert_eq!(sessions(&result), vec![]);
+    assert_eq!(
+        owners(&w.loch(&["blame", "shared.py"], "")),
+        vec![None; FEATURE.lines().count()]
+    );
+}
+
+#[test]
+fn a_removed_worktree_nested_inside_the_main_checkout_is_recognized() {
+    let w = World::new();
+    // Claude Code's own layout: the gone directory's nearest checkout is the
+    // main one, which must be its floor rather than its root.
+    let tree = w.repo.join(".claude/worktrees/nested");
+    w.git(&["worktree", "add", "-q", "-b", "nested", &s(&tree)]);
+    let file = tree.join("nested.py");
+    fs::write(&file, FEATURE).unwrap();
+    let mut records = vec![w.prompt_in(&tree, ONE, "p1", "2026-08-01T00:00:00Z", "nest it")];
+    records.extend(w.write_call(&tree, ONE, 1, &file, FEATURE));
+    w.transcript_in(&tree, ONE, &records);
+    w.git(&["-C", &s(&tree), "add", "nested.py"]);
+    w.git(&["-C", &s(&tree), "commit", "-q", "-m", "nested"]);
+    w.git(&["merge", "-q", "nested"]);
+    w.git(&["worktree", "remove", "--force", &s(&tree)]);
+    w.git(&["branch", "-q", "-D", "nested"]);
+    assert!(!tree.exists());
+
+    let result = w.loch(&["backfill"], "");
+    assert_eq!(sessions(&result), vec![(ONE.to_string(), s(&tree))]);
+    let lines = owners(&w.loch(&["blame", "nested.py"], ""));
+    assert!(lines.iter().all(|l| l == &some("nest it")), "{:?}", lines);
+}
+
+#[test]
+fn two_roots_with_equal_evidence_decide_nothing() {
+    let w = World::new();
+    // The repository holds the same text at `f.py` and `a/f.py`, so a gone
+    // `<x>/a/f.py` fits a root at `<x>` exactly as well as one at `<x>/a`.
+    w.write("f.py", FEATURE);
+    w.write("a/f.py", FEATURE);
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "twice"]);
+    let gone = w.root.join("gone/x/a");
+    let mut records = vec![w.prompt_in(&gone, ONE, "p1", "2026-08-01T00:00:00Z", "which root")];
+    records.extend(w.write_call(&gone, ONE, 1, &gone.join("f.py"), FEATURE));
+    w.transcript_in(&gone, ONE, &records);
+
+    assert_eq!(sessions(&w.loch(&["backfill"], "")), vec![]);
+    // With one of the two gone, the same evidence decides.
+    w.git(&["rm", "-q", "f.py"]);
+    w.git(&["commit", "-q", "-m", "once"]);
+    assert_eq!(
+        sessions(&w.loch(&["backfill"], "")),
+        vec![(ONE.to_string(), s(&w.root.join("gone/x")))]
+    );
+}
+
+#[test]
+fn a_directory_that_still_exists_outside_any_checkout_is_not_a_former_worktree() {
+    let w = World::new();
+    w.write("shared.py", FEATURE);
+    w.git(&["add", "shared.py"]);
+    w.git(&["commit", "-q", "-m", "shared"]);
+    // A plain copy of the text, in a directory that is there and is no
+    // checkout: it is what it is, however much it matches.
+    let scratch = w.root.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    fs::write(scratch.join("shared.py"), FEATURE).unwrap();
+    let mut records = vec![w.prompt_in(&scratch, ONE, "p1", "2026-08-01T00:00:00Z", "scratch")];
+    records.extend(w.write_call(&scratch, ONE, 1, &scratch.join("shared.py"), FEATURE));
+    w.transcript_in(&scratch, ONE, &records);
+
+    assert_eq!(sessions(&w.loch(&["backfill"], "")), vec![]);
+    // Gone, the same session would have been a former worktree.
+    fs::remove_dir_all(&scratch).unwrap();
+    assert_eq!(
+        sessions(&w.loch(&["backfill"], "")),
+        vec![(ONE.to_string(), s(&scratch))]
     );
 }

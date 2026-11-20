@@ -346,6 +346,10 @@ pub fn find_transcript(
     session_id: &str,
     store: Option<&dyn Store>,
 ) -> Result<Option<String>, StoreError> {
+    // The id comes from an edit record, which a shared store also supplies.
+    if !crate::agent::is_safe_session_id(session_id) {
+        return Ok(None);
+    }
     if let Some(path) = rollout_for(session_id) {
         return Ok(Some(path));
     }

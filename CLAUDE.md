@@ -928,6 +928,15 @@ stay at 1 and keep their refs, and no ref of a version-2 bundle predates
 the rule, so nothing moved. `Bundle::required_version` decides it, and both
 cases are pinned. Index entries name their first session's agent.
 
+**A bundle's session ids are untrusted input.** Both adapters build the
+restored file's name from the id, and `resumeCommand` puts it in a shell
+line, so an id of `../../x` or `/x` chose where `restore` wrote and `;` what
+the command ran. `agent::is_safe_session_id` (non-empty, `[A-Za-z0-9._-]`,
+no leading `.`, at most 128 bytes) is checked when a bundle is unpacked, so a
+bundle failing it is `bundle-unreadable` as a whole, and by both
+`find_transcript`s, whose ids come from edit records in the same shared
+store. Real ids are UUIDs. The bad id is never echoed back.
+
 **Never the matched text.** Redaction is reported as `{"<rule>": <count>}`
 plus a `redacted` total, exactly as much as the prose summary carries and no
 more — `save`'s stdout lands in the next agent's transcript. The one field

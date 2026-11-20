@@ -918,3 +918,294 @@ fn ask_on_a_turn_of_an_agent_this_build_lacks_is_unsupported() {
     assert_ne!(code, 0);
     assert_eq!(text(&document, "code"), "unsupported-agent");
 }
+
+// -- untrusted bundles ------------------------------------------------------------------
+
+/// A bundle that `restore` is handed came from a shared store, so its
+/// session ids are someone else's input: one shaped like a path must not
+/// decide where a transcript is written.
+fn crafted_bundle(world: &World, agent: &str, session_id: &str) -> String {
+    let repo = s(&world.repo);
+    let transcript = if agent == "codex" {
+        format!(
+            "{{\"timestamp\":\"x\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"timestamp\":\"2026-11-18T10:00:00.000Z\",\"cwd\":\"{}\"}}}}\n",
+            session_id, repo
+        )
+    } else {
+        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", repo)
+    };
+    let bundle = loch::bundle::Bundle {
+        version: 2,
+        agent: agent.into(),
+        created_at: "2026-11-18T10:00:00.000Z".into(),
+        origin: loch::bundle::BundleOrigin {
+            home: s(&world.home),
+            platform: "darwin".into(),
+            hostname: "elsewhere".into(),
+        },
+        sessions: vec![loch::bundle::BundleSession {
+            session_id: session_id.into(),
+            agent: None,
+            agent_version: None,
+            cwd: repo,
+            git_branch: None,
+            claude_version: None,
+            modified_at: "2026-11-18T10:00:00.000Z".into(),
+            transcript,
+        }],
+    };
+    let packed = loch::bundle::pack_bundle(&bundle).unwrap();
+    let reference = loch::bundle::bundle_ref(&packed);
+    let path = world.store.join(format!("bundles/{}.loch", reference));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, packed).unwrap();
+    reference
+}
+
+#[test]
+fn a_session_id_shaped_like_a_path_cannot_place_a_restore() {
+    let world = World::new();
+    let target = world.root.join("escaped");
+    for agent in ["claude-code", "codex"] {
+        for id in [
+            format!("../../../../../../../../../../..{}", s(&target)),
+            s(&target),
+            "a/b".to_string(),
+            "a\\b".to_string(),
+        ] {
+            let reference = crafted_bundle(&world, agent, &id);
+            let (document, code) = world.json(&["restore", &reference]);
+            assert_ne!(code, 0, "{} {}: {:?}", agent, id, document);
+            assert_eq!(
+                text(&document, "code"),
+                "bundle-unreadable",
+                "{} {}",
+                agent,
+                id
+            );
+            assert!(
+                !world.root.join("escaped.jsonl").exists(),
+                "{} {} wrote outside the sessions directory",
+                agent,
+                id
+            );
+            let mut stray = Vec::new();
+            collect_files(&world.root, &mut stray);
+            assert!(
+                stray.iter().all(|p| !s(p).ends_with(".jsonl")),
+                "{} {} wrote {:?}",
+                agent,
+                id,
+                stray
+            );
+        }
+    }
+}
+
+fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, into);
+        } else {
+            into.push(path);
+        }
+    }
+}
+
+// -- SessionEnd under Codex's 3s clamp ---------------------------------------------------
+
+/// Codex kills a `SessionEnd` hook after 3s. `end` closes the open turn
+/// locally — snapshot, diff, the edit record written aside and renamed —
+/// before it touches the store, so a kill during a slow store loses the
+/// store's copy and not the turn. This pins that order, and what the kill
+/// leaves behind: the record on this machine, nothing in the store (no later
+/// hook of an ended session publishes it), and the session's state still
+/// open.
+#[test]
+fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let world = World::new();
+    let repo = s(&world.repo);
+    world.meta(SESSION, &repo, "feat/x");
+    world.begin(SESSION, TURN_A, &repo, 1, "cut short");
+    world.hook(
+        "prompt",
+        &world.event(SESSION, Some(TURN_A), Some("cut short")),
+    );
+    world.sh("echo 'a line written before quitting' > a.txt");
+
+    // A store that accepts and never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let held = std::thread::spawn(move || {
+        let mut open = Vec::new();
+        for stream in listener.incoming().take(1) {
+            open.push(stream);
+        }
+        std::thread::sleep(Duration::from_secs(10));
+        drop(open);
+    });
+    let mut child = world
+        .command(env!("CARGO_BIN_EXE_loch"), &world.repo)
+        .args(["hook", "end", "--agent", "codex"])
+        .env("LOCH_STORE", "s3://sessions")
+        .env("LOCH_S3_ENDPOINT", format!("http://127.0.0.1:{}", port))
+        .env("LOCH_S3_REGION", "us-east-1")
+        .env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(world.event(SESSION, None, None).as_bytes())
+        .unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "end was still waiting on the store at 3s"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(held);
+
+    let local = world
+        .home
+        .join(".loch/edits/codex")
+        .join(format!("{}.json", SESSION));
+    let record = json::loads(&fs::read_to_string(&local).unwrap()).unwrap();
+    let turns = items(&record, "turns");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(text(&turns[0], "promptUuid"), TURN_A);
+    assert_eq!(turns[0].get("interrupted"), Some(&Value::Bool(true)));
+    assert!(!items(&turns[0], "files").is_empty());
+    assert!(
+        world
+            .home
+            .join(".loch/sessions")
+            .join(format!("{}.json", SESSION))
+            .exists(),
+        "the kill came before the state was let go"
+    );
+}
+
+// -- the cwd a fork is rewritten from --------------------------------------------------
+
+/// Codex's TUI compares the latest cwd a rollout records with the directory
+/// it was started in, and asks which to use ("Use session directory" / "Use
+/// current directory") when they differ. A fork cut at a turn from before the
+/// session moved ends on a `turn_context` naming where that turn ran, so it
+/// has to be rewritten from that cwd, not the session's live one: otherwise
+/// the fork names a directory it isn't being resumed in.
+#[test]
+#[ignore = "review finding 3, not fixed: the fork is rewritten from the live cwd"]
+fn a_fork_cut_before_a_move_is_rewritten_from_that_turns_cwd() {
+    let world = World::new();
+    let repo = s(&world.repo);
+    let old = s(&world.root.join("removed-worktree"));
+    world.meta(SESSION, &old, "feat/x");
+    world.begin(SESSION, TURN_A, &old, 1, "make a");
+    world.hook(
+        "prompt",
+        &world.event(SESSION, Some(TURN_A), Some("make a")),
+    );
+    world.sh("echo 'alpha line here' > a.txt");
+    world.finish(SESSION, TURN_A, 1);
+    world.hook("stop", &world.event(SESSION, Some(TURN_A), None));
+    world.turn(TURN_B, 2, "make b", "echo 'bravo line here' > b.txt");
+
+    let ask = world.ok(&["ask", "a.txt:1", "--at-turn", "--no-launch"]);
+    let fork = at(&ask, "fork");
+    assert_eq!(text(fork, "cwd"), repo);
+    let named: Vec<String> = records(Path::new(text(fork, "path")))
+        .iter()
+        .filter(|r| matches!(text(r, "type"), "session_meta" | "turn_context"))
+        .map(|r| text(at(r, "payload"), "cwd").to_string())
+        .collect();
+    assert!(!named.is_empty());
+    assert!(
+        named.iter().all(|cwd| *cwd == repo),
+        "the fork names {:?}, and is resumed in {}",
+        named,
+        repo
+    );
+}
+
+// -- one directory, two spellings ---------------------------------------------------------
+
+/// Codex records `-C` as given and its own cwd resolved, so one session can
+/// name one directory two ways: begun in it (`/private/tmp/x`), resumed with
+/// `-C` through a link (`/tmp/x`). That is not a move.
+#[cfg(unix)]
+fn a_session_through_two_spellings(world: &World) -> String {
+    let link = world.root.join("link-to-repo");
+    std::os::unix::fs::symlink(&world.repo, &link).unwrap();
+    let link = s(&link);
+    let repo = s(&world.repo);
+    world.meta(SESSION, &repo, "feat/x");
+    world.begin(SESSION, TURN_A, &repo, 1, "begun here");
+    world.finish(SESSION, TURN_A, 1);
+    world.begin(
+        SESSION,
+        TURN_B,
+        &link,
+        2,
+        "resumed with -C through the link",
+    );
+    world.finish(SESSION, TURN_B, 2);
+    link
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "review finding 4, not fixed: other_cwds compares cwds unresolved"]
+fn a_second_spelling_of_the_live_cwd_is_not_another_cwd() {
+    let world = World::new();
+    a_session_through_two_spellings(&world);
+    let list = world.ok(&["list", "--agent", "codex"]);
+    let session = &items(&list, "sessions")[0];
+    assert_eq!(
+        text(session, "branch"),
+        "feat/x",
+        "already right: not a move"
+    );
+    assert!(
+        items(session, "otherCwds").is_empty(),
+        "{:?}",
+        items(session, "otherCwds")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "review finding 4, not fixed: only the live cwd's spelling is rewritten"]
+fn both_spellings_of_the_live_cwd_are_restored_into_the_target() {
+    let world = World::new();
+    a_session_through_two_spellings(&world);
+    let reference = text(&world.ok(&["save"]), "ref").to_string();
+    let there = world.elsewhere("b");
+    let restore = there.ok(&["restore", &reference, "--new-id"]);
+    let session = &items(&restore, "sessions")[0];
+    let raw = fs::read_to_string(text(session, "path")).unwrap();
+    assert!(
+        !raw.contains(&s(&world.repo)),
+        "a record still names the origin"
+    );
+    assert!(
+        at(session, "foreignCwds").as_object().unwrap().is_empty(),
+        "{:?}",
+        at(session, "foreignCwds")
+    );
+}

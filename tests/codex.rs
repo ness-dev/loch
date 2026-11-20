@@ -270,8 +270,8 @@ impl World {
 
     fn edit_record(&self) -> Value {
         let path = self
-            .store
-            .join("edits/codex")
+            .home
+            .join(".loch/store/edits/codex")
             .join(format!("{}.json", SESSION));
         json::loads(&fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -1015,15 +1015,14 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
 
 // -- SessionEnd under Codex's 3s clamp ---------------------------------------------------
 
-/// Codex kills a `SessionEnd` hook after 3s. `end` closes the open turn
-/// locally — snapshot, diff, the edit record written aside and renamed —
-/// before it touches the store, so a kill during a slow store loses the
-/// store's copy and not the turn. This pins that order, and what the kill
-/// leaves behind: the record on this machine, nothing in the store (no later
-/// hook of an ended session publishes it), and the session's state still
-/// open.
+/// Codex kills a `SessionEnd` hook after 3s. When hooks published to the
+/// store, a store that hung held `end` past that, and the kill left the
+/// session's last turn on this machine alone with nothing to publish it
+/// later. Hooks now write only the local store, so `end` finishes well inside
+/// the clamp whatever `LOCH_STORE` names, and closes the turn and lets the
+/// session's state go.
 #[test]
-fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
+fn a_session_end_finishes_inside_codex_s_clamp_while_a_remote_hangs() {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
     let world = World::new();
@@ -1039,14 +1038,6 @@ fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
     // A store that accepts and never answers.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let held = std::thread::spawn(move || {
-        let mut open = Vec::new();
-        for stream in listener.incoming().take(1) {
-            open.push(stream);
-        }
-        std::thread::sleep(Duration::from_secs(10));
-        drop(open);
-    });
     let mut child = world
         .command(env!("CARGO_BIN_EXE_loch"), &world.repo)
         .args(["hook", "end", "--agent", "codex"])
@@ -1067,37 +1058,29 @@ fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
         .write_all(world.event(SESSION, None, None).as_bytes())
         .unwrap();
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(3) {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    while started.elapsed() < Duration::from_secs(3) && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "end was still waiting on the store at 3s"
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    drop(held);
+    let finished = child.try_wait().unwrap();
+    if finished.is_none() {
+        child.kill().unwrap();
+    }
+    drop(listener);
+    assert!(finished.is_some(), "end was still running at 3s");
 
-    let local = world
-        .home
-        .join(".loch/edits/codex")
-        .join(format!("{}.json", SESSION));
-    let record = json::loads(&fs::read_to_string(&local).unwrap()).unwrap();
+    let record = world.edit_record();
     let turns = items(&record, "turns");
     assert_eq!(turns.len(), 1);
     assert_eq!(text(&turns[0], "promptUuid"), TURN_A);
     assert_eq!(turns[0].get("interrupted"), Some(&Value::Bool(true)));
     assert!(!items(&turns[0], "files").is_empty());
     assert!(
-        world
+        !world
             .home
             .join(".loch/sessions")
             .join(format!("{}.json", SESSION))
             .exists(),
-        "the kill came before the state was let go"
+        "the session's state was let go"
     );
 }
 

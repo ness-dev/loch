@@ -98,6 +98,15 @@ requirements fixed the rest of the design:
   `SessionEnd`, the third hook — closes it first, marked `interrupted`. Every
   state and record file is written aside and renamed, so a hook killed
   mid-write leaves the old file or the new one, never half of either.
+- **Hooks never touch the network.** They write the edit record, its file
+  index and a copy of the transcript to the local store (`~/.loch/store`,
+  `store::local_store`), whatever `LOCH_STORE` says, and so do `backfill`'s
+  records. `blame`, `log` and `ask` read only that store. Publishing from the
+  hook was the first design, and a remote that didn't answer held every
+  `Stop` for the S3 timeout (`end` took 8.3s against an unreachable bucket),
+  while Codex kills a `SessionEnd` hook at 3s, so the last turn's record
+  never left the machine. Getting records to and from a remote is an explicit
+  step, like git's push and fetch. `hooks_never_wait_on_a_remote` pins it.
 - **No background process.** Snapshots are taken on demand with a stat cache,
   the way git's index works: files whose size and mtime are unchanged aren't
   read again. A harness with no hooks gets coarser attribution, never a
@@ -1117,7 +1126,7 @@ kinds don't justify an async runtime and several MB. The signer is pinned to
 AWS's two published examples (a header-signed GET and a signed query
 string). Listings send `encoding-type=url` and decode the keys, so a key
 with any character survives the XML. A store that doesn't answer fails
-after 20s rather than holding a turn. The tests that need an endpoint are
+after 20s. No hook ever waits on that, since hooks write only locally. The tests that need an endpoint are
 `#[ignore]`d in `tests/store.rs` and `tests/index.rs`, and read it from
 `LOCH_TEST_S3_ENDPOINT` (bucket `LOCH_TEST_S3_BUCKET`, default `sessions`):
 `moto_server` or MinIO will do. moto's verifier rejects correct signatures on
@@ -1222,7 +1231,7 @@ release exists yet.
   generator are attributed to the turn that ran them, with no edit tool
   involved.
 - **History rewrites don't matter.** After a squash, a fresh clone with an
-  empty HOME and only the store in common blames the same lines to the same
+  empty HOME and only a copy of the store blames the same lines to the same
   turns, and finds the transcripts in the store.
 - **A person's text isn't the agent's.** A line someone later rewrote is
   unattributed, a re-indented one keeps its turn, and a person's lone `}` is

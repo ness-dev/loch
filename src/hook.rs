@@ -4,8 +4,9 @@
 //!
 //! `prompt` snapshots the workspace; `stop` snapshots it again and records the
 //! lines the turn added (see `attribution.rs`) in the session's edit record,
-//! and copies the transcript into the store, since Claude Code deletes
-//! transcripts after `cleanupPeriodDays` (30 by default).
+//! and copies the transcript into the local store, since Claude Code deletes
+//! transcripts after `cleanupPeriodDays` (30 by default). Nothing here reaches
+//! a remote; `push` does that.
 //!
 //! **Every turn gets closed by someone.** Claude Code runs no `Stop` when a
 //! turn is cancelled, and a crash runs nothing at all. Left alone, the next
@@ -497,11 +498,14 @@ pub fn run(name: &str, agent_id: &str, scope: Option<Scope>, stdin: &[u8]) {
         },
         Err(Stop) => None,
     };
-    let store = || store::create_store(&store::resolve_store_uri(None)).ok();
+    // Always the local store, whatever `LOCH_STORE` says: the agent waits on
+    // this hook, so it must never wait on the network.
+    let local = store::local_store();
+    let store: Option<&dyn Store> = Some(&local);
     let _ = match name {
-        "prompt" => prompt(agent, &event, store().as_deref()),
-        "stop" => stop(agent, &event, store().as_deref()),
-        "end" => end(agent, &event, store().as_deref()),
+        "prompt" => prompt(agent, &event, store),
+        "stop" => stop(agent, &event, store),
+        "end" => end(agent, &event, store),
         // The tool-call hooks the git-notes design used. A settings file can
         // still name them until `install` is re-run; they do nothing.
         _ => return,

@@ -57,7 +57,7 @@ impl World {
             transcript: home
                 .join(".claude/projects/-repo")
                 .join(format!("{}.jsonl", SESSION)),
-            store: root.join("store"),
+            store: home.join(".loch/store"),
             root,
             home,
             repo,
@@ -88,7 +88,7 @@ impl World {
                 "PATH",
                 format!("{}:/usr/bin:/bin", s(&self.root.join("bin"))),
             )
-            .env("LOCH_STORE", &self.store)
+            .env_remove("LOCH_STORE")
             .env("GIT_CONFIG_GLOBAL", self.root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Test")
@@ -470,9 +470,14 @@ fn the_link_survives_a_squash_and_a_fresh_clone() {
     w.git(&w.repo, &["commit", "-q", "-m", "squashed"]);
     let clone = w.root.join("teammate");
     w.git(&w.root, &["clone", "-q", &s(&w.repo), &s(&clone)]);
-    // Another machine: its own empty HOME, only the store in common.
+    // Another machine: its own HOME, holding only a copy of the store.
     let other_home = w.root.join("other-home");
-    fs::create_dir_all(&other_home).unwrap();
+    fs::create_dir_all(other_home.join(".loch")).unwrap();
+    w.sh(&format!(
+        "cp -R '{}' '{}/.loch/store'",
+        s(&w.store),
+        s(&other_home)
+    ));
     let out = w
         .command(env!("CARGO_BIN_EXE_loch"), &clone)
         .args(["blame", "calc.py", "--json"])
@@ -603,6 +608,53 @@ fn hooks_never_fail_and_never_print() {
         assert!(out.status.success(), "{} {}", name, stdin);
         assert!(out.stdout.is_empty() && out.stderr.is_empty());
     }
+}
+
+/// A remote that accepts connections and never answers, as a hung S3 does.
+fn hung_remote() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    (listener, endpoint)
+}
+
+#[test]
+fn hooks_never_wait_on_a_remote() {
+    let mut w = World::new(true);
+    let (_listener, endpoint) = hung_remote();
+    w.prompt("p1", "write it");
+    w.write("a.py", "written_while_the_remote_hangs = 1\n");
+    w.record(format!(
+        r#"{{"type": "assistant", "uuid": "p1-end", "parentUuid": "p1", "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:01:30.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "done"}}]}}}}"#,
+        SESSION,
+        s(&w.repo)
+    ));
+    let started = std::time::Instant::now();
+    for name in ["stop", "end"] {
+        let mut child = w
+            .command(env!("CARGO_BIN_EXE_loch"), &w.repo)
+            .args(["hook", name])
+            .env("LOCH_STORE", "s3://bucket/prefix")
+            .env("LOCH_S3_ENDPOINT", &endpoint)
+            .env("AWS_ACCESS_KEY_ID", "test")
+            .env("AWS_SECRET_ACCESS_KEY", "test")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(w.event().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(owners(&w.json(&["blame", "a.py"]))[0].is_some());
+    assert!(w.store.join("transcripts/claude-code").is_dir());
 }
 
 #[test]

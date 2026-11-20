@@ -1080,8 +1080,10 @@ pub fn command_install(argv: &[String]) -> Run {
 
 // -- blame / log / ask -------------------------------------------------------------
 
-fn store_or_none(uri: Option<&str>) -> Option<Box<dyn Store>> {
-    create_store(&resolve_store_uri(uri)).ok()
+/// The local store, which is all `blame`, `log`, `ask` and `backfill` read
+/// or write: a remote's records arrive by `pull`, as git's do by `fetch`.
+fn local() -> Option<Box<dyn Store>> {
+    Some(Box::new(crate::store::local_store()))
 }
 
 fn flat(text: &str, limit: usize) -> String {
@@ -1292,11 +1294,10 @@ pub fn command_blame(argv: &[String]) -> Run {
     p.positional("file", Nargs::One)
         .option_optional("--html", "", "PATH")
         .option_metavar("--lines", "RANGES")
-        .flag("--no-open", None)
-        .option("--store");
+        .flag("--no-open", None);
     let args = p.parse(argv)?;
     let file = args.str("file").unwrap_or_default();
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
 
     // One mark per turn, handed out in order of first appearance in the file,
@@ -1437,10 +1438,10 @@ fn line_target(target: &str) -> std::result::Result<(String, Option<(usize, usiz
 
 pub fn command_log(argv: &[String]) -> Run {
     let mut p = parser("log");
-    p.positional("target", Nargs::One).option("--store");
+    p.positional("target", Nargs::One);
     let args = p.parse(argv)?;
     let (file, lines) = line_target(&args.str("target").unwrap_or_default())?;
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
     if let Some((_, last)) = lines {
         if last > blamed.owners.len() {
@@ -1514,8 +1515,7 @@ pub fn command_ask(argv: &[String]) -> Run {
     p.positional("target", Nargs::One)
         .positional("question", Nargs::Optional)
         .flag("--at-turn", None)
-        .flag("--no-launch", None)
-        .option("--store");
+        .flag("--no-launch", None);
     let args = p.parse(argv)?;
     let as_json = json_requested();
     let target = args.str("target").unwrap_or_default();
@@ -1523,7 +1523,7 @@ pub fn command_ask(argv: &[String]) -> Run {
         (file, Some((line, _))) => (file, line),
         (_, None) => return err("usage", format!("{} is not <file>:<line>", target)),
     };
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
     if line > blamed.owners.len() {
         return err(
@@ -1551,7 +1551,7 @@ pub fn command_ask(argv: &[String]) -> Run {
         return err(
             "transcript-missing",
             format!(
-                "session {} wrote it, but its transcript is neither in {} nor in the store",
+                "session {} wrote it, but its transcript is neither in {} nor in the local store",
                 link.session_id,
                 adapter.sessions_dir()
             ),
@@ -1667,14 +1667,14 @@ fn exec_agent(root: &str, command: &[String]) -> Run {
 /// transcripts' edit calls and the commits the agent made.
 pub fn command_backfill(argv: &[String]) -> Run {
     let mut p = parser("backfill");
-    p.option("--cwd").option("--store");
+    p.option("--cwd");
     let args = p.parse(argv)?;
     let cwd = args
         .str("cwd")
         .filter(|c| !c.is_empty())
         .unwrap_or_else(sys::getcwd);
     let root = snapshot::workspace_root(&cwd);
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let results = crate::backfill::backfill(&cwd, store.as_deref());
     let mut text = String::new();
     for r in &results {

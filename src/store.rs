@@ -136,6 +136,14 @@ pub fn default_store() -> String {
     sys::join(&sys::join(&home_dir(), ".loch"), "store")
 }
 
+/// This machine's own store, which the hooks, `backfill`, `blame`, `log` and
+/// `ask` use and nothing else. They never reach the network: a remote that
+/// doesn't answer would hold a turn for its timeout, and Codex kills a
+/// `SessionEnd` hook at 3s.
+pub fn local_store() -> FileStore {
+    FileStore::new(default_store())
+}
+
 pub fn resolve_store_uri(explicit: Option<&str>) -> String {
     if let Some(uri) = explicit {
         return uri.to_string();

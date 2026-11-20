@@ -18,6 +18,8 @@ Usage:
   loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
   loch backfill [--cwd <path>]
                                   attribute turns from before the hooks
+  loch remote  [list] | add <name> <uri> | remove <name>
+                                  the stores push and pull reach (~/.loch/config)
   loch gc                         delete snapshots nothing needs (the hooks
                                   also do this every 50 snapshots)
   loch hook    prompt | stop | end [--agent <id>]   (run by the agent's harness)

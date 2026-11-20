@@ -22,6 +22,7 @@ pub mod json;
 pub mod output;
 pub mod py;
 pub mod redact;
+pub mod remote;
 pub mod rewrite;
 pub mod s3;
 pub mod snapshot;

@@ -15,6 +15,7 @@ use crate::object;
 use crate::output::{fail, CommandError, Outcome, JSON_FLAG};
 use crate::py;
 use crate::redact;
+use crate::remote::{self, RemoteError};
 use crate::rewrite::{self, ForeignCwd, RewriteSpec};
 use crate::snapshot;
 use crate::store::{create_store, resolve_store_uri, Store, StoreError};
@@ -1713,6 +1714,96 @@ pub fn command_backfill(argv: &[String]) -> Run {
     ))
 }
 
+// -- remote ---------------------------------------------------------------------------
+
+fn remote_error(error: RemoteError) -> Failure {
+    let mut failure = CommandError::new(error.code, error.message);
+    if error.code == "usage" {
+        failure.exit_status = 2;
+    }
+    Failure::Error(failure)
+}
+
+/// `remote [list]`, `remote add <name> <uri>`, `remote remove <name>`.
+pub fn command_remote(argv: &[String]) -> Run {
+    let (sub, rest) = match argv.split_first() {
+        Some((sub, rest)) if !sub.starts_with('-') => (sub.as_str(), rest),
+        _ => ("list", argv),
+    };
+    match sub {
+        "add" => {
+            let mut p = parser("remote add");
+            p.positional("name", Nargs::One)
+                .positional("uri", Nargs::One);
+            let args = p.parse(rest)?;
+            let added = remote::add(
+                &args.str("name").unwrap_or_default(),
+                &args.str("uri").unwrap_or_default(),
+            )
+            .map_err(remote_error)?;
+            Ok(Outcome::with(
+                "remote",
+                object! {"action" => "add", "remote" => added.payload()},
+                format!("added remote {} {}\n", added.label(), added.uri),
+            ))
+        }
+        "remove" => {
+            let mut p = parser("remote remove");
+            p.positional("name", Nargs::One);
+            let args = p.parse(rest)?;
+            let removed =
+                remote::remove(&args.str("name").unwrap_or_default()).map_err(remote_error)?;
+            Ok(Outcome::with(
+                "remote",
+                object! {"action" => "remove", "remote" => removed.payload()},
+                format!("removed remote {} {}\n", removed.label(), removed.uri),
+            ))
+        }
+        "list" => {
+            parser("remote list").parse(rest)?;
+            let remotes = remote::remotes().map_err(remote_error)?;
+            let default = remote::default_name(&remotes);
+            let mut text = String::new();
+            for (name, uri) in &remotes {
+                let marker = if default.as_deref() == Some(name) {
+                    "  (default)"
+                } else {
+                    ""
+                };
+                text.push_str(&format!(
+                    "{}  {}{}\n",
+                    name,
+                    uri.as_str().unwrap_or_default(),
+                    marker
+                ));
+            }
+            if remotes.is_empty() {
+                text.push_str("no remotes; `loch remote add origin <uri>`\n");
+            }
+            Ok(Outcome::with(
+                "remote",
+                object! {
+                    "action" => "list",
+                    "remotes" => remotes.iter().map(|(name, uri)| Value::Object(object! {
+                        "name" => name.as_str(),
+                        "uri" => uri.clone(),
+                    })).collect::<Vec<_>>(),
+                    "default" => Value::opt_str(default.as_deref()),
+                },
+                text,
+            ))
+        }
+        other => {
+            let mut error = CommandError::new(
+                "usage",
+                format!("unknown remote action {:?} (add, remove, list)", other),
+            );
+            error.exit_status = 2;
+            Err(Failure::Error(error))
+        }
+    }
+}
+
 // -- gc ------------------------------------------------------------------------------
 
 /// Deletes the snapshots nothing needs: the hooks do this on their own every
@@ -1770,6 +1861,7 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "log" => command_log(argv),
         "hook" => command_hook(argv),
         "gc" => command_gc(argv),
+        "remote" => command_remote(argv),
         "backfill" => command_backfill(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),

@@ -363,8 +363,15 @@ pub fn applies(scope: Option<Scope>, event: &Map) -> bool {
 }
 
 /// How long after one hook has handled an event a byte-identical one is taken
-/// to be the same event, seen by another hook.
-const DUPLICATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// to be the same event, seen by another hook. Those start within
+/// milliseconds of each other and, having waited on the lock, read the time
+/// the first wrote as it let go. A genuine repeat follows a model round trip,
+/// which is seconds, so a wider window could only drop real events.
+const DUPLICATE_WINDOW_MS: u64 = 2_000;
+
+fn now_ms() -> u64 {
+    (sys::now() * 1000.0) as u64
+}
 
 fn events_dir() -> PathBuf {
     snapshot::loch_home().join("events")
@@ -446,7 +453,7 @@ pub fn claim(session: &str, name: &str, stdin: &[u8], transcript: Option<&str>) 
         .split_once(' ')
         .filter(|(last, _)| *last == digest)
         .and_then(|(_, at)| at.trim().parse::<u64>().ok())
-        .is_some_and(|at| (sys::now() as u64).saturating_sub(at) < DUPLICATE_WINDOW.as_secs());
+        .is_some_and(|at| now_ms().saturating_sub(at) < DUPLICATE_WINDOW_MS);
     if recent {
         Claimed::Handled
     } else {
@@ -462,7 +469,7 @@ impl Claim {
         use std::io::{Seek, Write};
         let _ = self.file.set_len(0);
         let _ = self.file.seek(std::io::SeekFrom::Start(0));
-        let _ = write!(self.file, "{} {}", self.digest, (sys::now() as u64));
+        let _ = write!(self.file, "{} {}", self.digest, now_ms());
     }
 }
 

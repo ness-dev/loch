@@ -132,7 +132,7 @@ project trusted in `config.toml` (`[projects."<path>"] trust_level =
   `prompt` closing the first's turn as an empty interruption. Each event's
   hooks get byte-identical stdin, so `hook::claim` takes a per-session lock
   (`~/.loch/events/<session>.last`), and a hook handed the same event that
-  another finished handling within 10s does nothing. An event is the hook's
+  another finished handling within 2s (timed in milliseconds) does nothing. An event is the hook's
   name, its payload and its transcript's length. The payload alone can
   repeat: Claude Code stopping twice for one prompt sends identical bytes,
   which the first version of this took for a duplicate, losing the second
@@ -140,7 +140,10 @@ project trusted in `config.toml` (`[projects."<path>"] trust_level =
   agent waits on these hooks, so every hook for an event sees the same
   transcript, and a genuine second event follows output that grew it.
   `UserPromptSubmit` also carries a `prompt_id`, and Codex's events a
-  `turn_id`. A lock that can't be taken
+  `turn_id`. The window is narrow because duplicates read the claim within
+  milliseconds of its being written, while a genuine repeat that hashes the
+  same (a second `Stop` before the transcript is flushed) follows a model
+  round trip. A wider window could only drop such an event. A lock that can't be taken
   handles the event anyway, since a duplicate record beats a lost turn.
 - **The first design guessed, and the guess could lose turns.** It had a
   wider scope's hook step aside when a narrower file held loch's hook "and

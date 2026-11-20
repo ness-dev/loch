@@ -1086,3 +1086,22 @@ fn install_removes_a_second_claude_loch_line() {
     assert_eq!(stop[1].get("hooks").unwrap().as_array().unwrap().len(), 1);
     assert_eq!(first_command(&stop[1]), "theirs");
 }
+
+/// A genuine second `Stop` can arrive with the same payload and the transcript
+/// not yet grown. Past the window it is an event of its own, not another
+/// hook's copy of the first, and its edits are the turn's.
+#[test]
+fn an_identical_stop_after_the_duplicate_window_is_handled() {
+    let mut w = World::new(true);
+    w.prompt("p1", "two steps");
+    w.write("a.py", "first = 1\n");
+    w.stop("p1");
+    w.write("a.py", "first = 1\nsecond = 2\n");
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
+    assert!(out.status.success());
+    assert_eq!(
+        owners(&w.json(&["blame", "a.py"])),
+        vec![some("two steps"); 2]
+    );
+}

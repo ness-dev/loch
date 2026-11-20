@@ -116,8 +116,15 @@ fn write_remotes(remotes: Map) -> Result<(), RemoteError> {
     })
 }
 
+/// A bundle ref: 64 lowercase hex digits. No remote may be named like one,
+/// so `delete --remote <ref>` can be read the way it was meant.
+pub fn looks_like_ref(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
+        && !looks_like_ref(name)
         && !name.starts_with('-')
         && name
             .chars()

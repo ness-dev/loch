@@ -2,12 +2,12 @@ loch — save and restore agent coding sessions across machines
 
 Usage:
   loch list    [--cwd <path>] [--branch <name>] [--agent <id>]
-  loch list    --remote [--branch <name>] [--all] [--store <uri>]
+  loch list    --saved | --remote [<remote>] [--branch <name>] [--all]
   loch save    [--cwd <path>] [--branch <name>] [--session <id>] [--agent <id>]
-               [--store <uri>]
-  loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
-  loch delete  <ref> [--store <uri>]
-  loch reindex [--store <uri>]
+               [--push [<remote>]]
+  loch restore <ref> [--into <path>] [--remote <remote>] [--force] [--new-id]
+  loch delete  <ref> | --session <id> [--agent <id>] [--remote [<remote>]]
+  loch reindex [--remote [<remote>]]
   loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
@@ -40,13 +40,19 @@ Stores:
   <path>              local directory
   s3://bucket/prefix  any S3-compatible endpoint
 
-A remote is a name from `loch remote` or a URI. Without one, push and pull
-take LOCH_REMOTE, then `origin`, then the only remote there is. Transcripts are
-redacted on the way out; blame, log and ask read only what is here.
+Like git: `save` packs a bundle into this machine's store (~/.loch/store),
+and `push` sends it, with what the hooks recorded, to a remote. `restore` takes
+a bundle from here, or fetches it from the remote. `delete` removes from here
+alone, and with --remote from the remote too, leaving a tombstone so no push
+brings it back. Transcripts are redacted on the way out; blame, log and ask
+read only what is here, which `pull` brings up to date.
+
+A remote is a name from `loch remote` or a URI (--store <uri> still works).
+Without one: LOCH_REMOTE, then `origin`, then the only remote there is.
 
 Environment:
   LOCH_REMOTE       the remote push and pull use, ahead of the configured one
-  LOCH_STORE        default store URI
+  LOCH_STORE        the old name for LOCH_REMOTE, read with a warning
   SOURCE_DATE_EPOCH fixed createdAt for save, so a bundle is reproducible
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override

@@ -180,13 +180,6 @@ pub fn local_store() -> FileStore {
     FileStore::new(default_store())
 }
 
-pub fn resolve_store_uri(explicit: Option<&str>) -> String {
-    if let Some(uri) = explicit {
-        return uri.to_string();
-    }
-    std::env::var("LOCH_STORE").unwrap_or_else(|_| default_store())
-}
-
 #[derive(Debug)]
 pub struct InvalidUri(pub String);
 

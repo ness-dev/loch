@@ -263,8 +263,8 @@ and unpacking. That is what makes `reindex` a repair command and what
 makes a half-failed `save` leave a recoverable store rather than a corrupt
 one. Nothing may end up knowable only from the index.
 
-**Push and pull, git style.** The local store (`~/.loch/store`) is where
-everything is recorded first. Named remotes (`loch remote`, kept in
+**Push and pull, git style: `save` is `commit`.** The local store
+(`~/.loch/store`) is where everything is recorded first, bundles included. Named remotes (`loch remote`, kept in
 `~/.loch/config`) are where `push` sends and `pull` fetches from, as git's
 remotes are. `blame`, `log` and `ask` read only the local store, so a
 teammate's turns arrive by `pull`, never by a read that waits on the network.
@@ -293,6 +293,28 @@ teammate's turns arrive by `pull`, never by a read that waits on the network.
   transcript in its own directory. Being able to delete is why loch uses
   object storage, so this is stricter than git on purpose. Whether a local
   tombstone should hold for every remote is to be tested against use.
+- **The store commands, by git's answer.** `save` writes the bundle here,
+  and `save --push [<remote>]` sends that bundle alone afterwards. A push
+  failing after the save is reported with the ref, since the bundle exists.
+  `restore` looks here first, then fetches the one bundle from the remote
+  (`fetchedFrom`), checks that its bytes hash to the ref, and keeps it, as
+  git keeps what it fetched. Content addressing is what makes any remote's
+  copy as good as another's. `list --saved` is this machine's bundles,
+  `list --remote` is `ls-remote`, and plain `list` is still the live
+  sessions. `delete <ref>` is local. With `--remote` it writes the tombstone
+  on the remote first (so a racing push sees it), deletes there, and
+  tombstones and deletes here too. `delete --session <id>` does the same for
+  a session's record, file index and transcripts, which is the delete that
+  matters, since transcripts are what leak. A ref in neither place is
+  `bundle-not-found`, and no tombstone is written for a typo. `reindex` is
+  per store. `--store <uri>` still works everywhere, meaning `--remote <uri>`
+  (`save --push <uri>` for `save`), which is the meaning callers had.
+- **The one silent change, made loud.** A caller with `LOCH_STORE` set that
+  runs a plain `save` used to upload. Now it gets `ok: true` and a bundle on
+  this machine only, so it is warned (stderr in text, `"deprecated":
+  "LOCH_STORE"` in JSON), and `schema` is 3. The Harness "send worktree to
+  remote" flow needs `save --push` (or a push to the destination as a
+  remote), and `restore` there finds the bundle by fetching it.
 - **A remote's keys are someone else's input.** `FileStore` refuses a key
   with an empty, `.` or `..` segment, and `pull` takes a record only for an
   agent this build knows, an id `is_safe_session_id` accepts, and contents
@@ -852,12 +874,14 @@ So every command takes `--json`, accepted either before or after the
 subcommand, and answers with exactly one document on stdout:
 
 ```json
-{"schema": 2, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
+{"schema": 3, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
 ```
 
 `schema` is the envelope version. It exists so a consumer can detect a
 format change it doesn't understand; bump it when a field changes meaning or
-disappears, not when one is added.
+disappears, not when one is added. It went to 3 when `save` stopped writing to
+`LOCH_STORE` (its `store` names this machine's store now) and `blame`, `log`,
+`ask` and `backfill` lost `--store`.
 
 **Built once per command, rendered twice.** Each `command_*` returns a
 `Result` — the payload, the prose, and any stderr warnings — and `main()`
@@ -868,7 +892,7 @@ prose that describes it will rot the first time someone edits the prose.
 **Failures are documents, on stdout.**
 
 ```json
-{"schema": 2, "ok": false, "command": "restore", "code": "nothing-restored",
+{"schema": 3, "ok": false, "command": "restore", "code": "nothing-restored",
  "error": "nothing restored", "sessions": [{"status": "skipped", ...}]}
 ```
 
@@ -887,7 +911,7 @@ never a code. The set today:
 | `redaction-failed` | a secret survived redaction; nothing was uploaded |
 | `transcript-unreadable` | `save` found a transcript that isn't UTF-8; nothing was uploaded |
 | `missing-ref` | `restore`/`delete` called without a ref |
-| `bundle-not-found` | the store answered and the ref isn't there |
+| `bundle-not-found` | the store answered and the ref isn't there (for `restore`, not here and not on the remote) |
 | `store-unreachable` | the store didn't answer |
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
@@ -898,7 +922,8 @@ never a code. The set today:
 | `turn-not-found` | the transcript no longer holds the record a turn ended on |
 | `unknown-agent` | `--agent` named an agent this build doesn't know |
 | `unsupported-agent` | `ask` on a turn whose agent's adapter can't fork or resume |
-| `no-remote` | `push`/`pull` named no remote and none is configured |
+| `session-not-found` | `delete --session` on a session with no record here (or on the remote) |
+| `no-remote` | a command that needs a remote named none, and none is configured |
 | `ambiguous-remote` | several remotes are configured, none is `origin`, and none was named |
 | `unknown-remote` | no remote by that name |
 | `remote-exists` | `remote add` of a name already taken |

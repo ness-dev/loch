@@ -146,6 +146,17 @@ fn counts_payload(counts: &BTreeMap<&'static str, usize>) -> Value {
     Value::Object(map)
 }
 
+/// What a push sends.
+#[derive(Clone, Copy)]
+pub enum Scope<'a> {
+    /// Every bundle, and this project's sessions.
+    Project(&'a str),
+    /// Every bundle, and every session.
+    All,
+    /// One bundle and its entries, for `save --push`.
+    Bundle(&'a str),
+}
+
 struct Item {
     key: String,
     kind: Kind,
@@ -219,7 +230,7 @@ fn local_sessions(local: &dyn Store) -> Result<Vec<(String, String, EditRecord)>
 /// before its index entries and a record before its file index, as `save` and
 /// the hooks have always written them, so a push cut short leaves objects
 /// `reindex` can re-derive entries from rather than entries naming nothing.
-fn plan(local: &dyn Store, project: Option<&str>) -> Result<Vec<Item>, StoreError> {
+fn plan(local: &dyn Store, scope: Scope) -> Result<Vec<Item>, StoreError> {
     let mut items = Vec::new();
     let branch_entries = local.list(&index::dimension_prefix(BRANCH))?;
     for key in local.list(BUNDLES_PREFIX)? {
@@ -227,6 +238,9 @@ fn plan(local: &dyn Store, project: Option<&str>) -> Result<Vec<Item>, StoreErro
             continue;
         }
         let ref_ = index::ref_from_key(&key);
+        if matches!(scope, Scope::Bundle(only) if only != ref_) {
+            continue;
+        }
         items.push(Item {
             key: key.clone(),
             kind: Kind::Bundle,
@@ -245,6 +259,11 @@ fn plan(local: &dyn Store, project: Option<&str>) -> Result<Vec<Item>, StoreErro
             });
         }
     }
+    let project = match scope {
+        Scope::Bundle(_) => return Ok(items),
+        Scope::Project(project) => Some(project),
+        Scope::All => None,
+    };
     let transcripts = local.list(TRANSCRIPTS_PREFIX)?;
     for (agent, session, record) in local_sessions(local)? {
         if project.is_some_and(|p| record.project != p) {
@@ -409,16 +428,15 @@ impl PushReport {
     }
 }
 
-/// Sends what the local store holds that `remote` hasn't been sent: every
-/// bundle, and the edit records, file index and transcripts of `project`'s
-/// sessions (every session's, for `None`). Bundles were redacted by `save`
+/// Sends what the local store holds that `remote` hasn't been sent, within
+/// `scope`: bundles, and sessions' edit records, file index and transcripts. Bundles were redacted by `save`
 /// and go as they are, so a ref is the same everywhere; transcripts are
 /// redacted on the way out, since the hooks keep them verbatim.
 pub fn push(
     local: &dyn Store,
     remote: &dyn Store,
     uri: &str,
-    project: Option<&str>,
+    scope: Scope,
     report: &mut PushReport,
 ) -> Result<(), SyncError> {
     let dead = Dead::from_keys(
@@ -428,7 +446,7 @@ pub fn push(
         ]
         .concat(),
     );
-    let items = plan(local, project)?;
+    let items = plan(local, scope)?;
     let mut markers = load_markers(uri);
     let mut sent: Vec<(String, Owner)> = Vec::new();
     let result = send(local, remote, items, &dead, &mut markers, &mut sent, report);
@@ -501,6 +519,52 @@ fn send(
         sent.push((item.key, item.owner));
     }
     Ok(())
+}
+
+// -- delete -------------------------------------------------------------------------------
+
+/// Removes a session's record, file index and transcripts from `store`, and
+/// returns the keys removed. The file index is found from the record, so a
+/// store holding the entries without the record keeps them until `reindex`.
+pub fn delete_session(
+    store: &dyn Store,
+    agent: &str,
+    session: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut removed = Vec::new();
+    let key = attribution::edits_key(agent, session);
+    if let Some(record) = store.get(&key).ok().and_then(|d| parse_record(&d)) {
+        for (entry, _) in attribution::file_entries(&record) {
+            store.delete(&entry)?;
+            removed.push(entry);
+        }
+        store.delete(&key)?;
+        removed.push(key);
+    }
+    for transcript in store.list(&trace::transcripts_prefix(agent))? {
+        if transcript_of(&transcript, agent, session) {
+            store.delete(&transcript)?;
+            removed.push(transcript);
+        }
+    }
+    Ok(removed)
+}
+
+/// The agents whose records or transcripts in `store` name `session`.
+pub fn agents_of_session(store: &dyn Store, session: &str) -> Result<Vec<String>, StoreError> {
+    let mut agents = Vec::new();
+    for agent in agent::all() {
+        let id = agent.id();
+        let has_record = store.get(&attribution::edits_key(id, session)).is_ok();
+        let has_transcript = store
+            .list(&trace::transcripts_prefix(id))?
+            .iter()
+            .any(|k| transcript_of(k, id, session));
+        if has_record || has_transcript {
+            agents.push(id.to_string());
+        }
+    }
+    Ok(agents)
 }
 
 // -- pull ---------------------------------------------------------------------------------

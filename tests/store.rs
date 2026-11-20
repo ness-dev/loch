@@ -11,7 +11,7 @@
 //! exist; each test works under its own unique prefix within it.
 
 use loch::s3::S3Store;
-use loch::store::{create_store, default_store, resolve_store_uri, FileStore, Store, StoreError};
+use loch::store::{create_store, FileStore, Store, StoreError};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -134,24 +134,26 @@ fn create_store_rejects_a_bucketless_s3_uri() {
 }
 
 #[test]
-fn resolve_store_uri_prefers_explicit_then_env() {
+fn the_remote_is_named_then_loch_remote_then_loch_store() {
     let _guard = env_lock();
-    let saved = std::env::var_os("LOCH_STORE");
-
-    std::env::remove_var("LOCH_STORE");
-    let unset = resolve_store_uri(None);
-    std::env::set_var("LOCH_STORE", "s3://from-env/x");
-    let from_env = resolve_store_uri(None);
-    let explicit = resolve_store_uri(Some("/explicit"));
-
-    match saved {
-        Some(value) => std::env::set_var("LOCH_STORE", value),
-        None => std::env::remove_var("LOCH_STORE"),
+    let saved: Vec<_> = ["LOCH_REMOTE", "LOCH_STORE"]
+        .iter()
+        .map(|v| (*v, std::env::var_os(v)))
+        .collect();
+    std::env::set_var("LOCH_STORE", "s3://old/x");
+    let old = loch::remote::resolve(None).unwrap();
+    std::env::set_var("LOCH_REMOTE", "s3://new/x");
+    let new = loch::remote::resolve(None).unwrap();
+    let named = loch::remote::resolve(Some("/explicit")).unwrap();
+    for (variable, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(variable, value),
+            None => std::env::remove_var(variable),
+        }
     }
-
-    assert_eq!(unset, default_store());
-    assert_eq!(from_env, "s3://from-env/x");
-    assert_eq!(explicit, "/explicit");
+    assert_eq!((old.uri.as_str(), old.deprecated), ("s3://old/x", true));
+    assert_eq!((new.uri.as_str(), new.deprecated), ("s3://new/x", false));
+    assert_eq!(named.uri, "/explicit");
 }
 
 #[test]

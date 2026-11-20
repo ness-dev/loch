@@ -1,7 +1,7 @@
 //! Every command: each builds one `Outcome` — payload
 //! and prose together — and `main` renders it.
 
-use crate::agent::{self, Agent};
+use crate::agent::{self, Agent, Scope};
 use crate::argparse::{Exit, Nargs, Parser};
 use crate::attribution::{self, EditRecord};
 use crate::blame_html;
@@ -920,9 +920,14 @@ pub fn command_hook(argv: &[String]) -> Run {
         .and_then(|i| argv.get(i + 1))
         .map(String::as_str)
         .unwrap_or(AGENT);
+    let scope = argv
+        .iter()
+        .position(|a| a == "--scope")
+        .and_then(|i| argv.get(i + 1))
+        .and_then(|s| Scope::parse(s));
     let mut stdin = Vec::new();
     if std::io::stdin().read_to_end(&mut stdin).is_ok() {
-        crate::hook::run(name, agent_id, &stdin);
+        crate::hook::run(name, agent_id, scope, &stdin);
     }
     Ok(Outcome::new("hook"))
 }
@@ -954,12 +959,28 @@ pub fn command_install(argv: &[String]) -> Run {
     let mut p = parser("install");
     p.option("--cwd")
         .flag("--local", None)
+        .flag("--project", None)
         .option("--command")
         .option("--agent");
     let args = p.parse(argv)?;
+    if args.flag("local") && args.flag("project") {
+        return Err(p
+            .usage_error("argument --project: not allowed with argument --local")
+            .into());
+    }
+    // The user's hooks unless asked: one install covers every project, with
+    // nothing written into any of them.
+    let scope = if args.flag("local") {
+        Scope::Local
+    } else if args.flag("project") {
+        Scope::Project
+    } else {
+        Scope::User
+    };
     // Claude Code's alone unless asked: an install that also wrote Codex's
-    // hooks would, with --local, put loch in every Codex project on the
-    // machine, and without it drop a .codex/ into repos that never use Codex.
+    // hooks would put loch in every Codex session on the machine, or drop a
+    // .codex/ into repos that never use Codex, and leave a review prompt in
+    // its next TUI either way.
     let agents = agents_arg(Some(args.str("agent").as_deref().unwrap_or(AGENT)))?;
     let cwd = args
         .str("cwd")
@@ -968,34 +989,45 @@ pub fn command_install(argv: &[String]) -> Run {
     let root = snapshot::workspace_root(&cwd);
     let command = match args.str("command") {
         Some(command) => command,
-        // A machine-specific path, which is why it only goes in the
-        // uncommitted settings file.
-        None if args.flag("local") => which("loch")
+        // A machine-specific path, which is why only the uncommitted settings
+        // file gets one. The user's file names plain `loch` too, so it keeps
+        // working when loch moves (an npm upgrade under another Node version),
+        // at the price of depending on the agent's PATH.
+        None if scope == Scope::Local => which("loch")
             .unwrap_or_else(|| sys::abspath(&std::env::args().next().unwrap_or_default())),
         None => "loch".into(),
     };
     let mut text = String::new();
     let mut results = Vec::new();
     for adapter in &agents {
-        let settings = adapter.hooks_file(&root, args.flag("local"));
-        let installed = trace::install_hooks(&settings, &command, *adapter)
+        let settings = adapter.hooks_file(scope, &root);
+        let installed = trace::install_hooks(&settings, &command, *adapter, scope)
             .map_err(|trace::InstallError::Internal(m)| Failure::Internal(m))?;
-        if installed.added.is_empty() {
+        if installed.added.is_empty() && installed.replaced.is_empty() {
             text.push_str(&format!("loch hooks already installed in {}\n", settings));
         } else {
+            let mut events = installed.added.clone();
+            events.extend(installed.replaced.iter().cloned());
             text.push_str(&format!(
                 "installed loch hooks ({}) in {}\n",
-                installed.added.join(", "),
+                events.join(", "),
                 settings
             ));
         }
         if !installed.removed.is_empty() {
             text.push_str(&format!(
-                "removed the old per-command hooks ({})\n",
+                "removed old and duplicate loch hooks ({})\n",
                 installed.removed.join(", ")
             ));
         }
-        text.push_str(&format!("{}\n", adapter.install_note()));
+        if !installed.duplicates.is_empty() {
+            text.push_str(&format!(
+                "left a second loch hook for {} where it is (each event is still handled once); remove it in {} if you like\n",
+                installed.duplicates.join(", "),
+                settings
+            ));
+        }
+        text.push_str(&format!("{}\n", adapter.install_note(scope)));
         results.push((
             adapter.id(),
             settings,
@@ -1003,14 +1035,22 @@ pub fn command_install(argv: &[String]) -> Run {
             adapter.hooks_need_review(),
         ));
     }
+    text.push_str(match scope {
+        Scope::User => "they run in every git repository\n",
+        Scope::Project => "they run for everyone who works in this project\n",
+        Scope::Local => "they run in this project, on this machine alone\n",
+    });
     // The first agent's at the top level, as before there were several.
     let (_, settings, installed, _) = &results[0];
     let mut payload = object! {
+        "scope" => scope.as_str(),
         "settings" => settings.as_str(),
         // Not `command`, which is the envelope's: the hooks' loch.
         "hookCommand" => command.as_str(),
         "added" => strings(&installed.added),
+        "replaced" => strings(&installed.replaced),
         "removed" => strings(&installed.removed),
+        "duplicates" => strings(&installed.duplicates),
     };
     payload.insert(
         "agents".into(),
@@ -1018,14 +1058,18 @@ pub fn command_install(argv: &[String]) -> Run {
             results
                 .iter()
                 .map(|(id, settings, installed, review)| {
+                    let changed = !installed.added.is_empty() || !installed.replaced.is_empty();
                     Value::Object(object! {
                         "agent" => *id,
+                        "scope" => scope.as_str(),
                         "settings" => settings.as_str(),
                         "added" => strings(&installed.added),
+                        "replaced" => strings(&installed.replaced),
                         "removed" => strings(&installed.removed),
-                        // The agent won't run a new hook until a person
-                        // approves it; loch never approves its own.
-                        "needsReview" => *review && !installed.added.is_empty(),
+                        "duplicates" => strings(&installed.duplicates),
+                        // The agent won't run a new or changed hook until a
+                        // person approves it; loch never approves its own.
+                        "needsReview" => *review && changed,
                     })
                 })
                 .collect(),

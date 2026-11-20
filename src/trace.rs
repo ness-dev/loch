@@ -5,7 +5,7 @@
 //! What a turn changed is recorded by the hooks (`hook.rs`) and matched by
 //! content (`attribution.rs`); nothing here reads or writes git history.
 
-use crate::agent::{self, Agent};
+use crate::agent::{self, Agent, Scope};
 use crate::attribution::{EditRecord, TurnRecord};
 use crate::claude::{self, home_dir};
 use crate::format::Turn;
@@ -62,6 +62,9 @@ pub fn py_str(value: Option<&Value>) -> String {
 /// git-notes design. Removed on install, so they stop costing a process each.
 const RETIRED: &[&str] = &["pre-tool", "post-tool"];
 
+/// How every line `install` writes ends.
+const LINE_END: &str = " 2>/dev/null || true";
+
 #[derive(Debug)]
 pub enum InstallError {
     Internal(String),
@@ -69,36 +72,92 @@ pub enum InstallError {
 
 pub struct Installed {
     pub added: Vec<String>,
+    /// Events whose loch line was there in another form (another path to
+    /// loch, another scope) and was rewritten where it stood.
+    pub replaced: Vec<String>,
+    /// Old loch hooks no longer used, and second loch lines for an event.
     pub removed: Vec<String>,
+    /// Second loch lines for an event that were left where they are, since
+    /// the agent keys trust by position.
+    pub duplicates: Vec<String>,
 }
 
 /// The line a hook runs. `agent` is passed only for agents other than Claude
-/// Code, so the lines earlier versions wrote for it still match.
-pub fn hook_line(command: &str, name: &str, agent: &dyn Agent) -> String {
+/// Code, and the scope only for the user's, so the lines earlier versions
+/// wrote still match.
+pub fn hook_line(command: &str, name: &str, agent: &dyn Agent, scope: Scope) -> String {
     let flag = if agent.id() == claude::AGENT {
         String::new()
     } else {
         format!(" --agent {}", agent.id())
     };
-    // A checkout whose machine lacks loch gets a silent no-op rather than an
-    // error on every turn, since the settings file is committed.
-    format!("{} hook {}{} 2>/dev/null || true", command, name, flag)
+    // Only the user's lines name a scope, the one `hook::applies` acts on, so
+    // a project's committed lines and Ness's local ones stay as they were.
+    let scope = match scope {
+        Scope::User => format!(" --scope {}", Scope::User.as_str()),
+        Scope::Project | Scope::Local => String::new(),
+    };
+    // A machine without loch gets a silent no-op rather than an error on every
+    // turn, since a project's settings file is committed and a user's applies
+    // everywhere.
+    format!("{} hook {}{}{}{}", command, name, flag, scope, LINE_END)
+}
+
+/// A loch hook line, read back: which hook, for which agent, at which scope
+/// (`None` for a line that names none, as local ones and older ones don't).
+pub struct HookLine {
+    pub name: String,
+    pub agent: String,
+    pub scope: Option<Scope>,
+}
+
+/// Whether `line` is one `hook_line` wrote, whatever the path to loch. Only
+/// these are ever rewritten or removed; every other hook is left alone.
+pub fn parse_hook_line(line: &str) -> Option<HookLine> {
+    let body = line.strip_suffix(LINE_END)?;
+    let at = body.rfind(" hook ")?;
+    let mut words = body[at + " hook ".len()..].split(' ');
+    let name = words.next()?.to_string();
+    let known = RETIRED.contains(&name.as_str())
+        || agent::all()
+            .iter()
+            .any(|a| a.hook_events().iter().any(|(_, n)| *n == name));
+    if !known || body[..at].is_empty() {
+        return None;
+    }
+    let mut parsed = HookLine {
+        name,
+        agent: claude::AGENT.into(),
+        scope: None,
+    };
+    while let Some(flag) = words.next() {
+        let value = words.next()?;
+        match flag {
+            "--agent" => parsed.agent = value.into(),
+            "--scope" => parsed.scope = Some(Scope::parse(value)?),
+            _ => return None,
+        }
+    }
+    Some(parsed)
 }
 
 fn is_retired(line: &str) -> bool {
-    RETIRED
-        .iter()
-        .any(|name| line.ends_with(&format!(" hook {} 2>/dev/null || true", name)))
+    parse_hook_line(line).is_some_and(|l| RETIRED.contains(&l.name.as_str()))
 }
 
 /// Adds an agent's loch hooks to its hooks file, keeping whatever else is
 /// there, and takes out the ones loch no longer uses. Re-running changes
-/// nothing. Claude Code's settings and Codex's hooks.json share the shape
+/// nothing. A loch line already there in another form is rewritten in place,
+/// and a second one for the same event removed, so no other hook moves;
+/// where the agent keys trust by position (Codex), the second is left and
+/// reported instead. Claude Code's settings and Codex's
+/// hooks.json share the shape
 /// `{"hooks": {"<Event>": [{"hooks": [{"type": "command", "command": ...}]}]}}`.
 pub fn install_hooks(
     settings_path: &str,
     command: &str,
     agent: &dyn Agent,
+    scope: Scope,
 ) -> std::result::Result<Installed, InstallError> {
     let mut settings = match fs::read(settings_path) {
         Ok(bytes) => {
@@ -154,39 +213,90 @@ pub fn install_hooks(
     hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
 
     let mut added = Vec::new();
+    let mut replaced = Vec::new();
+    let mut duplicates = Vec::new();
+    // An agent whose trust is keyed by position keeps every group where it
+    // is: removing one would shift the keys of all the groups after it.
+    let positional = agent.hooks_need_review();
     for (event, name) in agent.hook_events() {
-        let line = hook_line(command, name, agent);
+        let line = hook_line(command, name, agent, scope);
         let groups = hooks
             .entry(event.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         let Value::Array(groups) = groups else {
             return Err(not_a_dict());
         };
-        let present = groups.iter().any(|group| {
+        let ours = |entry: &Value| {
+            entry
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(parse_hook_line)
+                .is_some_and(|l| l.name == *name && l.agent == agent.id())
+        };
+        let mut seen = 0;
+        for group in groups.iter_mut() {
+            let Some(Value::Array(entries)) =
+                group.as_object_mut().and_then(|g| g.get_mut("hooks"))
+            else {
+                continue;
+            };
+            let mut index = 0;
+            while index < entries.len() {
+                if !ours(&entries[index]) {
+                    index += 1;
+                    continue;
+                }
+                seen += 1;
+                if seen == 1 {
+                    if !entries[index]
+                        .get("command")
+                        .is_some_and(|c| c.is_str(&line))
+                    {
+                        if let Some(entry) = entries[index].as_object_mut() {
+                            entry.insert("command".into(), Value::str(line.as_str()));
+                        }
+                        replaced.push(event.to_string());
+                    }
+                    index += 1;
+                } else if positional {
+                    // Harmless beside the first, since an event is handled
+                    // once (`hook::claim`), and only the person can retire it.
+                    duplicates.push(event.to_string());
+                    index += 1;
+                } else {
+                    // Another path to loch, appended by an older install.
+                    entries.remove(index);
+                    removed.push(event.to_string());
+                }
+            }
+        }
+        groups.retain(|group| {
             group
                 .get("hooks")
                 .and_then(Value::as_array)
-                .is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| entry.get("command").is_some_and(|c| c.is_str(&line)))
-                })
+                .is_none_or(|entries| !entries.is_empty())
         });
-        if present {
-            continue;
+        if seen == 0 {
+            groups.push(Value::Object(object! {
+                "hooks" => vec![Value::Object(object! {"type" => "command", "command" => line.as_str()})],
+            }));
+            added.push(event.to_string());
         }
-        groups.push(Value::Object(object! {
-            "hooks" => vec![Value::Object(object! {"type" => "command", "command" => line.as_str()})],
-        }));
-        added.push(event.to_string());
     }
     let parent = sys::dirname(settings_path);
     fs::create_dir_all(&parent).map_err(|e| InstallError::Internal(sys::os_error(&e, &parent)))?;
     let text = format!("{}\n", json::dumps(&settings, json::INDENTED));
     fs::write(settings_path, text)
         .map_err(|e| InstallError::Internal(sys::os_error(&e, settings_path)))?;
-    removed.dedup();
-    Ok(Installed { added, removed })
+    let mut unique = std::collections::HashSet::new();
+    removed.retain(|event| unique.insert(event.clone()));
+    duplicates.dedup();
+    Ok(Installed {
+        added,
+        replaced,
+        removed,
+        duplicates,
+    })
 }
 
 // -- transcripts ----------------------------------------------------------------

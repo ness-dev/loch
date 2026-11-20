@@ -23,6 +23,10 @@ struct World {
     store: PathBuf,
     transcript: PathBuf,
     minute: usize,
+    /// Hooks run as the harness would: every loch line the settings files
+    /// hold for the event, in parallel, rather than one `loch hook` call.
+    fired: bool,
+    sequential: bool,
 }
 
 impl Drop for World {
@@ -58,7 +62,12 @@ impl World {
             home,
             repo,
             minute: 0,
+            fired: false,
+            sequential: false,
         };
+        let bin = world.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_loch"), bin.join("loch")).unwrap();
         fs::create_dir_all(world.transcript.parent().unwrap()).unwrap();
         if git {
             world.git(&world.repo, &["init", "-q", "-b", "main"]);
@@ -75,6 +84,10 @@ impl World {
         command
             .current_dir(cwd)
             .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", s(&self.root.join("bin"))),
+            )
             .env("LOCH_STORE", &self.store)
             .env("GIT_CONFIG_GLOBAL", self.root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -167,8 +180,76 @@ impl World {
             s(&self.transcript),
             text
         );
+        if self.fired {
+            self.fire("UserPromptSubmit", &event);
+            return;
+        }
         let out = self.loch_in(&self.repo, &["hook", "prompt"], &event);
         assert!(out.status.success() && out.stdout.is_empty());
+    }
+
+    /// The settings files Claude Code reads for the repo, user-wide first.
+    fn settings_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.home.join(".claude/settings.json"),
+            self.repo.join(".claude/settings.json"),
+            self.repo.join(".claude/settings.local.json"),
+        ]
+    }
+
+    /// Every command the settings files hold for `event`.
+    fn hook_commands(&self, event: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        for file in self.settings_files() {
+            let Ok(text) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let settings = json::loads(&text).unwrap();
+            let Some(groups) = settings.get("hooks").and_then(|h| h.get(event)) else {
+                continue;
+            };
+            for group in groups.as_array().unwrap() {
+                for entry in group.get("hooks").unwrap().as_array().unwrap() {
+                    commands.push(entry.get("command").unwrap().as_str().unwrap().to_string());
+                }
+            }
+        }
+        commands
+    }
+
+    /// Runs an event's hooks as Claude Code does, all at once, in `cwd`; or
+    /// one after another, the ordering in which a second `prompt` finds the
+    /// first's turn open.
+    fn fire_in(&self, cwd: &Path, event: &str, stdin: &str) {
+        let one_by_one = self.sequential;
+        let mut children = Vec::new();
+        for line in self.hook_commands(event) {
+            children.push({
+                let mut child = self
+                    .command("sh", cwd)
+                    .args(["-c", &line])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                child
+            });
+            if one_by_one {
+                settle(children.pop().unwrap());
+            }
+        }
+        children.into_iter().for_each(settle);
+    }
+
+    fn fire(&self, event: &str, stdin: &str) {
+        self.fire_in(&self.repo, event, stdin);
     }
 
     fn hook(&self, name: &str) {
@@ -215,6 +296,10 @@ impl World {
             s(&self.repo),
             self.minute
         ));
+        if self.fired {
+            self.fire("Stop", &self.event());
+            return;
+        }
         let out = self.loch_in(&self.repo, &["hook", "stop"], &self.event());
         assert!(out.status.success() && out.stdout.is_empty());
     }
@@ -238,6 +323,11 @@ impl World {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     }
+}
+
+fn settle(child: std::process::Child) {
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 }
 
 /// Each line's owner, as prompt text or None.
@@ -286,12 +376,12 @@ fn install_writes_the_two_turn_hooks_and_keeps_existing_settings() {
     )
     .unwrap();
     // No repository is needed: the hooks record files, not commits.
-    let first = w.json(&["install"]);
+    let first = w.json(&["install", "--project"]);
     assert_eq!(
         first.get("added").unwrap(),
         &json::loads(r#"["UserPromptSubmit", "Stop", "SessionEnd"]"#).unwrap()
     );
-    let again = w.json(&["install"]);
+    let again = w.json(&["install", "--project"]);
     assert_eq!(again.get("added").unwrap(), &Value::Array(vec![]));
     let written = json::loads(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert!(written.get("model").unwrap().is_str("x"));
@@ -323,7 +413,7 @@ fn install_retires_the_per_command_hooks_it_used_to_write() {
                 {"type": "command", "command": "keep-me"}]}]}}"#,
     )
     .unwrap();
-    let result = w.json(&["install"]);
+    let result = w.json(&["install", "--project"]);
     assert_eq!(
         result.get("removed").unwrap(),
         &json::loads(r#"["PreToolUse", "PostToolUse"]"#).unwrap()
@@ -422,7 +512,12 @@ fn stopping_twice_for_one_prompt_is_one_turn() {
     w.write("a.py", "first = 1\n");
     w.stop("p1");
     w.write("a.py", "first = 1\nsecond = 2\n");
-    // Claude Code stops again for the same prompt.
+    // Claude Code stops again for the same prompt, after saying more.
+    w.record(format!(
+        r#"{{"type": "assistant", "uuid": "p1-more", "parentUuid": "p1-end", "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:01:45.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "and another"}}]}}}}"#,
+        SESSION,
+        s(&w.repo)
+    ));
     let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
     assert!(out.status.success());
     let log = w.json(&["log", "a.py"]);
@@ -793,4 +888,220 @@ fn the_hooks_collect_on_their_own_once_due() {
     w.prompt("p2", "second");
     // That prompt's snapshot made 50: the hook collected and reset the count.
     assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "0");
+}
+
+// -- install scopes ------------------------------------------------------------------
+
+fn loch_line(name: &str, flags: &str) -> String {
+    format!("loch hook {}{} 2>/dev/null || true", name, flags)
+}
+
+fn groups_of(path: &Path, event: &str) -> Vec<Value> {
+    let settings = json::loads(&fs::read_to_string(path).unwrap()).unwrap();
+    settings
+        .get("hooks")
+        .unwrap()
+        .get(event)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn first_command(group: &Value) -> String {
+    group.get("hooks").unwrap().as_array().unwrap()[0]
+        .get("command")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn install_defaults_to_the_user_s_settings_and_keeps_their_hooks() {
+    let w = World::new(true);
+    let user = w.home.join(".claude/settings.json");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    fs::write(
+        &user,
+        r#"{"theme": "dark", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "their-own"}]}]}}"#,
+    )
+    .unwrap();
+    let installed = w.json(&["install"]);
+    assert!(installed.get("scope").unwrap().is_str("user"));
+    assert!(installed.get("settings").unwrap().is_str(&s(&user)));
+    assert!(installed.get("hookCommand").unwrap().is_str("loch"));
+    assert!(!w.repo.join(".claude").exists(), "nothing in the project");
+    let written = json::loads(&fs::read_to_string(&user).unwrap()).unwrap();
+    assert!(written.get("theme").unwrap().is_str("dark"));
+    let stop = groups_of(&user, "Stop");
+    assert_eq!(first_command(&stop[0]), "their-own");
+    assert_eq!(first_command(&stop[1]), loch_line("stop", " --scope user"));
+
+    let again = w.json(&["install"]);
+    assert_eq!(again.get("added").unwrap(), &Value::Array(vec![]));
+    assert_eq!(again.get("replaced").unwrap(), &Value::Array(vec![]));
+    assert_eq!(groups_of(&user, "Stop").len(), 2);
+}
+
+#[test]
+fn install_follows_claude_config_dir() {
+    let w = World::new(true);
+    let account = w.root.join("account");
+    let out = w
+        .command(env!("CARGO_BIN_EXE_loch"), &w.repo)
+        .env("CLAUDE_CONFIG_DIR", &account)
+        .args(["install", "--json"])
+        .output()
+        .unwrap();
+    let document = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    let settings = account.join("settings.json");
+    assert!(document.get("settings").unwrap().is_str(&s(&settings)));
+    assert!(settings.exists());
+    assert!(!w.home.join(".claude/settings.json").exists());
+}
+
+#[test]
+fn install_rewrites_only_its_own_line_and_in_place() {
+    let w = World::new(true);
+    let user = w.home.join(".claude/settings.json");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    // What an older loch, or another path to it, left: in the middle of
+    // someone else's hooks.
+    fs::write(
+        &user,
+        r#"{"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "first"}]},
+            {"hooks": [{"type": "command", "command": "/old/bin/loch hook stop 2>/dev/null || true"}]},
+            {"hooks": [{"type": "command", "command": "last"}]}]}}"#,
+    )
+    .unwrap();
+    let installed = w.json(&["install"]);
+    assert_eq!(
+        installed.get("replaced").unwrap(),
+        &json::loads(r#"["Stop"]"#).unwrap()
+    );
+    assert_eq!(
+        installed.get("added").unwrap(),
+        &json::loads(r#"["UserPromptSubmit", "SessionEnd"]"#).unwrap()
+    );
+    let stop: Vec<String> = groups_of(&user, "Stop").iter().map(first_command).collect();
+    assert_eq!(
+        stop,
+        vec![
+            "first".to_string(),
+            loch_line("stop", " --scope user"),
+            "last".to_string()
+        ]
+    );
+}
+
+#[test]
+fn install_takes_one_scope() {
+    let w = World::new(true);
+    let out = w.loch(&["install", "--local", "--project", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let document = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    assert!(document.get("code").unwrap().is_str("usage"));
+}
+
+#[test]
+fn a_user_wide_hook_does_nothing_outside_a_repository() {
+    let mut w = World::new(false);
+    w.json(&["install"]);
+    w.fired = true;
+    w.prompt("p1", "somewhere that is not a project");
+    w.write("a.txt", "anything\n");
+    w.stop("p1");
+    w.fire("SessionEnd", &w.event());
+    assert!(
+        !w.home.join(".loch").exists(),
+        "no snapshot, state or record"
+    );
+    assert!(!w.store.exists(), "no transcript copied to the store");
+}
+
+#[test]
+fn a_user_wide_hook_records_in_a_repository() {
+    for commits in [true, false] {
+        // Without commits there is no root commit to name the project by,
+        // and it is still a project.
+        let mut w = World::new(commits);
+        if !commits {
+            w.git(&w.repo, &["init", "-q", "-b", "main"]);
+        }
+        w.json(&["install"]);
+        w.fired = true;
+        w.prompt("p1", "write it");
+        w.write("a.txt", "the agent's line\n");
+        w.stop("p1");
+        assert_eq!(owners(&w.json(&["blame", "a.txt"])), vec![some("write it")]);
+    }
+}
+
+#[test]
+fn a_turn_is_recorded_once_beside_a_project_s_own_hooks() {
+    for (narrower, sequential) in [("--local", false), ("--local", true), ("--project", true)] {
+        let mut w = World::new(true);
+        w.sequential = sequential;
+        w.json(&["install"]);
+        // Ness's install: this worktree alone, with loch's absolute path.
+        w.json(&["install", narrower, "--command", env!("CARGO_BIN_EXE_loch")]);
+        assert_eq!(w.hook_commands("UserPromptSubmit").len(), 2);
+        w.fired = true;
+        w.prompt("p1", "first");
+        w.write("a.txt", "one\n");
+        w.stop("p1");
+        w.prompt("p2", "second");
+        w.write("b.txt", "two\n");
+        w.stop("p2");
+        assert_eq!(interrupted_flags(&w), vec![false, false], "{}", narrower);
+        assert_eq!(owners(&w.json(&["blame", "a.txt"])), vec![some("first")]);
+        assert_eq!(owners(&w.json(&["blame", "b.txt"])), vec![some("second")]);
+    }
+}
+
+#[test]
+fn install_removes_a_second_claude_loch_line() {
+    let w = World::new(true);
+    let user = w.home.join(".claude/settings.json");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    // What re-running an older install after loch moved left: two paths.
+    fs::write(
+        &user,
+        r#"{"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "/a/loch hook stop 2>/dev/null || true"}]},
+            {"hooks": [{"type": "command", "command": "theirs"},
+                       {"type": "command", "command": "/b/loch hook stop 2>/dev/null || true"}]}]}}"#,
+    )
+    .unwrap();
+    let installed = w.json(&["install"]);
+    assert_eq!(
+        installed.get("removed").unwrap(),
+        &json::loads(r#"["Stop"]"#).unwrap()
+    );
+    let stop = groups_of(&user, "Stop");
+    assert_eq!(stop.len(), 2);
+    assert_eq!(first_command(&stop[0]), loch_line("stop", " --scope user"));
+    assert_eq!(stop[1].get("hooks").unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(first_command(&stop[1]), "theirs");
+}
+
+/// A genuine second `Stop` can arrive with the same payload and the transcript
+/// not yet grown. Past the window it is an event of its own, not another
+/// hook's copy of the first, and its edits are the turn's.
+#[test]
+fn an_identical_stop_after_the_duplicate_window_is_handled() {
+    let mut w = World::new(true);
+    w.prompt("p1", "two steps");
+    w.write("a.py", "first = 1\n");
+    w.stop("p1");
+    w.write("a.py", "first = 1\nsecond = 2\n");
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
+    assert!(out.status.success());
+    assert_eq!(
+        owners(&w.json(&["blame", "a.py"])),
+        vec![some("two steps"); 2]
+    );
 }

@@ -234,6 +234,12 @@ impl Parser {
         self
     }
 
+    /// A usage error a command found after parsing, such as two flags that
+    /// exclude each other: `argument --b: not allowed with argument --a`.
+    pub fn usage_error(&self, message: &str) -> Exit {
+        self.error(message.into())
+    }
+
     fn error(&self, message: String) -> Exit {
         let prose = format!("{}{}: error: {}\n", self.format_usage(), self.prog, message);
         Exit::Usage { message, prose }

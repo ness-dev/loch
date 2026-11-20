@@ -80,7 +80,11 @@ sessions produces a single ref.
 ## Blame a line back to its conversation
 
 ```sh
-loch install          # once per project: Claude Code hooks, committed in .claude/
+loch install          # once per machine: Claude Code hooks in ~/.claude/settings.json,
+                      # recording in every git repository
+                      # --local: this project only (.claude/settings.local.json)
+                      # --project: committed in .claude/settings.json, for everyone
+                      # --agent codex|all: Codex's too (trust them in its /hooks)
 
 loch blame src/format.rs
 #     102-112  2026-11-18  session 37d467e5 "loch-format-v1" — asked: "none of those seem like open questions…"

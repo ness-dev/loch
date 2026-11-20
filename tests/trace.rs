@@ -512,7 +512,12 @@ fn stopping_twice_for_one_prompt_is_one_turn() {
     w.write("a.py", "first = 1\n");
     w.stop("p1");
     w.write("a.py", "first = 1\nsecond = 2\n");
-    // Claude Code stops again for the same prompt.
+    // Claude Code stops again for the same prompt, after saying more.
+    w.record(format!(
+        r#"{{"type": "assistant", "uuid": "p1-more", "parentUuid": "p1-end", "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:01:45.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "and another"}}]}}}}"#,
+        SESSION,
+        s(&w.repo)
+    ));
     let out = w.loch_in(&w.repo, &["hook", "stop"], &w.event());
     assert!(out.status.success());
     let log = w.json(&["log", "a.py"]);
@@ -1054,4 +1059,30 @@ fn a_turn_is_recorded_once_beside_a_project_s_own_hooks() {
         assert_eq!(owners(&w.json(&["blame", "a.txt"])), vec![some("first")]);
         assert_eq!(owners(&w.json(&["blame", "b.txt"])), vec![some("second")]);
     }
+}
+
+#[test]
+fn install_removes_a_second_claude_loch_line() {
+    let w = World::new(true);
+    let user = w.home.join(".claude/settings.json");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    // What re-running an older install after loch moved left: two paths.
+    fs::write(
+        &user,
+        r#"{"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "/a/loch hook stop 2>/dev/null || true"}]},
+            {"hooks": [{"type": "command", "command": "theirs"},
+                       {"type": "command", "command": "/b/loch hook stop 2>/dev/null || true"}]}]}}"#,
+    )
+    .unwrap();
+    let installed = w.json(&["install"]);
+    assert_eq!(
+        installed.get("removed").unwrap(),
+        &json::loads(r#"["Stop"]"#).unwrap()
+    );
+    let stop = groups_of(&user, "Stop");
+    assert_eq!(stop.len(), 2);
+    assert_eq!(first_command(&stop[0]), loch_line("stop", " --scope user"));
+    assert_eq!(stop[1].get("hooks").unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(first_command(&stop[1]), "theirs");
 }

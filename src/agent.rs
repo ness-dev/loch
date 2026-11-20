@@ -56,9 +56,8 @@ pub struct TurnInfo {
 pub type HookEvent = (&'static str, &'static str);
 
 /// Where `install` puts hooks, from the widest to the narrowest. An agent
-/// runs every scope's hooks for the same event, so a wider scope's hook
-/// defers to a narrower one's in the same project (`hook::run`): a turn is
-/// recorded once, by the most specific install.
+/// runs every scope's hooks for an event, and `hook::claim` sees that the
+/// event is handled once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// The user's own hooks file: every project on the machine.
@@ -83,15 +82,6 @@ impl Scope {
             .into_iter()
             .find(|scope| scope.as_str() == text)
     }
-
-    /// The scopes a hook of this one defers to.
-    pub fn narrower(self) -> &'static [Scope] {
-        match self {
-            Scope::User => &[Scope::Local, Scope::Project],
-            Scope::Project => &[Scope::Local],
-            Scope::Local => &[],
-        }
-    }
 }
 
 pub trait Agent: Sync {
@@ -107,12 +97,6 @@ pub trait Agent: Sync {
     /// The hooks file `install` writes for a scope; `root` is the workspace
     /// root, which the user scope ignores.
     fn hooks_file(&self, scope: Scope, root: &str) -> String;
-    /// Whether the agent will run the hooks `file` holds for `event` in the
-    /// project at `root`. A wider scope's hook defers to these only if so,
-    /// since deferring to a hook that never runs would lose the turn.
-    fn hooks_active(&self, _file: &str, _root: &str, _event: &str) -> bool {
-        true
-    }
     /// What `install` says after writing, beyond the file it wrote.
     fn install_note(&self, scope: Scope) -> &'static str;
     /// Hooks this agent won't run until a person approves them.

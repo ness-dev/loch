@@ -125,30 +125,51 @@ project trusted in `config.toml` (`[projects."<path>"] trust_level =
   decides this from the event's cwd before a store is opened, so outside a
   repository the hook costs one walk up for `.git`. A project-level install
   still records a plain directory, since it was asked for there.
-- **The widest scope defers.** Claude Code and Codex run every scope's hooks
-  for an event, in parallel, so a user-wide and a project's own hook would
-  both snapshot a turn and race over its state (the second `prompt` closing
-  the first's turn as an empty interruption). Each hook line names its scope
-  (`--scope user|project`), and a hook steps aside when a narrower scope's
-  file in the same project holds loch's hook for that event, and the agent
-  will run it (`Agent::hooks_active`). Local lines name no scope, which keeps
-  Ness's existing lines byte for byte, and neither do lines from before scopes
-  existed, which record as they always did. Deduping at install time was
-  rejected: an install can't see every project on the machine, and an
-  idempotent hook would need a lock across processes that run in parallel.
-- **Codex's deferral reads trust by key, not by hash.** A project hook counts
-  as trusted when `config.toml` has `trust_level = "trusted"` for the project
-  (or a directory above it) and a `[hooks.state."<file>:<event>:…"]` key for
-  the file. Trusting through the TUI wrote exactly that, with the file's path
-  symlink-resolved (`/private/tmp/...`), so both spellings are tried. The hash
-  isn't checked, since it isn't a plain SHA-256: a hook edited after it was
-  trusted still counts. That costs a duplicate record, never a lost turn,
-  which is the failure worth avoiding.
+- **Each event is handled once, however many of loch's hooks it reaches.**
+  Claude Code and Codex run every scope's hooks for an event, at once, so a
+  user-wide hook and a project's own (or an old committed line beside Ness's
+  local one) would both snapshot a turn and race over its state, the second
+  `prompt` closing the first's turn as an empty interruption. Each event's
+  hooks get byte-identical stdin, so `hook::claim` takes a per-session lock
+  (`~/.loch/events/<session>.last`), and a hook handed the same event that
+  another finished handling within 10s does nothing. An event is the hook's
+  name, its payload and its transcript's length. The payload alone can
+  repeat: Claude Code stopping twice for one prompt sends identical bytes,
+  which the first version of this took for a duplicate, losing the second
+  stop's edits (`stopping_twice_for_one_prompt_is_one_turn` caught it). The
+  agent waits on these hooks, so every hook for an event sees the same
+  transcript, and a genuine second event follows output that grew it.
+  `UserPromptSubmit` also carries a `prompt_id`, and Codex's events a
+  `turn_id`. A lock that can't be taken
+  handles the event anyway, since a duplicate record beats a lost turn.
+- **The first design guessed, and the guess could lose turns.** It had a
+  wider scope's hook step aside when a narrower file held loch's hook "and
+  the agent will run it". Answering that means knowing where the agent reads
+  a project's settings, whether it trusts them, and whether they changed
+  after it started (both agents snapshot hooks at startup). For Codex it
+  meant reading trust keys per group and index out of `config.toml`. Each
+  wrong answer skipped a hook the agent never ran, so nobody recorded the
+  turn. Idempotency needs none of those answers.
+- **What was verified, on Claude Code 2.1.329 and Codex 0.166** (scratch
+  `HOME`/`CODEX_HOME`; Claude ran `UserPromptSubmit` before failing on its
+  missing login, which was enough): two user hooks and a project-local hook
+  for one event got byte-identical payloads, for both agents.
+  `UserPromptSubmit`'s keys are `session_id`, `transcript_path`, `cwd`,
+  `permission_mode`, `hook_event_name`, `prompt` and `prompt_id`. Claude
+  Code launched in `repo/sub` ran the repo root's `.claude/settings.local.json`,
+  and gave hooks `CLAUDE_PROJECT_DIR` as `repo/sub`. Claude's `Stop` payload
+  was not captured, since that needs a model call. If it ever differs
+  between hooks, the cost is a duplicate record.
 - **Only loch's own lines are touched.** `trace::parse_hook_line` recognises a
-  line `hook_line` wrote, whatever the path to loch. A loch line already in
-  the target file in another form (another path, another scope) is rewritten
-  in place and reported as `replaced`, so no file runs loch twice for an
-  event and no other hook moves. Codex keys trust by position.
+  line `hook_line` wrote, whatever the path to loch. The first loch line for
+  an event in the target file is rewritten in place if it differs (another
+  path, another scope) and reported as `replaced`. A second one, which an
+  older install appended after loch moved, is removed for Claude Code
+  (`removed`). For Codex it is left where it is and reported as
+  `duplicates`, since removing a group shifts the positional trust keys of
+  every group after it, and the claim makes it harmless. Only user-wide lines
+  name a scope (`--scope user`, the one `hook::applies` acts on), so a
+  project's committed lines and Ness's local ones are what they always were.
 - **The user's file names plain `loch`.** That survives an npm upgrade under
   another Node version, at the price of needing loch on the agent's PATH.
   `--local` still defaults to the absolute path.
@@ -964,7 +985,7 @@ which hands most of the hooks' speed back on every Bash call.
   since the path is machine-specific) rather than rely on PATH. It means
   "this worktree only", installs Claude Code's hooks alone, and writes the
   same lines it always did. A user who also ran a plain `loch install` is
-  recorded once: the user-wide hook steps aside wherever the local one is.
+  recorded once, since each event is handled once (`hook::claim`).
   Codex's need `--agent codex` (or `all`). With `--local` that is the
   worktree's `.codex/hooks.json`, which git sees and Codex runs only in a
   trusted project. Without it, it is the user's `$CODEX_HOME/hooks.json`,
@@ -1251,14 +1272,22 @@ scratch repositories, a temporary store):
 
 - **User-wide install, real runs.** In a scratch `HOME`/`CODEX_HOME`, a
   user-wide install appended loch's groups after a Ness-style status hook,
-  and `--local` wrote the repo's `.codex/hooks.json`. Both were trusted
-  through the TUI's "Trust all and continue", and runs used no bypass flag.
-  With both installed, an `exec` turn in the repo was recorded once, not
-  interrupted, and blamed correctly. In a plain directory the hooks ran (the
-  status hook fired) and loch wrote nothing. With the project file removed,
-  the user-wide hook alone recorded the next turn. Measured: a user-wide hook
-  outside a repository takes 2.8ms (process start). The same 2,000-file
-  directory without the gate takes 83ms, and gets snapshotted.
+  and `--local` appended them after a team hook in the repo's
+  `.codex/hooks.json`. All of it was trusted through the TUI's "Trust all and
+  continue", and the runs used no bypass flag. Each case below was one
+  `exec` turn:
+  - **The reviewer's lost-turn case.** Trust was removed from loch's project
+    entries and kept on the team hook's. Codex ran the team hook and skipped
+    loch's project one, and the user-wide hook recorded the turn. The
+    inference this replaced would have deferred and lost it.
+  - **Both trusted.** Both loch hooks ran, and the turn was recorded once,
+    not interrupted, and blamed correctly.
+  - **A plain directory.** The hooks ran (the status hook fired), and loch
+    wrote nothing, not even a claim.
+
+  Measured: a user-wide hook outside a repository takes 2.8ms (process
+  start). The same 2,000-file directory without the gate takes 83ms, and
+  gets snapshotted.
 
 The TUI was driven by a script over a pty, so how the prompt and
 `needsReview` read to a person is still untested.

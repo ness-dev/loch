@@ -27,7 +27,6 @@ use crate::object;
 use crate::snapshot;
 use crate::store::{self, Store};
 use crate::sys;
-use crate::trace;
 use std::fs;
 use std::path::PathBuf;
 
@@ -286,6 +285,15 @@ pub fn end(agent: &dyn Agent, event: &Map, store: Option<&dyn Store>) -> Result<
 pub fn roots() -> Vec<String> {
     let mut roots = snapshot::workspace_roots();
     let now = std::time::SystemTime::now();
+    for entry in fs::read_dir(events_dir()).into_iter().flatten().flatten() {
+        let age = fs::metadata(entry.path())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok());
+        if age.is_some_and(|age| age > ABANDONED) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
     let Ok(entries) = fs::read_dir(sessions_dir()) else {
         return roots;
     };
@@ -337,42 +345,125 @@ pub fn snapshot_transcript(
 }
 
 /// Whether a hook installed at `scope` records this event, decided before
-/// anything is opened, since a user-wide hook runs in every directory the
-/// agent does.
-///
-/// - **A user-wide hook records only in a git repository.** Anywhere else it
-///   would snapshot whatever directory a session happened to start in
-///   (`~/Downloads`, a scratch dir), which nobody asked for by installing
-///   loch once. A project-level install still records a plain directory:
-///   that was asked for.
-/// - **A wider scope's hook defers to a narrower one's** in the same project,
-///   when that file holds loch's hook for the same event and the agent will
-///   run it. Every scope's hooks run, in parallel, so two would snapshot one
-///   turn twice and race over its state.
-///
-/// A line naming no scope (local ones, and every line before scopes) records
-/// as it always did.
-pub fn applies(agent: &dyn Agent, scope: Option<Scope>, name: &str, event: &Map) -> bool {
-    let Some(scope) = scope else {
+/// anything is opened. A user-wide hook runs in every directory the agent
+/// does, and records only in a git repository: anywhere else it would
+/// snapshot whatever directory a session happened to start in
+/// (`~/Downloads`, a scratch dir), which nobody asked for by installing loch
+/// once. A project-level install still records a plain directory, since that
+/// was asked for. A line naming no scope (local ones, and every line before
+/// scopes) records as it always did.
+pub fn applies(scope: Option<Scope>, event: &Map) -> bool {
+    if scope != Some(Scope::User) {
         return true;
-    };
+    }
     let root = snapshot::workspace_root(&event_cwd(event));
     // A home directory that is itself a repository (dotfiles) is the root of
     // every directory under it, and is refused before any store is opened.
-    if scope == Scope::User && !(snapshot::has_git_marker(&root) && snapshot::snapshottable(&root))
-    {
-        return false;
-    }
-    let Some((event_name, _)) = agent.hook_events().iter().find(|(_, n)| *n == name) else {
-        return true;
+    snapshot::has_git_marker(&root) && snapshot::snapshottable(&root)
+}
+
+/// How long after one hook has handled an event a byte-identical one is taken
+/// to be the same event, seen by another hook.
+const DUPLICATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn events_dir() -> PathBuf {
+    snapshot::loch_home().join("events")
+}
+
+/// The right to handle one event, held for as long as the hook runs.
+///
+/// **An event is handled once, however many of loch's hooks it reaches.** An
+/// agent runs every scope's hooks for an event (a user-wide one, a project's,
+/// an older line beside a newer one), at once, and each gets the same bytes
+/// on stdin: verified on Claude Code 2.1 and Codex 0.166. Two hooks handling
+/// one prompt would snapshot it twice and race over the session's state, the
+/// second closing the first's turn as an empty interruption. So the hooks of
+/// a session take turns under a lock, and one finding that the event it was
+/// handed was handled moments ago does nothing. An event is its hook's name,
+/// its payload and the length of its transcript: Claude Code's prompts carry
+/// a `prompt_id` and Codex's events a `turn_id`, and a second `Stop` for one
+/// prompt comes after more of the transcript was written.
+///
+/// Deciding instead which hook should step aside means knowing which files
+/// the agent runs: where it reads a project's settings from, whether it
+/// trusts them, whether they changed after it started. A wrong answer loses
+/// the turn. This needs none of it.
+pub struct Claim {
+    file: fs::File,
+    digest: String,
+}
+
+pub enum Claimed {
+    /// This hook handles the event; `finish` once done.
+    Mine(Claim),
+    /// Another hook already has.
+    Handled,
+    /// The lock couldn't be taken. The event is handled anyway, since a
+    /// duplicate record beats a lost turn.
+    Unguarded,
+}
+
+pub fn claim(session: &str, name: &str, stdin: &[u8], transcript: Option<&str>) -> Claimed {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(stdin);
+    // The payload alone can repeat: Claude Code stopping twice for one prompt
+    // sends the same bytes both times. The agent waits on these hooks, so
+    // every hook for one event sees the same transcript, and a genuine second
+    // event follows the output that grew it. Read before waiting on the lock,
+    // as the hooks start, so nothing the agent writes once another hook has
+    // exited is counted.
+    let length = transcript
+        .and_then(|t| fs::metadata(t).ok())
+        .map(|m| m.len());
+    hasher.update(format!("\n{:?}", length).as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let Ok(()) = fs::create_dir_all(events_dir()) else {
+        return Claimed::Unguarded;
     };
-    let own = agent.hooks_file(scope, &root);
-    !scope.narrower().iter().any(|narrower| {
-        let file = agent.hooks_file(*narrower, &root);
-        file != own
-            && trace::holds_hook(&file, event_name, name, agent)
-            && agent.hooks_active(&file, &root, event_name)
-    })
+    let Ok(mut file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(events_dir().join(format!("{}.last", session)))
+    else {
+        return Claimed::Unguarded;
+    };
+    if file.lock().is_err() {
+        return Claimed::Unguarded;
+    }
+    let mut seen = String::new();
+    let _ = file.read_to_string(&mut seen);
+    let recent = seen
+        .split_once(' ')
+        .filter(|(last, _)| *last == digest)
+        .and_then(|(_, at)| at.trim().parse::<u64>().ok())
+        .is_some_and(|at| (sys::now() as u64).saturating_sub(at) < DUPLICATE_WINDOW.as_secs());
+    if recent {
+        Claimed::Handled
+    } else {
+        Claimed::Mine(Claim { file, digest })
+    }
+}
+
+impl Claim {
+    /// Records the event as handled, timed from when it finished, and lets
+    /// the session's next hook in. A write cut short leaves something that
+    /// matches nothing, so the next hook handles the event again.
+    pub fn finish(mut self) {
+        use std::io::{Seek, Write};
+        let _ = self.file.set_len(0);
+        let _ = self.file.seek(std::io::SeekFrom::Start(0));
+        let _ = write!(self.file, "{} {}", self.digest, (sys::now() as u64));
+    }
 }
 
 /// Run by the harness with the event as JSON on stdin. An agent this build
@@ -388,9 +479,17 @@ pub fn run(name: &str, agent_id: &str, scope: Option<Scope>, stdin: &[u8]) {
     let Ok(Value::Object(event)) = json::loads(text) else {
         return;
     };
-    if !applies(agent, scope, name, &event) {
+    if !applies(scope, &event) {
         return;
     }
+    let claim = match session_of(&event) {
+        Ok(session) => match claim(&session, name, stdin, transcript_of(&event).as_deref()) {
+            Claimed::Handled => return,
+            Claimed::Mine(claim) => Some(claim),
+            Claimed::Unguarded => None,
+        },
+        Err(Stop) => None,
+    };
     let store = || store::create_store(&store::resolve_store_uri(None)).ok();
     let _ = match name {
         "prompt" => prompt(agent, &event, store().as_deref()),
@@ -400,6 +499,9 @@ pub fn run(name: &str, agent_id: &str, scope: Option<Scope>, stdin: &[u8]) {
         // still name them until `install` is re-run; they do nothing.
         _ => return,
     };
+    if let Some(claim) = claim {
+        claim.finish();
+    }
     // Collection rides on the hooks, as `git gc --auto` rides on commands:
     // the check is a counter read, and the work runs once in many turns.
     if snapshot::collection_due() {

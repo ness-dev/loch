@@ -32,30 +32,6 @@ use std::path::Path;
 
 pub const AGENT: &str = "codex";
 
-/// `UserPromptSubmit` → `user_prompt_submit`, as trust keys name events.
-fn snake_case(event: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in event.chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
-}
-
-/// The quoted key of a TOML table header under `prefix`:
-/// `[projects."/a/b"]` with `projects.` is `/a/b`.
-fn toml_key<'a>(header: &'a str, prefix: &str) -> Option<&'a str> {
-    header
-        .strip_prefix('[')?
-        .strip_suffix(']')?
-        .trim()
-        .strip_prefix(prefix)?
-        .strip_prefix('"')?
-        .strip_suffix('"')
-}
-
 /// `CODEX_HOME` when set, else `~/.codex` — the rule Codex follows, and the
 /// only place consulted, for the reason `claude::config_dir` gives.
 pub fn codex_home() -> String {
@@ -517,46 +493,6 @@ impl Agent for Codex {
             Scope::User => sys::join(&codex_home(), "hooks.json"),
             Scope::Project | Scope::Local => sys::join(&sys::join(root, ".codex"), "hooks.json"),
         }
-    }
-
-    /// Codex runs a project's hooks only in a project trusted in
-    /// `config.toml`, and each hook only once a person has trusted it. The
-    /// second is read from whether a trust entry exists for the file and
-    /// event, not whether its hash is current, which loch can't compute.
-    fn hooks_active(&self, file: &str, root: &str, event: &str) -> bool {
-        if file == self.hooks_file(Scope::User, root) {
-            return true;
-        }
-        let Ok(config) = fs::read_to_string(sys::join(&codex_home(), "config.toml")) else {
-            return false;
-        };
-        let roots = [root.to_string(), resolve_cwd(root)];
-        let files = [file.to_string(), resolve_cwd(file)];
-        let event = snake_case(event);
-        let mut trusted_project = false;
-        let mut trusted_hook = false;
-        let mut table = String::new();
-        for line in config.lines().map(str::trim) {
-            if line.starts_with('[') {
-                table = line.to_string();
-                if let Some(key) = toml_key(line, "hooks.state.") {
-                    trusted_hook |= files
-                        .iter()
-                        .any(|f| key.starts_with(&format!("{}:{}:", f, event)));
-                }
-                continue;
-            }
-            if let Some(project) = toml_key(&table, "projects.") {
-                let covers = roots.iter().any(|r| {
-                    r == project || r.starts_with(&format!("{}/", project.trim_end_matches('/')))
-                });
-                let value = line.split_once('=').map(|(k, v)| (k.trim(), v.trim()));
-                if covers && value == Some(("trust_level", "\"trusted\"")) {
-                    trusted_project = true;
-                }
-            }
-        }
-        trusted_project && trusted_hook
     }
 
     fn install_note(&self, scope: Scope) -> &'static str {

@@ -815,59 +815,69 @@ fn install_sets_up_claude_alone_unless_asked() {
     );
     assert!(world.repo.join(".codex/hooks.json").exists());
     let claude = fs::read_to_string(world.repo.join(".claude/settings.json")).unwrap();
-    assert!(claude.contains("\"loch hook stop --scope project 2>/dev/null || true\""));
+    assert!(claude.contains("\"loch hook stop 2>/dev/null || true\""));
 }
 
-/// A user-wide hook defers to a project's own only where Codex will run the
-/// project's: in a trusted project, once its hook is trusted. Deferring to a
-/// hook Codex skips would lose the turn.
+/// Codex runs the user's and the project's hooks for every event, each with
+/// the same payload. Which of them Codex actually runs (an untrusted project,
+/// an untrusted hook) doesn't matter: whichever gets there first records the
+/// event, and the other finds it handled.
 #[test]
-fn a_user_wide_codex_hook_defers_only_to_project_hooks_codex_runs() {
+fn a_codex_event_reaching_two_loch_hooks_is_recorded_once() {
     let world = World::new();
-    world.ok(&[
-        "install",
-        "--agent",
-        "codex",
-        "--local",
-        "--command",
-        "/opt/loch",
-    ]);
-    let project_hooks = world.repo.join(".codex/hooks.json");
-    let state = world
-        .home
-        .join(".loch/sessions")
-        .join(format!("{}.json", SESSION));
-    let prompt = |world: &World| {
-        let _ = fs::remove_file(&state);
-        let event = world.event(SESSION, Some(TURN_A), Some("hi"));
-        let out = world.loch_with(
-            &["hook", "prompt", "--agent", "codex", "--scope", "user"],
-            &event,
-        );
-        assert!(out.status.success() && out.stdout.is_empty());
-        state.exists()
+    let repo = s(&world.repo);
+    let both = |name: &str, event: &str| {
+        for scope in [&["--scope", "user"][..], &[][..]] {
+            let mut args = vec!["hook", name, "--agent", "codex"];
+            args.extend_from_slice(scope);
+            let out = world.loch_with(&args, event);
+            assert!(out.status.success() && out.stdout.is_empty());
+        }
     };
-    assert!(prompt(&world), "no config: the project's hooks don't run");
+    for (turn, minute, prompt, script) in [
+        (TURN_A, 1, "first", "echo one > a.txt"),
+        (TURN_B, 2, "second", "echo two > b.txt"),
+    ] {
+        world.begin(SESSION, turn, &repo, minute, prompt);
+        both("prompt", &world.event(SESSION, Some(turn), Some(prompt)));
+        world.sh(script);
+        world.finish(SESSION, turn, minute);
+        both("stop", &world.event(SESSION, Some(turn), None));
+    }
+    let record = world.edit_record();
+    let turns = items(&record, "turns");
+    assert_eq!(turns.len(), 2);
+    assert!(turns.iter().all(|t| !at(t, "interrupted").truthy()));
+}
 
-    let config = world.home.join(".codex/config.toml");
-    fs::create_dir_all(config.parent().unwrap()).unwrap();
-    let trusted_project = format!(
-        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-        s(&world.repo)
+#[test]
+fn install_leaves_a_second_codex_loch_line_where_it_is() {
+    let world = World::new();
+    let hooks = world.home.join(".codex/hooks.json");
+    fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    let two = r#"{"hooks":{"Stop":[
+        {"hooks":[{"type":"command","command":"/a/loch hook stop --agent codex 2>/dev/null || true"}]},
+        {"hooks":[{"type":"command","command":"their-status-hook"}]},
+        {"hooks":[{"type":"command","command":"/b/loch hook stop --agent codex 2>/dev/null || true"}]}]}}"#;
+    fs::write(&hooks, two).unwrap();
+    let installed = world.ok(&["install", "--agent", "codex"]);
+    let codex = &items(&installed, "agents")[0];
+    assert_eq!(items(codex, "duplicates")[0].as_str(), Some("Stop"));
+    let written = json::loads(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    let stop = at(at(&written, "hooks"), "Stop")
+        .as_array()
+        .unwrap()
+        .clone();
+    let line = |group: &Value| text(&items(group, "hooks")[0], "command").to_string();
+    // Every group keeps its position, and so its trust.
+    assert_eq!(
+        stop.iter().map(line).collect::<Vec<_>>(),
+        vec![
+            "loch hook stop --agent codex --scope user 2>/dev/null || true".to_string(),
+            "their-status-hook".to_string(),
+            "/b/loch hook stop --agent codex 2>/dev/null || true".to_string(),
+        ]
     );
-    fs::write(&config, &trusted_project).unwrap();
-    assert!(
-        prompt(&world),
-        "a trusted project, its hook not yet trusted"
-    );
-
-    let trusted_hook = format!(
-        "{}\n[hooks.state.\"{}:user_prompt_submit:0:0\"]\ntrusted_hash = \"sha256:00\"\n",
-        trusted_project,
-        s(&project_hooks)
-    );
-    fs::write(&config, trusted_hook).unwrap();
-    assert!(!prompt(&world), "the project's hook records this turn");
 }
 
 #[test]

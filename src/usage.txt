@@ -53,9 +53,9 @@ settings.json under CLAUDE_CONFIG_DIR or ~/.claude, Codex's
 $CODEX_HOME/hooks.json) and run in every git repository. --local puts them in
 this project on this machine alone (.claude/settings.local.json; Codex has no
 uncommitted file, so .codex/hooks.json), and --project in its committed
-settings for everyone. Where a project has its own, the user-wide ones step
-aside, so a turn is recorded once. Codex runs new hooks only after you trust
-them in its /hooks, and a project's only in a project it trusts.
+settings for everyone. A turn is recorded once, however many of these reach
+it. Codex runs new hooks only after you trust them in its /hooks, and a
+project's only in a project it trusts.
 Nothing is written to git, so squashes and rebases don't lose anything.
 `blame` shows which turn wrote each line, `log` every turn that changed a file
 or line range; `ask` forks that conversation and resumes it in the agent that

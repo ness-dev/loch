@@ -1016,8 +1016,15 @@ pub fn command_install(argv: &[String]) -> Run {
         }
         if !installed.removed.is_empty() {
             text.push_str(&format!(
-                "removed the old per-command hooks ({})\n",
+                "removed old and duplicate loch hooks ({})\n",
                 installed.removed.join(", ")
+            ));
+        }
+        if !installed.duplicates.is_empty() {
+            text.push_str(&format!(
+                "left a second loch hook for {} where it is (each event is still handled once); remove it in {} if you like\n",
+                installed.duplicates.join(", "),
+                settings
             ));
         }
         text.push_str(&format!("{}\n", adapter.install_note(scope)));
@@ -1029,9 +1036,7 @@ pub fn command_install(argv: &[String]) -> Run {
         ));
     }
     text.push_str(match scope {
-        Scope::User => {
-            "they run in every git repository; a project with its own loch hooks records with those instead\n"
-        }
+        Scope::User => "they run in every git repository\n",
         Scope::Project => "they run for everyone who works in this project\n",
         Scope::Local => "they run in this project, on this machine alone\n",
     });
@@ -1045,6 +1050,7 @@ pub fn command_install(argv: &[String]) -> Run {
         "added" => strings(&installed.added),
         "replaced" => strings(&installed.replaced),
         "removed" => strings(&installed.removed),
+        "duplicates" => strings(&installed.duplicates),
     };
     payload.insert(
         "agents".into(),
@@ -1060,6 +1066,7 @@ pub fn command_install(argv: &[String]) -> Run {
                         "added" => strings(&installed.added),
                         "replaced" => strings(&installed.replaced),
                         "removed" => strings(&installed.removed),
+                        "duplicates" => strings(&installed.duplicates),
                         // The agent won't run a new or changed hook until a
                         // person approves it; loch never approves its own.
                         "needsReview" => *review && changed,

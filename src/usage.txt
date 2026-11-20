@@ -2,24 +2,29 @@ loch — save and restore agent coding sessions across machines
 
 Usage:
   loch list    [--cwd <path>] [--branch <name>] [--agent <id>]
-  loch list    --remote [--branch <name>] [--all] [--store <uri>]
+  loch list    --saved | --remote [<remote>] [--branch <name>] [--all]
   loch save    [--cwd <path>] [--branch <name>] [--session <id>] [--agent <id>]
-               [--store <uri>]
-  loch restore <ref> [--into <path>] [--store <uri>] [--force] [--new-id]
-  loch delete  <ref> [--store <uri>]
-  loch reindex [--store <uri>]
+               [--push [<remote>]]
+  loch restore <ref> [--into <path>] [--remote <remote>] [--force] [--new-id]
+  loch delete  <ref> | --session <id> [--agent <id>] [--remote [<remote>]]
+  loch reindex [--remote [<remote>]]
   loch ingest  [--cwd <path>] [--branch <name>] [--session <id>]
                [--author <id> | --author-key <key.pub>]
                [--out <dir>]
   loch install [--local | --project] [--cwd <path>] [--command <loch>]
                [--agent <id>]
   loch blame   <file> [--html [<path>] [--lines <ranges>] [--no-open]]
-               [--store <uri>]
-  loch log     <file>[:<line>[-<end>]] [--store <uri>]
+  loch log     <file>[:<line>[-<end>]]
   loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
-               [--store <uri>]
-  loch backfill [--cwd <path>] [--store <uri>]
+  loch backfill [--cwd <path>]
                                   attribute turns from before the hooks
+  loch push    [<remote>] [--all] [--cwd <path>] [--dry-run] [--force]
+                                  send this project's bundles, records and
+                                  transcripts to a remote
+  loch pull    [<remote>] [--all] [--cwd <path>]
+                                  fetch this project's records and transcripts
+  loch remote  [list] | add <name> <uri> | remove <name>
+                                  the stores push and pull reach (~/.loch/config)
   loch gc                         delete snapshots nothing needs (the hooks
                                   also do this every 50 snapshots)
   loch hook    prompt | stop | end [--agent <id>]   (run by the agent's harness)
@@ -35,8 +40,19 @@ Stores:
   <path>              local directory
   s3://bucket/prefix  any S3-compatible endpoint
 
+Like git: `save` packs a bundle into this machine's store (~/.loch/store),
+and `push` sends it, with what the hooks recorded, to a remote. `restore` takes
+a bundle from here, or fetches it from the remote. `delete` removes from here
+alone, and with --remote from the remote too, leaving a tombstone so no push
+brings it back. Transcripts are redacted on the way out; blame, log and ask
+read only what is here, which `pull` brings up to date.
+
+A remote is a name from `loch remote` or a URI (--store <uri> still works).
+Without one: LOCH_REMOTE, then `origin`, then the only remote there is.
+
 Environment:
-  LOCH_STORE        default store URI
+  LOCH_REMOTE       the remote push and pull use, ahead of the configured one
+  LOCH_STORE        the old name for LOCH_REMOTE, read with a warning
   SOURCE_DATE_EPOCH fixed createdAt for save, so a bundle is reproducible
   LOCH_S3_ENDPOINT  custom endpoint (R2, MinIO, ...)
   LOCH_S3_REGION    region override
@@ -47,15 +63,16 @@ Derived conversation files go to ~/.loch/derived unless --out says otherwise.
 
 `install` adds hooks that snapshot the workspace when a prompt is submitted,
 when the agent stops and when the session ends, and record which lines each
-turn added — however it added them — in the store, along with the session's
-transcript. By default they go in your own settings (Claude Code's
-settings.json under CLAUDE_CONFIG_DIR or ~/.claude, Codex's
-$CODEX_HOME/hooks.json) and run in every git repository. --local puts them in
-this project on this machine alone (.claude/settings.local.json; Codex has no
-uncommitted file, so .codex/hooks.json), and --project in its committed
-settings for everyone. A turn is recorded once, however many of these reach
-it. Codex runs new hooks only after you trust them in its /hooks, and a
-project's only in a project it trusts.
+turn added — however it added them — in the local store (~/.loch/store),
+along with the session's transcript; hooks never reach a remote store. By
+default they go in your own settings (Claude Code's settings.json under
+CLAUDE_CONFIG_DIR or ~/.claude, Codex's $CODEX_HOME/hooks.json) and run in
+every git repository. --local puts them in this project on this machine alone
+(.claude/settings.local.json; Codex has no uncommitted file, so
+.codex/hooks.json), and --project in its committed settings for everyone. A
+turn is recorded once, however many of these reach it. Codex runs new hooks
+only after you trust them in its /hooks, and a project's only in a project it
+trusts.
 Nothing is written to git, so squashes and rebases don't lose anything.
 `blame` shows which turn wrote each line, `log` every turn that changed a file
 or line range; `ask` forks that conversation and resumes it in the agent that

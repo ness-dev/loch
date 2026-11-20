@@ -57,7 +57,7 @@ impl World {
             transcript: home
                 .join(".claude/projects/-repo")
                 .join(format!("{}.jsonl", SESSION)),
-            store: root.join("store"),
+            store: home.join(".loch/store"),
             root,
             home,
             repo,
@@ -88,7 +88,7 @@ impl World {
                 "PATH",
                 format!("{}:/usr/bin:/bin", s(&self.root.join("bin"))),
             )
-            .env("LOCH_STORE", &self.store)
+            .env_remove("LOCH_STORE")
             .env("GIT_CONFIG_GLOBAL", self.root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Test")
@@ -463,23 +463,51 @@ fn a_person_s_edits_between_turns_are_not_the_agent_s() {
     assert_eq!(owners(&w.json(&["blame", "notes.txt"])), vec![None]);
 }
 
+/// `loch <args> --json` as another machine: its own HOME, in `cwd`.
+fn json_on(w: &World, home: &Path, cwd: &Path, args: &[&str]) -> Value {
+    let out = w
+        .command(env!("CARGO_BIN_EXE_loch"), cwd)
+        .args(args)
+        .arg("--json")
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap()
+}
+
+fn pushed(doc: &Value, kind: &str) -> i64 {
+    doc.get("pushed")
+        .unwrap()
+        .get(kind)
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
 #[test]
 fn the_link_survives_a_squash_and_a_fresh_clone() {
     let w = calculator_world();
+    let remote = w.root.join("remote");
+    let push = w.json(&["push", &s(&remote)]);
+    assert!(push.get("ok").unwrap().truthy(), "{:?}", push);
     w.git(&w.repo, &["add", "-A"]);
     w.git(&w.repo, &["commit", "-q", "-m", "squashed"]);
     let clone = w.root.join("teammate");
     w.git(&w.root, &["clone", "-q", &s(&w.repo), &s(&clone)]);
-    // Another machine: its own empty HOME, only the store in common.
+    // Another machine: its own empty HOME, only the remote in common.
     let other_home = w.root.join("other-home");
     fs::create_dir_all(&other_home).unwrap();
-    let out = w
-        .command(env!("CARGO_BIN_EXE_loch"), &clone)
-        .args(["blame", "calc.py", "--json"])
-        .env("HOME", &other_home)
-        .output()
-        .unwrap();
-    let blame = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    let before = json_on(&w, &other_home, &clone, &["blame", "calc.py"]);
+    assert_eq!(owners(&before)[4], None, "nothing until it pulls");
+    let pull = json_on(&w, &other_home, &clone, &["pull", &s(&remote)]);
+    assert_eq!(pull.get("records").unwrap().as_i64(), Some(1));
+    assert_eq!(pull.get("transcripts").unwrap().as_i64(), Some(1));
+    let blame = json_on(&w, &other_home, &clone, &["blame", "calc.py"]);
     assert_eq!(
         owners(&blame)[4],
         some("make sub safer and generate the table")
@@ -487,8 +515,205 @@ fn the_link_survives_a_squash_and_a_fresh_clone() {
     let first = &blame.get("conversations").unwrap().as_array().unwrap()[0];
     assert!(
         first.get("available").unwrap().truthy(),
-        "the transcript comes from the store"
+        "the transcript came with the pull"
     );
+    let again = json_on(&w, &other_home, &clone, &["pull", &s(&remote)]);
+    assert_eq!(again.get("records").unwrap().as_i64(), Some(0));
+    assert_eq!(again.get("upToDate").unwrap().as_i64(), Some(1));
+}
+
+#[test]
+fn push_sends_what_is_new_once() {
+    let mut w = calculator_world();
+    let remote = w.root.join("remote");
+    let dry = w.json(&["push", &s(&remote), "--dry-run"]);
+    assert_eq!(pushed(&dry, "records"), 1);
+    assert!(!remote.exists(), "a dry run sends nothing");
+    let first = w.json(&["push", &s(&remote)]);
+    assert_eq!(pushed(&first, "records"), 1);
+    assert_eq!(pushed(&first, "fileEntries"), 2);
+    assert_eq!(pushed(&first, "transcripts"), 1);
+    assert!(remote
+        .join(format!("edits/claude-code/{}.json", SESSION))
+        .is_file());
+    let second = w.json(&["push", &s(&remote)]);
+    assert_eq!(second.get("total").unwrap().as_i64(), Some(0));
+    assert_eq!(second.get("upToDate").unwrap().as_i64(), Some(4));
+    // A new turn changes the record and the transcript, and only those go.
+    w.prompt("p3", "one more");
+    w.sh("echo 'more_rows = 3' >> table.py");
+    w.stop("p3");
+    let third = w.json(&["push", &s(&remote)]);
+    assert_eq!(pushed(&third, "records"), 1);
+    assert_eq!(pushed(&third, "transcripts"), 1);
+    assert_eq!(pushed(&third, "fileEntries"), 0);
+}
+
+#[test]
+fn push_redacts_transcripts_and_leaves_the_local_copy_alone() {
+    let mut w = World::new(true);
+    w.prompt("p1", "deploy with AKIAABCDEFGHIJKLMNOP please");
+    w.write("a.py", "deployed_it = True\n");
+    w.stop("p1");
+    let remote = w.root.join("remote");
+    let push = w.json(&["push", &s(&remote)]);
+    assert!(push.get("redacted").unwrap().as_i64().unwrap() >= 1);
+    let key = format!("transcripts/claude-code/-repo/{}.jsonl", SESSION);
+    let sent = fs::read_to_string(remote.join(&key)).unwrap();
+    assert!(!sent.contains("AKIAABCDEFGHIJKLMNOP") && sent.contains("[REDACTED:"));
+    let kept = fs::read_to_string(w.store.join(&key)).unwrap();
+    assert!(kept.contains("AKIAABCDEFGHIJKLMNOP"));
+    assert!(fs::read_to_string(&w.transcript)
+        .unwrap()
+        .contains("AKIAABCDEFGHIJKLMNOP"));
+}
+
+#[test]
+fn push_and_pull_cover_this_project_unless_asked_for_all() {
+    let w = calculator_world();
+    let elsewhere = w.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    w.git(&elsewhere, &["init", "-q", "-b", "main"]);
+    w.git(
+        &elsewhere,
+        &["commit", "-q", "--allow-empty", "-m", "other root"],
+    );
+    let remote = w.root.join("remote");
+    let there = json_on(&w, &w.home, &elsewhere, &["push", &s(&remote)]);
+    assert_eq!(there.get("total").unwrap().as_i64(), Some(0));
+    assert!(there
+        .get("project")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .starts_with("git:"));
+    let all = json_on(&w, &w.home, &elsewhere, &["push", &s(&remote), "--all"]);
+    assert_eq!(pushed(&all, "records"), 1);
+    assert_eq!(all.get("project"), Some(&Value::Null));
+    let other_home = w.root.join("other-home");
+    fs::create_dir_all(&other_home).unwrap();
+    let scoped = json_on(&w, &other_home, &elsewhere, &["pull", &s(&remote)]);
+    assert_eq!(scoped.get("records").unwrap().as_i64(), Some(0));
+    let everything = json_on(&w, &other_home, &elsewhere, &["pull", &s(&remote), "--all"]);
+    assert_eq!(everything.get("records").unwrap().as_i64(), Some(1));
+}
+
+#[test]
+fn a_remote_tombstone_stops_push_and_pull_forgets() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    w.json(&["push", &s(&remote)]);
+    let other_home = w.root.join("other-home");
+    fs::create_dir_all(&other_home).unwrap();
+    json_on(&w, &other_home, &w.repo, &["pull", &s(&remote)]);
+    // Deleted on the remote, as `delete --remote` will.
+    for key in [
+        format!("edits/claude-code/{}.json", SESSION),
+        format!("transcripts/claude-code/-repo/{}.jsonl", SESSION),
+    ] {
+        fs::remove_file(remote.join(key)).unwrap();
+    }
+    fs::remove_dir_all(remote.join("index/file")).unwrap();
+    let tomb = remote.join(format!("tombstones/session/claude-code/{}", SESSION));
+    fs::create_dir_all(tomb.parent().unwrap()).unwrap();
+    fs::write(&tomb, "{}").unwrap();
+    // The teammate who pulled it can't push it back.
+    fs::remove_dir_all(other_home.join(".loch/pushed")).ok();
+    let back = json_on(&w, &other_home, &w.repo, &["push", &s(&remote)]);
+    assert_eq!(back.get("total").unwrap().as_i64(), Some(0));
+    assert!(back.get("tombstoned").unwrap().as_i64().unwrap() >= 1);
+    assert!(!remote
+        .join("edits")
+        .join("claude-code")
+        .join(format!("{}.json", SESSION))
+        .exists());
+    // And a pull forgets loch's copies here, but never the agent's own.
+    let pull = w.json(&["pull", &s(&remote)]);
+    assert_eq!(pull.get("forgotten").unwrap().as_i64(), Some(1));
+    assert!(!w
+        .store
+        .join(format!("edits/claude-code/{}.json", SESSION))
+        .exists());
+    assert!(!w
+        .home
+        .join(format!(".loch/edits/claude-code/{}.json", SESSION))
+        .exists());
+    assert!(w.transcript.is_file());
+    assert_eq!(owners(&w.json(&["blame", "calc.py"]))[4], None);
+}
+
+#[test]
+fn pull_refuses_what_a_remote_names_badly() {
+    let w = World::new(true);
+    let remote = w.root.join("remote");
+    fs::create_dir_all(remote.join("edits/claude-code")).unwrap();
+    fs::create_dir_all(remote.join("edits/nobody")).unwrap();
+    fs::write(remote.join("edits/claude-code/bad;id.json"), "{}").unwrap();
+    fs::write(remote.join("edits/nobody/s1.json"), "{}").unwrap();
+    // A record that claims to be another session than its key.
+    let other = "22222222-2222-3333-4444-555555555555";
+    fs::write(
+        remote.join(format!("edits/claude-code/{}.json", other)),
+        format!(
+            r#"{{"loch": 1, "agent": "claude-code", "session": "{}", "project": "x", "turns": []}}"#,
+            SESSION
+        ),
+    )
+    .unwrap();
+    let pull = w.json(&["pull", &s(&remote), "--all"]);
+    assert!(pull.get("ok").unwrap().truthy());
+    assert_eq!(pull.get("records").unwrap().as_i64(), Some(0));
+    assert_eq!(pull.get("refused").unwrap().as_i64(), Some(3));
+    assert!(!w.store.join("edits").exists());
+}
+
+#[test]
+fn push_and_pull_need_a_remote_and_say_so() {
+    let w = calculator_world();
+    let none = w.json(&["push"]);
+    assert!(none.get("code").unwrap().is_str("no-remote"));
+    let none = w.json(&["pull"]);
+    assert!(none.get("code").unwrap().is_str("no-remote"));
+    let unknown = w.json(&["push", "nope"]);
+    assert!(unknown.get("code").unwrap().is_str("unknown-remote"));
+    let own = w.json(&["push", &s(&w.store)]);
+    assert!(own.get("code").unwrap().is_str("invalid-uri"));
+    // A named remote, and the default when there is one.
+    let remote = w.root.join("remote");
+    w.json(&["remote", "add", "origin", &s(&remote)]);
+    let push = w.json(&["push"]);
+    assert!(push
+        .get("remote")
+        .unwrap()
+        .get("name")
+        .unwrap()
+        .is_str("origin"));
+    assert_eq!(pushed(&push, "records"), 1);
+}
+
+#[test]
+fn loch_store_still_names_the_remote_with_a_warning() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    let out = w
+        .command(env!("CARGO_BIN_EXE_loch"), &w.repo)
+        .args(["push"])
+        .env("LOCH_STORE", &remote)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LOCH_REMOTE"));
+    let doc = {
+        let out = w
+            .command(env!("CARGO_BIN_EXE_loch"), &w.repo)
+            .args(["push", "--json"])
+            .env("LOCH_STORE", &remote)
+            .output()
+            .unwrap();
+        assert!(out.stderr.is_empty());
+        json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap()
+    };
+    assert!(doc.get("deprecated").unwrap().is_str("LOCH_STORE"));
 }
 
 #[test]
@@ -603,6 +828,53 @@ fn hooks_never_fail_and_never_print() {
         assert!(out.status.success(), "{} {}", name, stdin);
         assert!(out.stdout.is_empty() && out.stderr.is_empty());
     }
+}
+
+/// A remote that accepts connections and never answers, as a hung S3 does.
+fn hung_remote() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    (listener, endpoint)
+}
+
+#[test]
+fn hooks_never_wait_on_a_remote() {
+    let mut w = World::new(true);
+    let (_listener, endpoint) = hung_remote();
+    w.prompt("p1", "write it");
+    w.write("a.py", "written_while_the_remote_hangs = 1\n");
+    w.record(format!(
+        r#"{{"type": "assistant", "uuid": "p1-end", "parentUuid": "p1", "sessionId": "{}", "cwd": "{}", "timestamp": "2026-11-18T10:01:30.000Z", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "done"}}]}}}}"#,
+        SESSION,
+        s(&w.repo)
+    ));
+    let started = std::time::Instant::now();
+    for name in ["stop", "end"] {
+        let mut child = w
+            .command(env!("CARGO_BIN_EXE_loch"), &w.repo)
+            .args(["hook", name])
+            .env("LOCH_STORE", "s3://bucket/prefix")
+            .env("LOCH_S3_ENDPOINT", &endpoint)
+            .env("AWS_ACCESS_KEY_ID", "test")
+            .env("AWS_SECRET_ACCESS_KEY", "test")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(w.event().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(owners(&w.json(&["blame", "a.py"]))[0].is_some());
+    assert!(w.store.join("transcripts/claude-code").is_dir());
 }
 
 #[test]
@@ -1104,4 +1376,125 @@ fn an_identical_stop_after_the_duplicate_window_is_handled() {
         owners(&w.json(&["blame", "a.py"])),
         vec![some("two steps"); 2]
     );
+}
+
+fn turn_prompts(record: &Value) -> Vec<String> {
+    record
+        .get("turns")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.get("promptUuid").unwrap().as_str().unwrap().to_string())
+        .collect()
+}
+
+fn stored_record(store: &Path) -> Value {
+    let text =
+        fs::read_to_string(store.join(format!("edits/claude-code/{}.json", SESSION))).unwrap();
+    json::loads(&text).unwrap()
+}
+
+/// A machine that pulled a session and then recorded turns of it under the
+/// same id (a restore that kept the id) has the pulled record in its store and
+/// no working copy. Its next turn must add to that record, not replace it.
+#[test]
+fn a_turn_adds_to_a_pulled_record_rather_than_replacing_it() {
+    let mut w = calculator_world();
+    fs::remove_dir_all(w.home.join(".loch/edits")).unwrap();
+    w.prompt("p3", "after the pull");
+    w.sh("echo 'reviewer_line = 1' >> table.py");
+    w.stop("p3");
+    assert_eq!(
+        turn_prompts(&stored_record(&w.store)),
+        vec!["p1", "p2", "p3"]
+    );
+}
+
+/// Two machines recorded different turns of one session. A push merges the
+/// remote's copy in rather than writing over it, and keeps the merge here.
+#[test]
+fn diverged_records_merge_on_push_and_pull() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    w.json(&["push", &s(&remote)]);
+    // The other machine's copy: the first turn, and one this machine never saw.
+    let theirs = remote.join(format!("edits/claude-code/{}.json", SESSION));
+    let mut record = json::loads(&fs::read_to_string(&theirs).unwrap()).unwrap();
+    if let Value::Object(map) = &mut record {
+        let turns = map.get_mut("turns").unwrap();
+        if let Value::Array(list) = turns {
+            list.truncate(1);
+            let mut extra = list[0].clone();
+            if let Value::Object(turn) = &mut extra {
+                turn.insert("promptUuid".into(), Value::str("elsewhere"));
+                turn.insert("ended".into(), Value::str("2026-11-18T11:00:00.000000Z"));
+            }
+            list.push(extra);
+        }
+    }
+    fs::write(&theirs, json::dumps(&record, json::DEFAULT)).unwrap();
+    // And this machine recorded another turn since its last push.
+    let mut w = w;
+    w.prompt("p3", "one more here");
+    w.sh("echo 'here_line = 3' >> table.py");
+    w.stop("p3");
+
+    let push = w.json(&["push", &s(&remote)]);
+    assert!(push.get("ok").unwrap().truthy(), "{:?}", push);
+    let merged = vec!["p1", "p2", "p3", "elsewhere"];
+    assert_eq!(turn_prompts(&stored_record(&remote)), merged);
+    assert_eq!(turn_prompts(&stored_record(&w.store)), merged);
+
+    // A third machine that has only its own turn merges both in on pull.
+    let other_home = w.root.join("other-home");
+    let other_store = other_home.join(".loch/store");
+    fs::create_dir_all(other_store.join("edits/claude-code")).unwrap();
+    let mut solo = stored_record(&w.store);
+    if let Value::Object(map) = &mut solo {
+        if let Some(Value::Array(list)) = map.get_mut("turns") {
+            list.retain(|t| t.get("promptUuid").unwrap().is_str("p1"));
+            let mut mine = list[0].clone();
+            if let Value::Object(turn) = &mut mine {
+                turn.insert("promptUuid".into(), Value::str("third"));
+                turn.insert("ended".into(), Value::str("2026-11-18T12:00:00.000000Z"));
+            }
+            list.push(mine);
+        }
+    }
+    fs::write(
+        other_store.join(format!("edits/claude-code/{}.json", SESSION)),
+        json::dumps(&solo, json::DEFAULT),
+    )
+    .unwrap();
+    let pull = json_on(&w, &other_home, &w.repo, &["pull", &s(&remote)]);
+    assert_eq!(pull.get("records").unwrap().as_i64(), Some(1));
+    assert_eq!(
+        turn_prompts(&stored_record(&other_store)),
+        vec!["p1", "p2", "p3", "elsewhere", "third"]
+    );
+}
+
+#[test]
+fn push_force_resends_what_the_markers_claim_was_sent() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    w.json(&["push", &s(&remote)]);
+    fs::remove_dir_all(&remote).unwrap();
+    let stale = w.json(&["push", &s(&remote)]);
+    assert_eq!(stale.get("total").unwrap().as_i64(), Some(0));
+    let forced = w.json(&["push", &s(&remote), "--force"]);
+    assert_eq!(pushed(&forced, "records"), 1);
+    assert!(remote
+        .join(format!("edits/claude-code/{}.json", SESSION))
+        .is_file());
+}
+
+#[test]
+fn a_symlink_to_the_local_store_is_not_a_remote() {
+    let w = calculator_world();
+    let link = w.root.join("link-to-store");
+    std::os::unix::fs::symlink(&w.store, &link).unwrap();
+    let push = w.json(&["push", &s(&link)]);
+    assert!(push.get("code").unwrap().is_str("invalid-uri"));
 }

@@ -44,6 +44,11 @@ impl FileStore {
         FileStore { root: root.into() }
     }
 
+    /// Without reading it: `list` walks the whole store.
+    pub fn exists(&self, key: &str) -> bool {
+        is_safe_key(key) && Path::new(&self.path(key)).is_file()
+    }
+
     /// `Path(root) / key`, which collapses repeated and trailing slashes.
     fn path(&self, key: &str) -> String {
         let mut path = self.root.trim_end_matches('/').to_string();
@@ -60,6 +65,27 @@ impl FileStore {
     }
 }
 
+/// Whether a key names a place inside the store when made a path: no empty,
+/// `.` or `..` segment, nothing a path would read as a root or a separator.
+/// Keys `pull` writes are named by a remote, which is someone else's input.
+pub fn is_safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.contains(['\\', '\0'])
+        && key
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn refuse_unsafe(key: &str) -> Result<(), StoreError> {
+    if is_safe_key(key) {
+        Ok(())
+    } else {
+        Err(StoreError::Missing(
+            "refused a key outside the store".into(),
+        ))
+    }
+}
+
 fn unreachable(error: &std::io::Error, path: &str) -> StoreError {
     StoreError::Unreachable(sys::os_error(error, path))
 }
@@ -69,14 +95,18 @@ impl Store for FileStore {
         self.root.clone()
     }
 
+    /// Written aside and renamed: the local store is what the hooks write and
+    /// `pull` fills while either may be killed, so a reader sees the old
+    /// object or the new one, never half of either.
     fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError> {
+        refuse_unsafe(key)?;
         let path = self.path(key);
-        let parent = sys::dirname(&path);
-        fs::create_dir_all(&parent).map_err(|e| unreachable(&e, &parent))?;
-        fs::write(&path, data).map_err(|e| unreachable(&e, &path))
+        crate::snapshot::write_atomically(Path::new(&path), data)
+            .map_err(|e| unreachable(&e, &path))
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        refuse_unsafe(key)?;
         let path = self.path(key);
         fs::read(&path).map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => StoreError::Missing(format!("no object at {}", key)),
@@ -99,6 +129,7 @@ impl Store for FileStore {
     }
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
+        refuse_unsafe(key)?;
         let path = self.path(key);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -116,6 +147,11 @@ fn walk(dir: &Path, relative: &str, keys: &mut Vec<String>) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        // A write in progress (`put` stages `.<name>.tmp<pid>` and renames
+        // it), which no key names.
+        if name.starts_with('.') {
+            continue;
+        }
         let key = if relative.is_empty() {
             name.clone()
         } else {
@@ -136,11 +172,12 @@ pub fn default_store() -> String {
     sys::join(&sys::join(&home_dir(), ".loch"), "store")
 }
 
-pub fn resolve_store_uri(explicit: Option<&str>) -> String {
-    if let Some(uri) = explicit {
-        return uri.to_string();
-    }
-    std::env::var("LOCH_STORE").unwrap_or_else(|_| default_store())
+/// This machine's own store, which the hooks, `backfill`, `blame`, `log` and
+/// `ask` use and nothing else. They never reach the network: a remote that
+/// doesn't answer would hold a turn for its timeout, and Codex kills a
+/// `SessionEnd` hook at 3s.
+pub fn local_store() -> FileStore {
+    FileStore::new(default_store())
 }
 
 #[derive(Debug)]

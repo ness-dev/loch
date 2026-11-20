@@ -98,6 +98,15 @@ requirements fixed the rest of the design:
   `SessionEnd`, the third hook — closes it first, marked `interrupted`. Every
   state and record file is written aside and renamed, so a hook killed
   mid-write leaves the old file or the new one, never half of either.
+- **Hooks never touch the network.** They write the edit record, its file
+  index and a copy of the transcript to the local store (`~/.loch/store`,
+  `store::local_store`), whatever `LOCH_STORE` says, and so do `backfill`'s
+  records. `blame`, `log` and `ask` read only that store. Publishing from the
+  hook was the first design, and a remote that didn't answer held every
+  `Stop` for the S3 timeout (`end` took 8.3s against an unreachable bucket),
+  while Codex kills a `SessionEnd` hook at 3s, so the last turn's record
+  never left the machine. Getting records to and from a remote is an explicit
+  step, like git's push and fetch. `hooks_never_wait_on_a_remote` pins it.
 - **No background process.** Snapshots are taken on demand with a stat cache,
   the way git's index works: files whose size and mtime are unchanged aren't
   read again. A harness with no hooks gets coarser attribution, never a
@@ -253,6 +262,100 @@ source of truth and every entry is reconstructible by listing `bundles/`
 and unpacking. That is what makes `reindex` a repair command and what
 makes a half-failed `save` leave a recoverable store rather than a corrupt
 one. Nothing may end up knowable only from the index.
+
+**Push and pull, git style: `save` is `commit`.** The local store
+(`~/.loch/store`) is where everything is recorded first, bundles included.
+Named remotes (`loch remote`, kept in `~/.loch/config`) are where `push` sends and `pull` fetches from, as git's
+remotes are. `blame`, `log` and `ask` read only the local store, so a
+teammate's turns arrive by `pull`, never by a read that waits on the network.
+- **What moves.** `push` sends the current project's bundles with their
+  branch entries, and its sessions' edit records, file index and transcripts
+  (`--all` for every project's). A bundle belongs to a project if any session
+  in it ran there: sending every bundle on the machine, as the first cut did,
+  put one client's transcripts on another's remote. A bundle whose sessions'
+  directories are gone from this machine can't be placed and goes only with
+  `--all`. Bundles were redacted by `save` and go as they are, so a ref is the
+  same everywhere. Transcripts are kept verbatim locally and redacted on the
+  way out. One in which a secret survives redaction is skipped and named in
+  `redactionFailed`, the rest still goes, and the push ends `redaction-failed`.
+  Redaction is deterministic, so failing the whole push would block every
+  later one. Edit records hold line hashes, and their `prompt` was redacted
+  when recorded. `pull` fetches records with their transcripts, scoped through
+  the remote's file index, so a session whose turns edited no file isn't
+  pulled; it has nothing to blame anyway. Bundles are not pulled.
+- **Edit records merge, they are never replaced.** A session restored under
+  its own id and resumed is recorded by two machines, and a record is one
+  mutable object per session. Writing it whole erased the other machine's
+  turns, locally (the hook started from its working copy alone, which `pull`
+  never fills) and on the remote (the next push). So `EditRecord::merge`
+  takes both copies' turns, a turn known by its prompt's id (else by when it
+  ran), the later stop winning. The hook merges the working copy with the
+  store's, `pull` merges into the local copy, and `push` merges the remote's
+  copy in before it uploads and keeps the merge here. Two pushes of one session
+  at the same moment can still drop one's new turns from the remote, until
+  that machine's record next changes and its push merges them back. The
+  other side of merging: a turn removed on one machine (a `backfill` re-run
+  dropping a contested backfilled turn) comes back from any other copy, and
+  only a tombstone removes anything for good. That is the trade taken, since
+  a lost turn is silent and a resurrected one is visible.
+  Transcripts are still one object per key, last writer wins. Claude's keys
+  name the project directory, so a session resumed in another checkout gets
+  its own key, but a Codex rollout's name doesn't change on restore.
+- **What has been sent is remembered here, not there.** `~/.loch/pushed/<uri
+  hash>.json` maps each key to the hash of the local bytes last sent, so the
+  remote stays a set of independent objects (no manifest, per "No single
+  index object") and a second push sends only what changed. Losing that file
+  only re-sends. A stale one is the silent case: a remote emptied or replaced
+  by anything but `delete --remote` makes every push say it is up to date.
+  `push --force` ignores the markers. Push sends a bundle before its entries
+  and a record before its file index, the order `save` and the hooks keep, so
+  a push cut short leaves what `reindex` can repair.
+- **A delete on a remote stays deleted.** A tombstone (`tombstones/bundle/
+  <ref>`, `tombstones/session/<agent>/<id>`) is one new key per delete and
+  holds no content. Every push reads them first and sends nothing they cover,
+  so a teammate's copy can't bring a deleted session back. It reads them
+  again afterwards and withdraws what a delete racing it covered, which
+  closes the race in practice but not atomically. Every pull copies them here
+  and forgets loch's copies of what they cover, but never an agent's
+  transcript in its own directory. Being able to delete is why loch uses
+  object storage, so this is stricter than git on purpose. Whether a local
+  tombstone should hold for every remote is to be tested against use.
+- **The store commands, by git's answer.** `save` writes the bundle here,
+  and `save --push [<remote>]` sends that bundle alone afterwards. A push
+  failing after the save is reported with the ref, since the bundle exists.
+  `restore` looks here first, then fetches the one bundle from the remote
+  (`fetchedFrom`), checks that its bytes hash to the ref, and keeps it, as
+  git keeps what it fetched. Content addressing is what makes any remote's
+  copy as good as another's. `list --saved` is this machine's bundles,
+  `list --remote` is `ls-remote`, and plain `list` is still the live
+  sessions. `delete <ref>` is local. With `--remote` it writes the tombstone
+  on the remote first (so a racing push sees it), deletes there, and
+  tombstones and deletes here too. `delete --session <id>` does the same for
+  a session's record, file index and transcripts, which is the delete that
+  matters, since transcripts are what leak. A ref in neither place is
+  `bundle-not-found`, and no tombstone is written for a typo. `reindex` is
+  per store. `--store <uri>` still works everywhere, meaning `--remote <uri>`
+  (`save --push <uri>` for `save`), which is the meaning callers had.
+- **The one silent change, made loud.** A caller with `LOCH_STORE` set that
+  runs a plain `save` used to upload. Now it gets `ok: true` and a bundle on
+  this machine only, so it is warned (stderr in text, `"deprecated":
+  "LOCH_STORE"` in JSON), and `schema` is 3. The Harness "send worktree to
+  remote" flow needs `save --push` (or a push to the destination as a
+  remote), and `restore` there finds the bundle by fetching it.
+- **A remote's keys are someone else's input.** `FileStore` refuses a key
+  with an empty, `.` or `..` segment, and `pull` takes a record only for an
+  agent this build knows, an id `is_safe_session_id` accepts, and contents
+  that name the session and project its key does. Anything else is counted
+  as `refused` and never written.
+- **The remote is never guessed.** A command names a remote or a URI, else
+  `LOCH_REMOTE`, else `LOCH_STORE` (its old meaning, with a warning on
+  stderr in text mode and `"deprecated": "LOCH_STORE"` in JSON), else
+  `origin`, else the only remote. Several remotes and no `origin` is
+  `ambiguous-remote`, since a push to the wrong one publishes transcripts. A
+  URI scheme the store doesn't know is `invalid-uri`: `create_store` reads
+  anything else as a relative path, so `ssh://host` would have become a
+  local directory a push succeeded into. The local store itself is refused
+  as a remote, compared resolved, so a symlink to it is refused too.
 
 ## Empirical findings about Claude Code's storage
 
@@ -474,7 +577,7 @@ binary on top of it. The toolchain is pinned in `rust-toolchain.toml`.
 src/
 ├── main.rs       # argv handling, dispatch, the two renderers' entry point
 ├── cli.rs        # every command: list/save/restore/delete/reindex/ingest/install/
-│                 #   blame/log/ask/backfill/gc/hook/help/version
+│                 #   blame/log/ask/backfill/push/pull/remote/gc/hook/help/version
 ├── agent.rs      # the adapter boundary: what loch needs from one agent harness
 ├── claude.rs     # Claude Code adapter: path encoding, discovery, metadata, turns, fork
 ├── codex.rs      # Codex adapter: rollout discovery, live cwd, turns by id, prefix fork
@@ -492,7 +595,9 @@ src/
 ├── output.rs     # result envelope, the two renderers, structured failures
 ├── redact.rs     # secret scrubbing, applied on save before packing
 ├── rewrite.rs    # path rewriting (the load-bearing logic)
-├── store.rs      # Store interface + local-fs backend
+├── store.rs      # Store interface + local-fs backend, the local store
+├── remote.rs     # named remotes in ~/.loch/config, and which one a command means
+├── sync.rs       # push and pull: markers of what was sent, tombstones
 ├── s3.rs         # the S3-compatible backend, SigV4 by hand
 ├── json.rs       # JSON reading and writing, RFC 8785 canonical form
 ├── argparse.rs   # command-line parsing, usage errors and -h
@@ -796,12 +901,14 @@ So every command takes `--json`, accepted either before or after the
 subcommand, and answers with exactly one document on stdout:
 
 ```json
-{"schema": 2, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
+{"schema": 3, "ok": true, "command": "save", "ref": "...", "bytes": 331, ...}
 ```
 
 `schema` is the envelope version. It exists so a consumer can detect a
 format change it doesn't understand; bump it when a field changes meaning or
-disappears, not when one is added.
+disappears, not when one is added. It went to 3 when `save` stopped writing to
+`LOCH_STORE` (its `store` names this machine's store now) and `blame`, `log`,
+`ask` and `backfill` lost `--store`.
 
 **Built once per command, rendered twice.** Each `command_*` returns a
 `Result` — the payload, the prose, and any stderr warnings — and `main()`
@@ -812,7 +919,7 @@ prose that describes it will rot the first time someone edits the prose.
 **Failures are documents, on stdout.**
 
 ```json
-{"schema": 2, "ok": false, "command": "restore", "code": "nothing-restored",
+{"schema": 3, "ok": false, "command": "restore", "code": "nothing-restored",
  "error": "nothing restored", "sessions": [{"status": "skipped", ...}]}
 ```
 
@@ -831,7 +938,7 @@ never a code. The set today:
 | `redaction-failed` | a secret survived redaction; nothing was uploaded |
 | `transcript-unreadable` | `save` found a transcript that isn't UTF-8; nothing was uploaded |
 | `missing-ref` | `restore`/`delete` called without a ref |
-| `bundle-not-found` | the store answered and the ref isn't there |
+| `bundle-not-found` | the store answered and the ref isn't there (for `restore`, not here and not on the remote) |
 | `store-unreachable` | the store didn't answer |
 | `bundle-unreadable` | the bytes arrived and won't unpack |
 | `nothing-restored` | every session in the bundle was skipped |
@@ -842,6 +949,13 @@ never a code. The set today:
 | `turn-not-found` | the transcript no longer holds the record a turn ended on |
 | `unknown-agent` | `--agent` named an agent this build doesn't know |
 | `unsupported-agent` | `ask` on a turn whose agent's adapter can't fork or resume |
+| `session-not-found` | `delete --session` on a session with no record here (or on the remote) |
+| `no-remote` | a command that needs a remote named none, and none is configured |
+| `ambiguous-remote` | several remotes are configured, none is `origin`, and none was named |
+| `unknown-remote` | no remote by that name |
+| `remote-exists` | `remote add` of a name already taken |
+| `invalid-uri` | a remote URI no store understands, or the local store itself |
+| `config-unreadable` | `~/.loch/config` exists and won't parse (it is never overwritten) |
 | `unknown-command` | no such subcommand |
 | `usage` | argparse rejected the arguments (exit status 2) |
 | `internal` | an unexpected exception |
@@ -1117,7 +1231,7 @@ kinds don't justify an async runtime and several MB. The signer is pinned to
 AWS's two published examples (a header-signed GET and a signed query
 string). Listings send `encoding-type=url` and decode the keys, so a key
 with any character survives the XML. A store that doesn't answer fails
-after 20s rather than holding a turn. The tests that need an endpoint are
+after 20s. No hook ever waits on that, since hooks write only locally. The tests that need an endpoint are
 `#[ignore]`d in `tests/store.rs` and `tests/index.rs`, and read it from
 `LOCH_TEST_S3_ENDPOINT` (bucket `LOCH_TEST_S3_BUCKET`, default `sessions`):
 `moto_server` or MinIO will do. moto's verifier rejects correct signatures on
@@ -1222,7 +1336,7 @@ release exists yet.
   generator are attributed to the turn that ran them, with no edit tool
   involved.
 - **History rewrites don't matter.** After a squash, a fresh clone with an
-  empty HOME and only the store in common blames the same lines to the same
+  empty HOME and only a copy of the store blames the same lines to the same
   turns, and finds the transcripts in the store.
 - **A person's text isn't the agent's.** A line someone later rewrote is
   unattributed, a re-indented one keeps its turn, and a person's lone `}` is

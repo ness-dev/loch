@@ -15,9 +15,11 @@ use crate::object;
 use crate::output::{fail, CommandError, Outcome, JSON_FLAG};
 use crate::py;
 use crate::redact;
+use crate::remote::{self, Remote, RemoteError};
 use crate::rewrite::{self, ForeignCwd, RewriteSpec};
 use crate::snapshot;
-use crate::store::{create_store, resolve_store_uri, Store, StoreError};
+use crate::store::{Store, StoreError};
+use crate::sync::{self, SyncError};
 use crate::sys;
 use crate::trace::{self, Link, Resolver, TraceError};
 use std::collections::HashMap;
@@ -94,10 +96,6 @@ fn index_error(description: &str, error: IndexError) -> Failure {
             format!("{}: {}", description, m),
         )),
     }
-}
-
-fn open_store(uri: Option<&str>) -> std::result::Result<Box<dyn Store>, Failure> {
-    create_store(&resolve_store_uri(uri)).map_err(|e| Failure::Internal(e.0))
 }
 
 pub fn format_bytes(count: u64) -> String {
@@ -257,13 +255,20 @@ pub fn command_list(argv: &[String]) -> Run {
     p.option("--cwd")
         .option("--branch")
         .option("--agent")
-        .flag("--remote", None)
+        .option_optional("--remote", "", "NAME")
+        .flag("--saved", None)
         .flag("--all", Some("every"))
         .option("--store");
     let args = p.parse(argv)?;
-    let (cwd, branch, store) = (args.str("cwd"), args.str("branch"), args.str("store"));
-    if args.flag("remote") || args.flag("every") || store.is_some() {
-        return list_remote(cwd, branch, store, args.flag("every"));
+    let (cwd, branch) = (args.str("cwd"), args.str("branch"));
+    let every = args.flag("every");
+    if let Some(asked) = remote_asked(&args) {
+        let (remote, store) = open_remote(asked.as_deref())?;
+        return list_bundles(cwd, branch, store.as_ref(), Some(&remote), every);
+    }
+    if args.flag("saved") || every {
+        let local = crate::store::local_store();
+        return list_bundles(cwd, branch, &local, None, every);
     }
     let agents = agents_arg(args.str("agent").as_deref())?;
     let (cwd, sessions) = collect(&agents, cwd.as_deref(), branch.as_deref(), None);
@@ -280,6 +285,7 @@ pub fn command_list(argv: &[String]) -> Run {
         "list",
         object! {
             "remote" => false,
+            "saved" => false,
             "cwd" => cwd.as_str(),
             "branch" => Value::opt_str(branch.as_deref()),
             "sessions" => sessions.iter().map(session_payload).collect::<Vec<_>>(),
@@ -294,13 +300,15 @@ pub fn current_branch(cwd: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-fn list_remote(
+/// Saved bundles, by their branch entries: this machine's (`--saved`), or a
+/// remote's (`--remote`, git's `ls-remote`).
+fn list_bundles(
     cwd: Option<String>,
     branch: Option<String>,
-    uri: Option<String>,
+    store: &dyn Store,
+    remote: Option<&Remote>,
     every: bool,
 ) -> Run {
-    let store = open_store(uri.as_deref())?;
     let cwd = resolve_cwd(&cwd.unwrap_or_else(sys::getcwd));
     let branch = branch.or_else(|| current_branch(&cwd));
     let prefix = if every {
@@ -308,8 +316,8 @@ fn list_remote(
     } else {
         index::value_prefix(BRANCH, branch.as_deref())
     };
-    let described = store.describe();
-    let entries = index::load_entries(store.as_ref(), &prefix)
+    let described = remote.map_or_else(|| store.describe(), Remote::label);
+    let entries = index::load_entries(store, &prefix)
         .map_err(|e| index_error(&format!("could not list {}", described), e))?;
     let mut refs: Vec<&str> = entries.iter().map(|e| e.ref_.as_str()).collect();
     refs.sort();
@@ -338,18 +346,26 @@ fn list_remote(
         }
         text
     };
-    Ok(Outcome::with(
-        "list",
-        object! {
-            "remote" => true,
-            "store" => described.as_str(),
-            "all" => every,
-            "branch" => if every { Value::Null } else { Value::opt_str(branch.as_deref()) },
-            "bundles" => refs.len(),
-            "entries" => entries.iter().map(entry_payload).collect::<Vec<_>>(),
-        },
-        text,
-    ))
+    let mut payload = object! {
+        "remote" => remote.is_some(),
+        "saved" => remote.is_none(),
+        "store" => store.describe(),
+        "all" => every,
+        "branch" => if every { Value::Null } else { Value::opt_str(branch.as_deref()) },
+        "bundles" => refs.len(),
+        "entries" => entries.iter().map(entry_payload).collect::<Vec<_>>(),
+    };
+    let mut outcome_warnings = Vec::new();
+    if let Some(remote) = remote {
+        payload.insert("remoteName".into(), Value::opt_str(remote.name.as_deref()));
+        if remote.deprecated {
+            payload.insert("deprecated".into(), Value::str("LOCH_STORE"));
+        }
+        outcome_warnings.extend(remote.warning());
+    }
+    let mut outcome = Outcome::with("list", payload, text);
+    outcome.warnings = outcome_warnings;
+    Ok(outcome)
 }
 
 // -- save ---------------------------------------------------------------------
@@ -369,8 +385,14 @@ pub fn command_save(argv: &[String]) -> Run {
         .option("--branch")
         .option("--session")
         .option("--agent")
+        .option_optional("--push", "", "REMOTE")
         .option("--store");
     let args = p.parse(argv)?;
+    // `--store <uri>` is the older spelling of `--push <uri>`.
+    let push_to: Option<Option<String>> = match args.str("store").filter(|s| !s.is_empty()) {
+        Some(uri) => Some(Some(uri)),
+        None => args.str("push").map(|r| Some(r).filter(|r| !r.is_empty())),
+    };
     let agents = agents_arg(args.str("agent").as_deref())?;
     let (cwd, sessions) = collect(
         &agents,
@@ -439,14 +461,50 @@ pub fn command_save(argv: &[String]) -> Run {
     bundle.version = bundle.required_version();
     let packed = bundle::pack_bundle(&bundle).map_err(|e| Failure::Internal(e.0))?;
     let ref_ = bundle::bundle_ref(&packed);
-    let store = open_store(args.str("store").as_deref())?;
+    // Resolved before anything is written, so a remote that can't be named
+    // fails the save rather than leaving a bundle it didn't ask for.
+    let remote = match &push_to {
+        Some(asked) => Some(open_remote(asked.as_deref())?),
+        None => None,
+    };
+    let store = crate::store::local_store();
     let described = format!("could not write to {}", store.describe());
     // Bundle first: an index entry is derived from it.
     store
         .put(&index::bundle_key(&ref_), &packed)
         .map_err(|e| store_error(&described, e))?;
-    let entries = index::index_bundle(store.as_ref(), &bundle, &ref_, packed.len())
+    let entries = index::index_bundle(&store, &bundle, &ref_, packed.len())
         .map_err(|e| store_error(&described, e))?;
+    let pushed = match &remote {
+        Some((remote, opened)) => {
+            let mut report = sync::PushReport::new(false);
+            let result = sync::push(
+                &store,
+                opened.as_ref(),
+                &remote.uri,
+                sync::Scope::Bundle(&ref_),
+                &mut report,
+            );
+            let summary = with_remote(report.payload(), remote);
+            if let Err(error) = result {
+                return Err(match sync_error(remote, error) {
+                    Failure::Error(mut failure) => {
+                        failure.message =
+                            format!("saved {} on this machine, but {}", ref_, failure.message);
+                        failure.payload = object! {
+                            "ref" => ref_.as_str(),
+                            "store" => store.describe(),
+                            "pushed" => Value::Object(summary),
+                        };
+                        Failure::Error(failure)
+                    }
+                    other => other,
+                });
+            }
+            Some((remote, report, summary))
+        }
+        None => None,
+    };
 
     let total: usize = redactions.iter().map(|c| c.values().sum::<usize>()).sum();
     let mut text = String::new();
@@ -485,11 +543,37 @@ pub fn command_save(argv: &[String]) -> Run {
         store.describe()
     ));
     text.push_str(&format!("indexed under {}\n", indexed.join(", ")));
+    match &pushed {
+        Some((remote, report, _)) if report.tombstoned > 0 => text.push_str(&format!(
+            "not pushed: {} has deleted this bundle\n",
+            remote.label()
+        )),
+        Some((remote, report, _)) if report.total() == 0 => {
+            text.push_str(&format!("{} already has it\n", remote.label()))
+        }
+        Some((remote, _, _)) => text.push_str(&format!("pushed to {}\n", remote.label())),
+        None => {}
+    }
     text.push_str(&format!("ref {}\n", ref_));
+    // A caller that set LOCH_STORE expected `save` to upload, as it did
+    // before remotes; answering `ok` and keeping the bundle here would be the
+    // silent failure, so it is told.
+    let mut warnings = Vec::new();
+    let stale_store = push_to.is_none() && std::env::var_os("LOCH_STORE").is_some();
+    if stale_store {
+        warnings.push(
+            "LOCH_STORE is set, but save keeps bundles on this machine now; `loch save --push` or `loch push` sends them\n"
+                .to_string(),
+        );
+    }
 
-    Ok(Outcome::with(
+    let mut outcome = Outcome::with(
         "save",
         object! {
+            "pushed" => match &pushed {
+                Some((_, _, summary)) => Value::Object(summary.clone()),
+                None => Value::Null,
+            },
             "ref" => ref_.as_str(),
             "bytes" => packed.len(),
             "store" => store.describe(),
@@ -515,7 +599,17 @@ pub fn command_save(argv: &[String]) -> Run {
             })).collect::<Vec<_>>(),
         },
         text,
-    ))
+    );
+    if stale_store {
+        outcome
+            .payload
+            .insert("deprecated".into(), Value::str("LOCH_STORE"));
+    }
+    if let Some((remote, _, _)) = &pushed {
+        warnings.extend(remote.warning());
+    }
+    outcome.warnings = warnings;
+    Ok(outcome)
 }
 
 // -- restore ------------------------------------------------------------------
@@ -555,23 +649,54 @@ pub fn command_restore(argv: &[String]) -> Run {
     let mut p = parser("restore");
     p.positional("ref", Nargs::Optional)
         .option("--into")
+        .option_optional("--remote", "", "NAME")
         .option("--store")
         .flag("--force", None)
         .flag("--new-id", Some("new_id"));
     let args = p.parse(argv)?;
-    let Some(ref_) = args.str("ref").filter(|r| !r.is_empty()) else {
+    let (ref_, asked) = ref_and_remote(&args);
+    let Some(ref_) = ref_ else {
         return err("missing-ref", "restore requires a bundle ref");
     };
-    let store = open_store(args.str("store").as_deref())?;
-    let described = format!("could not read {} from {}", ref_, store.describe());
-    let packed = store
-        .get(&index::bundle_key(&ref_))
-        .map_err(|e| store_error(&described, e))?;
+    let local = crate::store::local_store();
+    let (packed, fetched) = match local.get(&index::bundle_key(&ref_)) {
+        Ok(packed) => (packed, None),
+        Err(StoreError::Missing(_)) => {
+            let (remote, packed) = fetch_bundle(&ref_, asked)?;
+            (packed, Some(remote))
+        }
+        Err(e) => {
+            return Err(store_error(
+                &format!("could not read {} from {}", ref_, local.describe()),
+                e,
+            ))
+        }
+    };
+    let described = format!(
+        "could not read {} from {}",
+        ref_,
+        fetched
+            .as_ref()
+            .map_or_else(|| local.describe(), Remote::label)
+    );
     let bundle = match bundle::unpack_bundle(&packed) {
         Ok(bundle) => bundle,
         // Fetched fine and still unusable: neither absent nor unreachable.
         Err(error) => return err("bundle-unreadable", format!("{}: {}", described, error)),
     };
+    // Kept, as git keeps what it fetched: the bytes hash to the ref, so this
+    // copy is the bundle, whichever remote it came from.
+    if fetched.is_some() {
+        let cached = local
+            .put(&index::bundle_key(&ref_), &packed)
+            .and_then(|()| index::index_bundle(&local, &bundle, &ref_, packed.len()).map(|_| ()));
+        if let Err(e) = cached {
+            return Err(store_error(
+                &format!("could not keep {} in {}", ref_, local.describe()),
+                e,
+            ));
+        }
+    }
     let target_cwd = resolve_cwd(&args.str("into").unwrap_or_else(sys::getcwd));
     let target_home = home_dir();
     let mut restored = Vec::new();
@@ -652,7 +777,9 @@ pub fn command_restore(argv: &[String]) -> Run {
 
     let payload = object! {
         "ref" => ref_.as_str(),
-        "store" => store.describe(),
+        "store" => local.describe(),
+        // Where the bundle came from: here, or fetched from a remote.
+        "fetchedFrom" => fetched.as_ref().map_or(Value::Null, Remote::payload),
         "cwd" => target_cwd.as_str(),
         "origin" => object! {
             "hostname" => bundle.origin.hostname.as_str(),
@@ -678,6 +805,9 @@ pub fn command_restore(argv: &[String]) -> Run {
             }
         })
         .collect();
+    if let Some(remote) = &fetched {
+        warnings.extend(remote.warning());
+    }
     for session in &restored {
         for (origin, foreign) in &session.foreign {
             warnings.push(format!(
@@ -735,35 +865,248 @@ pub fn command_restore(argv: &[String]) -> Run {
 
 pub fn command_delete(argv: &[String]) -> Run {
     let mut p = parser("delete");
-    p.positional("ref", Nargs::Optional).option("--store");
+    p.positional("ref", Nargs::Optional)
+        .option("--session")
+        .option("--agent")
+        .option_optional("--remote", "", "NAME")
+        .option("--store");
     let args = p.parse(argv)?;
-    let Some(ref_) = args.str("ref").filter(|r| !r.is_empty()) else {
-        return err("missing-ref", "delete requires a bundle ref");
+    let (ref_, asked) = ref_and_remote(&args);
+    let session = args.str("session").filter(|s| !s.is_empty());
+    let local = crate::store::local_store();
+    let remote = match &asked {
+        Some(asked) => Some(open_remote(asked.as_deref())?),
+        None => None,
     };
-    let store = open_store(args.str("store").as_deref())?;
-    let removed = index::delete_bundle(store.as_ref(), &ref_).map_err(|e| {
-        index_error(
-            &format!("could not delete {} from {}", ref_, store.describe()),
-            e,
-        )
-    })?;
-    let mut text: String = removed
+    let deleted = match (ref_, session) {
+        (Some(_), Some(_)) => {
+            let mut error = CommandError::new("usage", "delete takes a ref or --session, not both");
+            error.exit_status = 2;
+            return Err(Failure::Error(error));
+        }
+        (None, None) => return err("missing-ref", "delete requires a bundle ref or --session"),
+        (Some(ref_), None) => delete_bundle_everywhere(&local, remote.as_ref(), &ref_)?,
+        (None, Some(session)) => {
+            delete_session_everywhere(&local, remote.as_ref(), &session, args.str("agent"))?
+        }
+    };
+    let mut text: String = deleted
+        .removed
         .iter()
         .map(|k| format!("  removed {}\n", k))
         .collect();
-    text.push_str(&format!("\ndeleted {} from {}\n", ref_, store.describe()));
-    Ok(Outcome::with(
-        "delete",
-        object! {"ref" => ref_.as_str(), "store" => store.describe(), "removed" => strings(&removed)},
-        text,
-    ))
+    for key in &deleted.removed_remote {
+        text.push_str(&format!("  removed {} from the remote\n", key));
+    }
+    let what = deleted.subject.clone();
+    match &remote {
+        Some((remote, _)) => text.push_str(&format!(
+            "\ndeleted {} from {} and this machine; a tombstone keeps it deleted\n",
+            what,
+            remote.label()
+        )),
+        None => text.push_str(&format!("\ndeleted {} from {}\n", what, local.describe())),
+    }
+    let mut payload = object! {
+        "ref" => Value::opt_str(deleted.ref_.as_deref()),
+        "session" => Value::opt_str(deleted.session.as_deref()),
+        "store" => local.describe(),
+        "removed" => strings(&deleted.removed),
+        "removedRemote" => strings(&deleted.removed_remote),
+        "tombstones" => strings(&deleted.tombstones),
+    };
+    let mut outcome_warnings = Vec::new();
+    if let Some((remote, _)) = &remote {
+        payload = with_remote(payload, remote);
+        outcome_warnings.extend(remote.warning());
+    } else {
+        payload.insert("remote".into(), Value::Null);
+    }
+    let mut outcome = Outcome::with("delete", payload, text);
+    outcome.warnings = outcome_warnings;
+    Ok(outcome)
+}
+
+struct Deleted {
+    subject: String,
+    ref_: Option<String>,
+    session: Option<String>,
+    removed: Vec<String>,
+    removed_remote: Vec<String>,
+    tombstones: Vec<String>,
+}
+
+/// A bundle, from this machine and, with a remote, from it too. On a remote
+/// the tombstone is written first, so a push racing the delete sees it before
+/// the bundle is gone; here it is written as well, so this machine never
+/// pushes the bundle anywhere again.
+fn delete_bundle_everywhere(
+    local: &crate::store::FileStore,
+    remote: Option<&(Remote, Box<dyn Store>)>,
+    ref_: &str,
+) -> std::result::Result<Deleted, Failure> {
+    let mut deleted = Deleted {
+        subject: ref_.to_string(),
+        ref_: Some(ref_.to_string()),
+        session: None,
+        removed: Vec::new(),
+        removed_remote: Vec::new(),
+        tombstones: Vec::new(),
+    };
+    let local_failure = |e| {
+        index_error(
+            &format!("could not delete {} from {}", ref_, local.describe()),
+            e,
+        )
+    };
+    let Some((remote, opened)) = remote else {
+        deleted.removed = index::delete_bundle(local, ref_).map_err(local_failure)?;
+        return Ok(deleted);
+    };
+    let described = format!("could not delete {} from {}", ref_, remote.label());
+    // A ref in neither place is a typo, not a delete: refused before any
+    // tombstone is written, as a local delete of it is.
+    let key = index::bundle_key(ref_);
+    let on_remote = opened
+        .list(&key)
+        .map_err(|e| store_error(&described, e))?
+        .contains(&key);
+    if !on_remote && !local.exists(&key) {
+        return Err(store_error(
+            &described,
+            StoreError::Missing(format!("no object at {}", key)),
+        ));
+    }
+    let tombstone = sync::bundle_tombstone(ref_);
+    opened
+        .put(&tombstone, &sync::tombstone_body())
+        .map_err(|e| store_error(&described, e))?;
+    deleted.tombstones.push(tombstone.clone());
+    deleted.removed_remote = match index::delete_bundle(opened.as_ref(), ref_) {
+        Ok(removed) => removed,
+        Err(IndexError::Store(StoreError::Missing(_))) => Vec::new(),
+        // A bundle that won't unpack still goes; its entries wait for reindex.
+        Err(IndexError::Unreadable(_)) => {
+            let key = index::bundle_key(ref_);
+            opened
+                .delete(&key)
+                .map_err(|e| store_error(&described, e))?;
+            vec![key]
+        }
+        Err(e) => return Err(index_error(&described, e)),
+    };
+    local
+        .put(&tombstone, &sync::tombstone_body())
+        .map_err(|e| store_error(&format!("could not write {}", tombstone), e))?;
+    deleted.removed = match index::delete_bundle(local, ref_) {
+        Ok(removed) => removed,
+        Err(IndexError::Store(StoreError::Missing(_))) => Vec::new(),
+        Err(e) => return Err(local_failure(e)),
+    };
+    Ok(deleted)
+}
+
+/// A session's edit record, file index and transcripts, from this machine
+/// and, with a remote, from it too, tombstoned as a bundle is. The agent's
+/// own transcript in its own directory is never touched.
+fn delete_session_everywhere(
+    local: &crate::store::FileStore,
+    remote: Option<&(Remote, Box<dyn Store>)>,
+    session: &str,
+    agent_id: Option<String>,
+) -> std::result::Result<Deleted, Failure> {
+    if !agent::is_safe_session_id(session) {
+        let mut error = CommandError::new("usage", "--session is not a session id");
+        error.exit_status = 2;
+        return Err(Failure::Error(error));
+    }
+    let agents: Vec<String> = match agent_id {
+        Some(id) => vec![agents_arg(Some(&id))?
+            .first()
+            .map(|a| a.id().to_string())
+            .unwrap_or(id)],
+        None => {
+            let mut found = sync::agents_of_session(local, session)
+                .map_err(|e| store_error(&format!("could not read {}", local.describe()), e))?;
+            for id in agent::all().iter().map(|a| a.id()) {
+                if attribution::load_local(id, session).is_some() && !found.iter().any(|f| f == id)
+                {
+                    found.push(id.to_string());
+                }
+            }
+            if let Some((remote, opened)) = remote {
+                for id in sync::agents_of_session(opened.as_ref(), session)
+                    .map_err(|e| store_error(&format!("could not read {}", remote.label()), e))?
+                {
+                    if !found.contains(&id) {
+                        found.push(id);
+                    }
+                }
+            }
+            found
+        }
+    };
+    if agents.is_empty() {
+        return err(
+            "session-not-found",
+            format!("no record of session {} here or on the remote", session),
+        );
+    }
+    let mut deleted = Deleted {
+        subject: format!("session {}", session),
+        ref_: None,
+        session: Some(session.to_string()),
+        removed: Vec::new(),
+        removed_remote: Vec::new(),
+        tombstones: Vec::new(),
+    };
+    let local_failure = |e| store_error(&format!("could not delete from {}", local.describe()), e);
+    for agent in &agents {
+        let tombstone = sync::session_tombstone(agent, session);
+        if let Some((remote, opened)) = remote {
+            let described = format!(
+                "could not delete session {} from {}",
+                session,
+                remote.label()
+            );
+            opened
+                .put(&tombstone, &sync::tombstone_body())
+                .map_err(|e| store_error(&described, e))?;
+            deleted.tombstones.push(tombstone.clone());
+            deleted.removed_remote.extend(
+                sync::delete_session(opened.as_ref(), agent, session)
+                    .map_err(|e| store_error(&described, e))?,
+            );
+            local
+                .put(&tombstone, &sync::tombstone_body())
+                .map_err(local_failure)?;
+        }
+        deleted
+            .removed
+            .extend(sync::delete_session(local, agent, session).map_err(local_failure)?);
+        if attribution::forget_local(local, agent, session).map_err(local_failure)? {
+            deleted
+                .removed
+                .push(format!("~/.loch/edits/{}/{}.json", agent, session));
+        }
+    }
+    if remote.is_none() && deleted.removed.is_empty() {
+        return err(
+            "session-not-found",
+            format!("no record of session {} on this machine", session),
+        );
+    }
+    Ok(deleted)
 }
 
 pub fn command_reindex(argv: &[String]) -> Run {
     let mut p = parser("reindex");
-    p.option("--store");
+    p.option_optional("--remote", "", "NAME").option("--store");
     let args = p.parse(argv)?;
-    let store = open_store(args.str("store").as_deref())?;
+    let store: Box<dyn Store> = match remote_asked(&args) {
+        Some(asked) => open_remote(asked.as_deref())?.1,
+        None => Box::new(crate::store::local_store()),
+    };
     let described = format!("could not reindex {}", store.describe());
     let result = index::reindex(store.as_ref()).map_err(|e| index_error(&described, e))?;
     // The file index, re-derived from the edit records the same way, with
@@ -1080,8 +1423,10 @@ pub fn command_install(argv: &[String]) -> Run {
 
 // -- blame / log / ask -------------------------------------------------------------
 
-fn store_or_none(uri: Option<&str>) -> Option<Box<dyn Store>> {
-    create_store(&resolve_store_uri(uri)).ok()
+/// The local store, which is all `blame`, `log`, `ask` and `backfill` read
+/// or write: a remote's records arrive by `pull`, as git's do by `fetch`.
+fn local() -> Option<Box<dyn Store>> {
+    Some(Box::new(crate::store::local_store()))
 }
 
 fn flat(text: &str, limit: usize) -> String {
@@ -1292,11 +1637,10 @@ pub fn command_blame(argv: &[String]) -> Run {
     p.positional("file", Nargs::One)
         .option_optional("--html", "", "PATH")
         .option_metavar("--lines", "RANGES")
-        .flag("--no-open", None)
-        .option("--store");
+        .flag("--no-open", None);
     let args = p.parse(argv)?;
     let file = args.str("file").unwrap_or_default();
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
 
     // One mark per turn, handed out in order of first appearance in the file,
@@ -1437,10 +1781,10 @@ fn line_target(target: &str) -> std::result::Result<(String, Option<(usize, usiz
 
 pub fn command_log(argv: &[String]) -> Run {
     let mut p = parser("log");
-    p.positional("target", Nargs::One).option("--store");
+    p.positional("target", Nargs::One);
     let args = p.parse(argv)?;
     let (file, lines) = line_target(&args.str("target").unwrap_or_default())?;
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
     if let Some((_, last)) = lines {
         if last > blamed.owners.len() {
@@ -1514,8 +1858,7 @@ pub fn command_ask(argv: &[String]) -> Run {
     p.positional("target", Nargs::One)
         .positional("question", Nargs::Optional)
         .flag("--at-turn", None)
-        .flag("--no-launch", None)
-        .option("--store");
+        .flag("--no-launch", None);
     let args = p.parse(argv)?;
     let as_json = json_requested();
     let target = args.str("target").unwrap_or_default();
@@ -1523,7 +1866,7 @@ pub fn command_ask(argv: &[String]) -> Run {
         (file, Some((line, _))) => (file, line),
         (_, None) => return err("usage", format!("{} is not <file>:<line>", target)),
     };
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let blamed = blame_file(&file, store.as_deref())?;
     if line > blamed.owners.len() {
         return err(
@@ -1551,7 +1894,7 @@ pub fn command_ask(argv: &[String]) -> Run {
         return err(
             "transcript-missing",
             format!(
-                "session {} wrote it, but its transcript is neither in {} nor in the store",
+                "session {} wrote it, but its transcript is neither in {} nor in the local store",
                 link.session_id,
                 adapter.sessions_dir()
             ),
@@ -1667,14 +2010,14 @@ fn exec_agent(root: &str, command: &[String]) -> Run {
 /// transcripts' edit calls and the commits the agent made.
 pub fn command_backfill(argv: &[String]) -> Run {
     let mut p = parser("backfill");
-    p.option("--cwd").option("--store");
+    p.option("--cwd");
     let args = p.parse(argv)?;
     let cwd = args
         .str("cwd")
         .filter(|c| !c.is_empty())
         .unwrap_or_else(sys::getcwd);
     let root = snapshot::workspace_root(&cwd);
-    let store = store_or_none(args.str("store").as_deref());
+    let store = local();
     let results = crate::backfill::backfill(&cwd, store.as_deref());
     let mut text = String::new();
     for r in &results {
@@ -1711,6 +2054,286 @@ pub fn command_backfill(argv: &[String]) -> Run {
         },
         text,
     ))
+}
+
+// -- remotes, as the store commands name them ------------------------------------------
+
+/// `--remote [<name>]`, or the older `--store <uri>`, which means the same:
+/// `None` when neither was given, `Some(None)` for the default remote.
+fn remote_asked(args: &crate::argparse::Args) -> Option<Option<String>> {
+    if let Some(uri) = args.str("store").filter(|s| !s.is_empty()) {
+        return Some(Some(uri));
+    }
+    args.str("remote")
+        .map(|r| Some(r).filter(|r| !r.is_empty()))
+}
+
+/// The ref and the remote of `restore`/`delete`. `--remote` takes an
+/// optional value, so `delete --remote <ref>` hands it the ref, as argparse
+/// does; no remote can be named like a ref, so it is given back.
+fn ref_and_remote(args: &crate::argparse::Args) -> (Option<String>, Option<Option<String>>) {
+    let ref_ = args.str("ref").filter(|r| !r.is_empty());
+    let asked = remote_asked(args);
+    match (&ref_, &asked) {
+        (None, Some(Some(name))) if remote::looks_like_ref(name) && args.str("store").is_none() => {
+            (Some(name.clone()), Some(None))
+        }
+        _ => (ref_, asked),
+    }
+}
+
+/// A bundle this machine doesn't have, from the remote `asked` names (or the
+/// default one), checked against its ref.
+fn fetch_bundle(
+    ref_: &str,
+    asked: Option<Option<String>>,
+) -> std::result::Result<(Remote, Vec<u8>), Failure> {
+    let resolved = remote::resolve(asked.clone().flatten().as_deref());
+    let (remote, opened) = match resolved {
+        // Nothing to fetch from, and nobody asked for a remote: the bundle
+        // simply isn't here.
+        Err(e) if asked.is_none() && e.code == "no-remote" => {
+            return err(
+                "bundle-not-found",
+                format!(
+                    "{} is not on this machine, and there is no remote to fetch it from",
+                    ref_
+                ),
+            )
+        }
+        Err(e) => return Err(remote_error(e)),
+        Ok(remote) => {
+            let opened = remote.open().map_err(remote_error)?;
+            (remote, opened)
+        }
+    };
+    let described = format!("could not read {} from {}", ref_, remote.label());
+    let packed = opened
+        .get(&index::bundle_key(ref_))
+        .map_err(|e| store_error(&described, e))?;
+    if bundle::bundle_ref(&packed) != ref_ {
+        return err(
+            "bundle-unreadable",
+            format!("{}: its bytes don't hash to the ref", described),
+        );
+    }
+    Ok((remote, packed))
+}
+
+// -- push / pull ----------------------------------------------------------------------
+
+fn sync_error(remote: &Remote, error: SyncError) -> Failure {
+    match error {
+        SyncError::Store(e) => store_error(&format!("could not reach {}", remote.label()), e),
+        SyncError::Redaction(message) => {
+            Failure::Error(CommandError::new("redaction-failed", message))
+        }
+    }
+}
+
+/// The remote a command named, opened, and refused if it is this machine's
+/// own store: pushing there would mark everything sent and send nothing.
+fn open_remote(asked: Option<&str>) -> std::result::Result<(Remote, Box<dyn Store>), Failure> {
+    let remote = remote::resolve(asked).map_err(remote_error)?;
+    let opened = remote.open().map_err(remote_error)?;
+    // Resolved, so a symlink to the local store is caught too.
+    let resolved = |path: &str| {
+        fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| sys::abspath(path))
+    };
+    if !remote.uri.starts_with("s3://")
+        && resolved(remote.uri.trim_start_matches("file://"))
+            == resolved(&crate::store::default_store())
+    {
+        return err(
+            "invalid-uri",
+            format!("{} is this machine's own store, not a remote", remote.uri),
+        );
+    }
+    Ok((remote, opened))
+}
+
+/// The project a sync covers: the one `--cwd` (or the current directory) is
+/// in, or every project with `--all`.
+fn sync_scope(args: &crate::argparse::Args) -> Option<String> {
+    if args.flag("all") {
+        return None;
+    }
+    let cwd = args
+        .str("cwd")
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(sys::getcwd);
+    Some(attribution::project_id(&snapshot::workspace_root(&cwd)))
+}
+
+fn with_remote(mut payload: crate::json::Map, remote: &Remote) -> crate::json::Map {
+    payload.insert("remote".into(), remote.payload());
+    if remote.deprecated {
+        payload.insert("deprecated".into(), Value::str("LOCH_STORE"));
+    }
+    payload
+}
+
+pub fn command_push(argv: &[String]) -> Run {
+    let mut p = parser("push");
+    p.positional("remote", Nargs::Optional)
+        .option("--cwd")
+        .flag("--all", None)
+        .flag("--dry-run", None)
+        .flag("--force", None);
+    let args = p.parse(argv)?;
+    let (remote, opened) = open_remote(args.str("remote").as_deref())?;
+    let project = sync_scope(&args);
+    let local = crate::store::local_store();
+    let mut report = sync::PushReport::new(args.flag("dry_run"));
+    report.force = args.flag("force");
+    let scope = match &project {
+        Some(project) => sync::Scope::Project(project),
+        None => sync::Scope::All,
+    };
+    let result = sync::push(&local, opened.as_ref(), &remote.uri, scope, &mut report);
+    let mut payload = report.payload();
+    payload.insert("project".into(), Value::opt_str(project.as_deref()));
+    let payload = with_remote(payload, &remote);
+    if let Err(error) = result {
+        return Err(match sync_error(&remote, error) {
+            Failure::Error(mut failure) => {
+                failure.payload = payload;
+                Failure::Error(failure)
+            }
+            other => other,
+        });
+    }
+    let mut outcome = Outcome::with(
+        "push",
+        payload,
+        format!("{}: {}", remote.label(), report.text()),
+    );
+    outcome.warnings.extend(remote.warning());
+    Ok(outcome)
+}
+
+pub fn command_pull(argv: &[String]) -> Run {
+    let mut p = parser("pull");
+    p.positional("remote", Nargs::Optional)
+        .option("--cwd")
+        .flag("--all", None);
+    let args = p.parse(argv)?;
+    let (remote, opened) = open_remote(args.str("remote").as_deref())?;
+    let project = sync_scope(&args);
+    let local = crate::store::local_store();
+    let mut report = sync::PullReport::default();
+    let result = sync::pull(&local, opened.as_ref(), project.as_deref(), &mut report);
+    let mut payload = report.payload();
+    payload.insert("project".into(), Value::opt_str(project.as_deref()));
+    let payload = with_remote(payload, &remote);
+    if let Err(error) = result {
+        return Err(match sync_error(&remote, error) {
+            Failure::Error(mut failure) => {
+                failure.payload = payload;
+                Failure::Error(failure)
+            }
+            other => other,
+        });
+    }
+    let mut outcome = Outcome::with(
+        "pull",
+        payload,
+        format!("{}: {}", remote.label(), report.text()),
+    );
+    outcome.warnings.extend(remote.warning());
+    Ok(outcome)
+}
+
+// -- remote ---------------------------------------------------------------------------
+
+fn remote_error(error: RemoteError) -> Failure {
+    let mut failure = CommandError::new(error.code, error.message);
+    if error.code == "usage" {
+        failure.exit_status = 2;
+    }
+    Failure::Error(failure)
+}
+
+/// `remote [list]`, `remote add <name> <uri>`, `remote remove <name>`.
+pub fn command_remote(argv: &[String]) -> Run {
+    let (sub, rest) = match argv.split_first() {
+        Some((sub, rest)) if !sub.starts_with('-') => (sub.as_str(), rest),
+        _ => ("list", argv),
+    };
+    match sub {
+        "add" => {
+            let mut p = parser("remote add");
+            p.positional("name", Nargs::One)
+                .positional("uri", Nargs::One);
+            let args = p.parse(rest)?;
+            let added = remote::add(
+                &args.str("name").unwrap_or_default(),
+                &args.str("uri").unwrap_or_default(),
+            )
+            .map_err(remote_error)?;
+            Ok(Outcome::with(
+                "remote",
+                object! {"action" => "add", "remote" => added.payload()},
+                format!("added remote {} {}\n", added.label(), added.uri),
+            ))
+        }
+        "remove" => {
+            let mut p = parser("remote remove");
+            p.positional("name", Nargs::One);
+            let args = p.parse(rest)?;
+            let removed =
+                remote::remove(&args.str("name").unwrap_or_default()).map_err(remote_error)?;
+            Ok(Outcome::with(
+                "remote",
+                object! {"action" => "remove", "remote" => removed.payload()},
+                format!("removed remote {} {}\n", removed.label(), removed.uri),
+            ))
+        }
+        "list" => {
+            parser("remote list").parse(rest)?;
+            let remotes = remote::remotes().map_err(remote_error)?;
+            let default = remote::default_name(&remotes);
+            let mut text = String::new();
+            for (name, uri) in &remotes {
+                let marker = if default.as_deref() == Some(name) {
+                    "  (default)"
+                } else {
+                    ""
+                };
+                text.push_str(&format!(
+                    "{}  {}{}\n",
+                    name,
+                    uri.as_str().unwrap_or_default(),
+                    marker
+                ));
+            }
+            if remotes.is_empty() {
+                text.push_str("no remotes; `loch remote add origin <uri>`\n");
+            }
+            Ok(Outcome::with(
+                "remote",
+                object! {
+                    "action" => "list",
+                    "remotes" => remotes.iter().map(|(name, uri)| Value::Object(object! {
+                        "name" => name.as_str(),
+                        "uri" => uri.clone(),
+                    })).collect::<Vec<_>>(),
+                    "default" => Value::opt_str(default.as_deref()),
+                },
+                text,
+            ))
+        }
+        other => {
+            let mut error = CommandError::new(
+                "usage",
+                format!("unknown remote action {:?} (add, remove, list)", other),
+            );
+            error.exit_status = 2;
+            Err(Failure::Error(error))
+        }
+    }
 }
 
 // -- gc ------------------------------------------------------------------------------
@@ -1770,6 +2393,9 @@ pub fn dispatch(command: &str, argv: &[String]) -> Option<Run> {
         "log" => command_log(argv),
         "hook" => command_hook(argv),
         "gc" => command_gc(argv),
+        "remote" => command_remote(argv),
+        "push" => command_push(argv),
+        "pull" => command_pull(argv),
         "backfill" => command_backfill(argv),
         "help" => command_help(argv),
         "version" => command_version(argv),

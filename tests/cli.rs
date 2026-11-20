@@ -890,7 +890,11 @@ fn test_json_save_reports_the_ref_and_redaction_counts_without_the_match() {
         .unwrap()
         .len();
     assert_eq!(at(&document, "bytes"), &Value::int(size as i64));
-    assert_eq!(text(&document, "store"), s(&store));
+    // Saved here, and pushed to the store `--store` named.
+    assert!(text(&document, "store").ends_with("/.loch/store"));
+    let pushed = at(&document, "pushed");
+    assert_eq!(text(at(pushed, "remote"), "uri"), s(&store));
+    assert_eq!(at(at(pushed, "pushed"), "bundles"), &Value::int(1));
     assert_eq!(at(&document, "redacted"), &Value::int(1));
     let session = only(&document, "sessions");
     assert_eq!(text(session, "sessionId"), "abc");

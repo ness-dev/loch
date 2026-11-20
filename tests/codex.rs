@@ -79,7 +79,8 @@ impl World {
         command
             .current_dir(cwd)
             .env("HOME", &self.home)
-            .env("LOCH_STORE", &self.store)
+            .env_remove("LOCH_STORE")
+            .env("LOCH_REMOTE", &self.store)
             .env("GIT_CONFIG_GLOBAL", self.root_gitconfig())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Test")
@@ -270,8 +271,8 @@ impl World {
 
     fn edit_record(&self) -> Value {
         let path = self
-            .store
-            .join("edits/codex")
+            .home
+            .join(".loch/store/edits/codex")
             .join(format!("{}.json", SESSION));
         json::loads(&fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -548,7 +549,7 @@ fn a_codex_session_saves_and_restores_onto_another_machine() {
     world.begin(SESSION, TURN_B, &repo, 2, &format!("now in {}", repo));
     world.finish(SESSION, TURN_B, 2);
 
-    let save = world.ok(&["save"]);
+    let save = world.ok(&["save", "--push"]);
     let saved = &items(&save, "sessions")[0];
     assert_eq!(text(saved, "agent"), "codex");
     assert_eq!(text(saved, "agentVersion"), "0.166.0");
@@ -599,7 +600,7 @@ fn restore_finds_a_session_filed_under_another_day() {
     let world = World::new();
     world.meta(SESSION, &s(&world.repo), "feat/x");
     world.begin(SESSION, TURN_A, &s(&world.repo), 1, "hello");
-    let reference = text(&world.ok(&["save"]), "ref").to_string();
+    let reference = text(&world.ok(&["save", "--push"]), "ref").to_string();
     let there = world.elsewhere("b");
     let elsewhere = there
         .home
@@ -643,7 +644,7 @@ fn one_bundle_carries_both_agents_and_restores_each_to_its_own() {
         s(&world.rollout(SESSION))
     ));
 
-    let save = world.ok(&["save"]);
+    let save = world.ok(&["save", "--push"]);
     let agents: Vec<&str> = items(&save, "sessions")
         .iter()
         .map(|s| text(s, "agent"))
@@ -696,7 +697,7 @@ fn a_bundle_of_claude_sessions_alone_has_no_agent_fields() {
         ),
     )
     .unwrap();
-    let save = world.ok(&["save"]);
+    let save = world.ok(&["save", "--push"]);
     let packed = fs::read(
         world
             .store
@@ -893,7 +894,7 @@ fn a_timestamp_a_bundle_carries_cannot_crash_restore() {
         )],
     );
     world.begin(SESSION, TURN_A, &repo, 1, "hello");
-    let reference = text(&world.ok(&["save"]), "ref").to_string();
+    let reference = text(&world.ok(&["save", "--push"]), "ref").to_string();
     let there = world.elsewhere("b");
     let restore = there.ok(&["restore", &reference]);
     let path = text(&items(&restore, "sessions")[0], "path").to_string();
@@ -1015,15 +1016,14 @@ fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
 
 // -- SessionEnd under Codex's 3s clamp ---------------------------------------------------
 
-/// Codex kills a `SessionEnd` hook after 3s. `end` closes the open turn
-/// locally — snapshot, diff, the edit record written aside and renamed —
-/// before it touches the store, so a kill during a slow store loses the
-/// store's copy and not the turn. This pins that order, and what the kill
-/// leaves behind: the record on this machine, nothing in the store (no later
-/// hook of an ended session publishes it), and the session's state still
-/// open.
+/// Codex kills a `SessionEnd` hook after 3s. When hooks published to the
+/// store, a store that hung held `end` past that, and the kill left the
+/// session's last turn on this machine alone with nothing to publish it
+/// later. Hooks now write only the local store, so `end` finishes well inside
+/// the clamp whatever `LOCH_STORE` names, and closes the turn and lets the
+/// session's state go.
 #[test]
-fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
+fn a_session_end_finishes_inside_codex_s_clamp_while_a_remote_hangs() {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
     let world = World::new();
@@ -1039,14 +1039,6 @@ fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
     // A store that accepts and never answers.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let held = std::thread::spawn(move || {
-        let mut open = Vec::new();
-        for stream in listener.incoming().take(1) {
-            open.push(stream);
-        }
-        std::thread::sleep(Duration::from_secs(10));
-        drop(open);
-    });
     let mut child = world
         .command(env!("CARGO_BIN_EXE_loch"), &world.repo)
         .args(["hook", "end", "--agent", "codex"])
@@ -1067,37 +1059,29 @@ fn a_session_end_killed_while_the_store_hangs_keeps_the_turn_locally() {
         .write_all(world.event(SESSION, None, None).as_bytes())
         .unwrap();
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(3) {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    while started.elapsed() < Duration::from_secs(3) && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "end was still waiting on the store at 3s"
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    drop(held);
+    let finished = child.try_wait().unwrap();
+    if finished.is_none() {
+        child.kill().unwrap();
+    }
+    drop(listener);
+    assert!(finished.is_some(), "end was still running at 3s");
 
-    let local = world
-        .home
-        .join(".loch/edits/codex")
-        .join(format!("{}.json", SESSION));
-    let record = json::loads(&fs::read_to_string(&local).unwrap()).unwrap();
+    let record = world.edit_record();
     let turns = items(&record, "turns");
     assert_eq!(turns.len(), 1);
     assert_eq!(text(&turns[0], "promptUuid"), TURN_A);
     assert_eq!(turns[0].get("interrupted"), Some(&Value::Bool(true)));
     assert!(!items(&turns[0], "files").is_empty());
     assert!(
-        world
+        !world
             .home
             .join(".loch/sessions")
             .join(format!("{}.json", SESSION))
             .exists(),
-        "the kill came before the state was let go"
+        "the session's state was let go"
     );
 }
 
@@ -1194,7 +1178,7 @@ fn a_second_spelling_of_the_live_cwd_is_not_another_cwd() {
 fn both_spellings_of_the_live_cwd_are_restored_into_the_target() {
     let world = World::new();
     a_session_through_two_spellings(&world);
-    let reference = text(&world.ok(&["save"]), "ref").to_string();
+    let reference = text(&world.ok(&["save", "--push"]), "ref").to_string();
     let there = world.elsewhere("b");
     let restore = there.ok(&["restore", &reference, "--new-id"]);
     let session = &items(&restore, "sessions")[0];
@@ -1208,4 +1192,286 @@ fn both_spellings_of_the_live_cwd_are_restored_into_the_target() {
         "{:?}",
         at(session, "foreignCwds")
     );
+}
+
+// -- save is commit, push is push ---------------------------------------------------------
+
+impl World {
+    /// `loch <args> --json` with no remote in the environment.
+    fn json_without_remote(&self, args: &[&str]) -> (Value, i32, String) {
+        let out = self
+            .command(env!("CARGO_BIN_EXE_loch"), &self.repo)
+            .args(args)
+            .arg("--json")
+            .env_remove("LOCH_REMOTE")
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        (
+            json::loads(text.trim()).unwrap(),
+            out.status.code().unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    }
+
+    fn one_saved_session(&self) {
+        let repo = s(&self.repo);
+        self.meta(SESSION, &repo, "feat/x");
+        self.begin(SESSION, TURN_A, &repo, 1, "the work");
+        self.finish(SESSION, TURN_A, 1);
+    }
+
+    fn local_bundle(&self, reference: &str) -> PathBuf {
+        self.home
+            .join(".loch/store/bundles")
+            .join(format!("{}.loch", reference))
+    }
+}
+
+#[test]
+fn save_keeps_the_bundle_here_until_it_is_pushed() {
+    let world = World::new();
+    world.one_saved_session();
+    let save = world.ok(&["save"]);
+    let reference = text(&save, "ref").to_string();
+    assert_eq!(save.get("pushed"), Some(&Value::Null));
+    assert!(world.local_bundle(&reference).is_file());
+    assert!(!world.store.exists(), "nothing reached the remote");
+    let saved = world.ok(&["list", "--saved"]);
+    assert_eq!(saved.get("bundles").unwrap().as_i64(), Some(1));
+    assert!(saved.get("saved").unwrap().truthy());
+    let remote = world.ok(&["list", "--remote"]);
+    assert_eq!(remote.get("bundles").unwrap().as_i64(), Some(0));
+
+    // Not on the far side yet; then pushed, and there.
+    let there = world.elsewhere("b");
+    let (missing, code) = there.json(&["restore", &reference]);
+    assert_eq!((text(&missing, "code"), code), ("bundle-not-found", 1));
+    let push = world.ok(&["push"]);
+    assert_eq!(at(at(&push, "pushed"), "bundles").as_i64(), Some(1));
+    assert_eq!(at(at(&push, "pushed"), "branchEntries").as_i64(), Some(1));
+    assert_eq!(
+        world
+            .ok(&["list", "--remote"])
+            .get("bundles")
+            .unwrap()
+            .as_i64(),
+        Some(1)
+    );
+    let restore = there.ok(&["restore", &reference]);
+    assert!(at(&restore, "fetchedFrom").get("uri").is_some());
+    // Kept here once fetched, so the next restore needs no remote.
+    assert!(there.local_bundle(&reference).is_file());
+    let (again, _, _) = there.json_without_remote(&["restore", &reference, "--force"]);
+    assert!(again.get("ok").unwrap().truthy(), "{:?}", again);
+    assert_eq!(again.get("fetchedFrom"), Some(&Value::Null));
+}
+
+#[test]
+fn restore_without_a_remote_says_the_bundle_is_not_here() {
+    let world = World::new();
+    let reference = "a".repeat(64);
+    let (document, code, _) = world.json_without_remote(&["restore", &reference]);
+    assert_eq!((text(&document, "code"), code), ("bundle-not-found", 1));
+    let (document, _, _) = world.json_without_remote(&["restore", &reference, "--remote"]);
+    assert_eq!(text(&document, "code"), "no-remote");
+}
+
+#[test]
+fn a_fetched_bundle_must_hash_to_its_ref() {
+    let world = World::new();
+    world.one_saved_session();
+    let reference = text(&world.ok(&["save", "--push"]), "ref").to_string();
+    let forged = "b".repeat(64);
+    fs::copy(
+        world.store.join(format!("bundles/{}.loch", reference)),
+        world.store.join(format!("bundles/{}.loch", forged)),
+    )
+    .unwrap();
+    let there = world.elsewhere("b");
+    let (document, _) = there.json(&["restore", &forged]);
+    assert_eq!(text(&document, "code"), "bundle-unreadable");
+    assert!(!there.local_bundle(&forged).exists());
+}
+
+#[test]
+fn a_bundle_deleted_on_the_remote_stays_deleted() {
+    let world = World::new();
+    world.one_saved_session();
+    let reference = text(&world.ok(&["save", "--push"]), "ref").to_string();
+    let packed = fs::read(world.local_bundle(&reference)).unwrap();
+    let there = world.elsewhere("b");
+    there.ok(&["restore", &reference]);
+
+    // A local delete leaves the remote alone.
+    let local = world.ok(&["delete", &reference]);
+    assert_eq!(local.get("remote"), Some(&Value::Null));
+    assert!(!world.local_bundle(&reference).exists());
+    assert!(world
+        .store
+        .join(format!("bundles/{}.loch", reference))
+        .is_file());
+
+    // `--remote <ref>`: the ref is taken for what it is.
+    let gone = there.ok(&["delete", "--remote", &reference]);
+    assert_eq!(items(&gone, "tombstones").len(), 1);
+    assert!(!world
+        .store
+        .join(format!("bundles/{}.loch", reference))
+        .exists());
+    assert!(!there.local_bundle(&reference).exists());
+
+    // A machine still holding it can't push it back, and forgets it when it
+    // pulls.
+    fs::create_dir_all(world.local_bundle(&reference).parent().unwrap()).unwrap();
+    fs::write(world.local_bundle(&reference), &packed).unwrap();
+    fs::remove_dir_all(world.home.join(".loch/pushed")).unwrap();
+    let push = world.ok(&["push"]);
+    assert_eq!(push.get("tombstoned").unwrap().as_i64(), Some(1));
+    assert_eq!(push.get("total").unwrap().as_i64(), Some(0));
+    assert!(!world
+        .store
+        .join(format!("bundles/{}.loch", reference))
+        .exists());
+    let pull = world.ok(&["pull"]);
+    assert_eq!(pull.get("forgotten").unwrap().as_i64(), Some(1));
+    assert!(!world.local_bundle(&reference).exists());
+
+    let (absent, code) = world.json(&["delete", "--remote", &"c".repeat(64)]);
+    assert_eq!((text(&absent, "code"), code), ("bundle-not-found", 1));
+    assert!(!world
+        .store
+        .join(format!("tombstones/bundle/{}", "c".repeat(64)))
+        .exists());
+}
+
+#[test]
+fn a_session_deleted_on_the_remote_takes_its_transcript_and_record() {
+    let world = World::new();
+    world.turn(
+        TURN_A,
+        1,
+        "write it",
+        "echo 'a line the turn wrote' > a.txt",
+    );
+    world.ok(&["push"]);
+    assert!(world
+        .store
+        .join(format!("edits/codex/{}.json", SESSION))
+        .is_file());
+    let transcripts = world.store.join("transcripts/codex");
+    assert_eq!(fs::read_dir(&transcripts).unwrap().count(), 1);
+
+    let deleted = world.ok(&["delete", "--session", SESSION, "--remote"]);
+    assert_eq!(
+        items(&deleted, "tombstones")[0].as_str(),
+        Some(format!("tombstones/session/codex/{}", SESSION).as_str())
+    );
+    assert!(!world
+        .store
+        .join(format!("edits/codex/{}.json", SESSION))
+        .exists());
+    assert_eq!(fs::read_dir(&transcripts).unwrap().count(), 0);
+    assert!(world
+        .store
+        .join("index/file")
+        .read_dir()
+        .map_or(true, |mut d| d
+            .all(|e| fs::read_dir(e.unwrap().path()).unwrap().count() == 0)));
+    // This machine's copies go too, never the agent's own rollout.
+    assert!(!world
+        .home
+        .join(format!(".loch/store/edits/codex/{}.json", SESSION))
+        .exists());
+    assert!(!world
+        .home
+        .join(format!(".loch/edits/codex/{}.json", SESSION))
+        .exists());
+    assert!(world.rollout(SESSION).is_file());
+    // The next turn records the session again, and push won't send it.
+    world.turn(TURN_B, 2, "more", "echo 'another line' >> a.txt");
+    let push = world.ok(&["push"]);
+    assert_eq!(push.get("total").unwrap().as_i64(), Some(0));
+
+    let (unknown, code) = world.json(&["delete", "--session", "nope"]);
+    assert_eq!((text(&unknown, "code"), code), ("session-not-found", 1));
+    let (bad, code) = world.json(&["delete", "--session", "../x"]);
+    assert_eq!((text(&bad, "code"), code), ("usage", 2));
+}
+
+#[test]
+fn loch_store_set_and_a_plain_save_is_told_it_did_not_upload() {
+    let world = World::new();
+    world.one_saved_session();
+    let out = world
+        .command(env!("CARGO_BIN_EXE_loch"), &world.repo)
+        .args(["save", "--json"])
+        .env_remove("LOCH_REMOTE")
+        .env("LOCH_STORE", &world.store)
+        .output()
+        .unwrap();
+    assert!(out.stderr.is_empty(), "JSON mode keeps stderr empty");
+    let document = json::loads(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    assert_eq!(text(&document, "deprecated"), "LOCH_STORE");
+    let out = world
+        .command(env!("CARGO_BIN_EXE_loch"), &world.repo)
+        .args(["save"])
+        .env_remove("LOCH_REMOTE")
+        .env("LOCH_STORE", &world.store)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("save --push"));
+}
+
+#[test]
+fn a_push_that_fails_after_save_keeps_the_bundle_and_names_it() {
+    let world = World::new();
+    world.one_saved_session();
+    let blocked = world.root.join("blocked");
+    fs::write(&blocked, "not a store").unwrap();
+    let (document, code) = world.json(&["save", "--push", &s(&blocked)]);
+    assert_eq!((text(&document, "code"), code), ("store-unreachable", 1));
+    let reference = text(&document, "ref").to_string();
+    assert!(world.local_bundle(&reference).is_file());
+    assert!(text(&document, "error").starts_with(&format!("saved {} on this machine", reference)));
+}
+
+#[test]
+fn a_push_sends_only_this_project_s_bundles_unless_asked_for_all() {
+    let world = World::new();
+    world.one_saved_session();
+    let here = text(&world.ok(&["save"]), "ref").to_string();
+    // A second repository, with its own root commit and its own session.
+    let client = world.root.join("client");
+    fs::create_dir_all(&client).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["commit", "-q", "--allow-empty", "-m", "client root"],
+    ] {
+        let out = world.command("git", &client).args(&args).output().unwrap();
+        assert!(out.status.success());
+    }
+    let other = "01a1f570-0000-7000-8000-00000000c11e";
+    world.meta(other, &s(&client), "main");
+    world.begin(other, TURN_B, &s(&client), 3, "client work");
+    world.finish(other, TURN_B, 3);
+    let theirs = text(&world.ok(&["save", "--cwd", &s(&client)]), "ref").to_string();
+    assert_ne!(here, theirs);
+
+    let push = world.ok(&["push"]);
+    assert_eq!(at(at(&push, "pushed"), "bundles").as_i64(), Some(1));
+    assert!(world.store.join(format!("bundles/{}.loch", here)).is_file());
+    assert!(
+        !world
+            .store
+            .join(format!("bundles/{}.loch", theirs))
+            .exists(),
+        "the client's transcripts stay off this project's remote"
+    );
+    let all = world.ok(&["push", "--all"]);
+    assert_eq!(at(at(&all, "pushed"), "bundles").as_i64(), Some(1));
+    assert!(world
+        .store
+        .join(format!("bundles/{}.loch", theirs))
+        .is_file());
 }

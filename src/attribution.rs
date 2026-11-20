@@ -260,6 +260,33 @@ impl EditRecord {
         })
     }
 
+    /// Both copies' turns, each once, oldest first. A session restored under its
+    /// own id and resumed elsewhere is recorded by two machines, so neither copy
+    /// may replace the other: a whole-record write would erase the turns only the
+    /// other copy has. A turn is known by its prompt's id, else by when it ran;
+    /// where both copies hold one, the one that ended later wins, since Claude
+    /// Code can stop twice for one prompt and the second stop's record is the
+    /// whole turn.
+    pub fn merge(&self, other: &EditRecord) -> EditRecord {
+        let identity = |turn: &TurnRecord| match &turn.prompt_uuid {
+            Some(id) => (Some(id.clone()), None, None),
+            None => (None, turn.started.clone(), Some(turn.ended.clone())),
+        };
+        let mut turns: Vec<TurnRecord> = Vec::new();
+        for turn in self.turns.iter().chain(other.turns.iter()) {
+            match turns.iter_mut().find(|t| identity(t) == identity(turn)) {
+                Some(have) if have.ended < turn.ended => *have = turn.clone(),
+                Some(_) => {}
+                None => turns.push(turn.clone()),
+            }
+        }
+        turns.sort_by(|a, b| a.ended.cmp(&b.ended));
+        EditRecord {
+            turns,
+            ..self.clone()
+        }
+    }
+
     /// Every path any turn changed, each once.
     pub fn paths(&self) -> Vec<String> {
         let mut paths: Vec<String> = self
@@ -316,6 +343,12 @@ pub fn load_local(agent: &str, session: &str) -> Option<EditRecord> {
     EditRecord::from_json(&json::loads(&text).ok()?)
 }
 
+/// The record as `store` holds it.
+pub fn load_stored(store: &dyn Store, agent: &str, session: &str) -> Option<EditRecord> {
+    let data = store.get(&edits_key(agent, session)).ok()?;
+    EditRecord::from_json(&json::loads(&String::from_utf8(data).ok()?).ok()?)
+}
+
 pub fn save_local(record: &EditRecord) -> std::io::Result<()> {
     let path = local_path(&record.agent, &record.session);
     snapshot::write_atomically(
@@ -355,20 +388,56 @@ fn local_records() -> Vec<EditRecord> {
 pub fn publish(store: &dyn Store, record: &EditRecord) -> Result<(), StoreError> {
     let body = json::dumps(&record.to_json(), json::COMPACT_UNICODE);
     store.put(&edits_key(&record.agent, &record.session), body.as_bytes())?;
-    for path in record.paths() {
-        let key = index::index_key(
-            FILE,
-            Some(&file_value(&record.project, &path)),
-            &record.session,
-        );
-        let entry =
-            object! {"agent" => record.agent.as_str(), "session" => record.session.as_str()};
-        store.put(
-            &key,
-            json::dumps(&Value::Object(entry), json::DEFAULT).as_bytes(),
-        )?;
+    for (key, entry) in file_entries(record) {
+        store.put(&key, &entry)?;
     }
     Ok(())
+}
+
+/// The file index's entry for each path a record changed, keyed as stored.
+pub fn file_entries(record: &EditRecord) -> Vec<(String, Vec<u8>)> {
+    let entry = object! {"agent" => record.agent.as_str(), "session" => record.session.as_str()};
+    let body = json::dumps(&Value::Object(entry), json::DEFAULT).into_bytes();
+    record
+        .paths()
+        .iter()
+        .map(|path| {
+            (
+                index::index_key(
+                    FILE,
+                    Some(&file_value(&record.project, path)),
+                    &record.session,
+                ),
+                body.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Forgets a session on this machine: the hooks' working copy of its record
+/// and the local store's copy, with its file index. `pull` does this for a
+/// session a remote has tombstoned.
+/// Returns whether there was anything to forget.
+pub fn forget_local(store: &dyn Store, agent: &str, session: &str) -> Result<bool, StoreError> {
+    let key = edits_key(agent, session);
+    let stored = store
+        .get(&key)
+        .ok()
+        .and_then(|data| String::from_utf8(data).ok())
+        .and_then(|text| json::loads(&text).ok())
+        .and_then(|v| EditRecord::from_json(&v));
+    let working = load_local(agent, session);
+    if stored.is_none() && working.is_none() {
+        return Ok(false);
+    }
+    for record in stored.iter().chain(working.iter()) {
+        for (entry, _) in file_entries(record) {
+            store.delete(&entry)?;
+        }
+    }
+    store.delete(&key)?;
+    let _ = fs::remove_file(local_path(agent, session));
+    Ok(true)
 }
 
 /// Every edit record that changed `path` in `project`: the store's, by its
@@ -596,5 +665,31 @@ mod tests {
     fn reindentation_keeps_the_link() {
         let records = vec![record(vec![("1", vec!["return compute(x)"])])];
         assert!(attribute("        return compute(x)\n", &["f.py".into()], &records)[0].is_some());
+    }
+
+    #[test]
+    fn merging_keeps_each_turn_once_and_the_later_stop_of_one_prompt() {
+        let turn = |id: &str, ended: &str| TurnRecord {
+            prompt_uuid: Some(id.into()),
+            end_uuid: None,
+            started: None,
+            ended: ended.into(),
+            prompt: None,
+            interrupted: false,
+            backfilled: false,
+            files: Vec::new(),
+        };
+        let mut mine = record(vec![]);
+        mine.turns = vec![turn("a", "1"), turn("b", "2")];
+        let mut theirs = record(vec![]);
+        theirs.turns = vec![turn("a", "1"), turn("b", "3"), turn("c", "4")];
+        let merged = mine.merge(&theirs);
+        let ended: Vec<(&str, &str)> = merged
+            .turns
+            .iter()
+            .map(|t| (t.prompt_uuid.as_deref().unwrap(), t.ended.as_str()))
+            .collect();
+        assert_eq!(ended, vec![("a", "1"), ("b", "3"), ("c", "4")]);
+        assert_eq!(theirs.merge(&mine).turns, merged.turns, "either way round");
     }
 }

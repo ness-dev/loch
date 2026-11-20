@@ -30,6 +30,7 @@ use crate::sys;
 use crate::trace::{self, content, py_str};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
 /// How far a commit's time may sit outside the Bash call that made it: git
 /// records whole seconds and transcripts milliseconds, and a hook is slow.
@@ -275,41 +276,421 @@ fn old_notes(root: &str) -> HashMap<(String, String), Vec<String>> {
     found
 }
 
-/// The transcripts that might hold this project's history: every local
-/// session whose working directory lay inside `root`.
-fn transcripts_for(root: &str) -> Vec<(String, String)> {
+/// How many distinct substantive lines a session must have written, at the
+/// same relative paths, into this repository's files before a directory that
+/// no longer exists is taken for one of its former worktrees.
+const EVIDENCE: usize = 5;
+
+/// The repository a backfill covers, whichever of its worktrees it was run
+/// from: every worktree git knows of, and what its branches hold, to
+/// recognize the worktrees it no longer knows of by the text written in them.
+struct Repo {
+    root: String,
+    /// `git worktree list`, the main one first, including any whose
+    /// directory has gone but which git hasn't pruned yet.
+    worktrees: Vec<String>,
+    /// Path → every blob it has at the tip of any branch, tag or worktree.
+    tree: HashMap<String, HashSet<String>>,
+    /// Blob → the hashes of its lines, read on demand.
+    blobs: HashMap<String, HashSet<String>>,
+}
+
+impl Repo {
+    fn open(root: &str) -> Repo {
+        let mut repo = Repo {
+            root: root.to_string(),
+            worktrees: vec![root.to_string()],
+            tree: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        if !snapshot::has_git_marker(root) {
+            return repo;
+        }
+        let listing =
+            git::git(root, &["worktree", "list", "--porcelain"], None).unwrap_or_default();
+        let mut tips: Vec<String> = Vec::new();
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                let path = sys::realpath_strict(path).unwrap_or_else(|| path.to_string());
+                if !repo.worktrees.contains(&path) {
+                    repo.worktrees.push(path);
+                }
+            } else if let Some(head) = line.strip_prefix("HEAD ") {
+                tips.push(head.to_string());
+            }
+        }
+        let refs = git::git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+            None,
+        )
+        .unwrap_or_default();
+        tips.extend(refs.lines().map(str::to_string));
+        tips.sort();
+        tips.dedup();
+        // Walked a level at a time rather than `ls-tree -r` per tip: hundreds
+        // of branches share nearly every subtree, and each (subtree, path) is
+        // read once.
+        let mut level: Vec<(String, String)> = tips
+            .iter()
+            .map(|tip| (format!("{}^{{tree}}", tip), String::new()))
+            .collect();
+        let width = match git::git(root, &["rev-parse", "--show-object-format"], None) {
+            Ok(format) if format.trim() == "sha256" => 32,
+            _ => 20,
+        };
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        while !level.is_empty() {
+            let names: Vec<&str> = level.iter().map(|(name, _)| name.as_str()).collect();
+            let mut next = Vec::new();
+            for ((_, prefix), object) in level.iter().zip(batch(root, &names)) {
+                let Some((_, data)) = object else {
+                    continue;
+                };
+                for (mode, name, id) in tree_entries(&data, width).unwrap_or_default() {
+                    let path = format!("{}{}", prefix, name);
+                    if mode == "40000" {
+                        let sub = (id, format!("{}/", path));
+                        if seen.insert(sub.clone()) {
+                            next.push(sub);
+                        }
+                    } else if mode.starts_with("100") {
+                        repo.tree.entry(path).or_default().insert(id);
+                    }
+                }
+            }
+            level = next;
+        }
+        repo
+    }
+
+    /// Reads every blob in `wanted` not yet read, in one `cat-file`.
+    fn load(&mut self, wanted: &HashSet<String>) {
+        let missing: Vec<&str> = wanted
+            .iter()
+            .filter(|b| !self.blobs.contains_key(*b))
+            .map(String::as_str)
+            .collect();
+        for (blob, object) in missing.iter().zip(batch(&self.root, &missing)) {
+            let lines = object
+                .map(|(_, data)| {
+                    String::from_utf8_lossy(&data)
+                        .lines()
+                        .map(attribution::line_hash)
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.blobs.insert(blob.to_string(), lines);
+        }
+    }
+
+    /// The live worktree `path` is in, the most deeply nested if several.
+    fn worktree_holding(&self, path: &str) -> Option<&String> {
+        self.worktrees
+            .iter()
+            .filter(|w| path == w.as_str() || inside(path, w).is_some())
+            .max_by_key(|w| w.len())
+    }
+}
+
+/// Each named object as `cat-file --batch` gives it, `(id, contents)`, in the
+/// order asked; `None` for one that doesn't exist.
+fn batch(root: &str, names: &[&str]) -> Vec<Option<(String, Vec<u8>)>> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let input: String = names.iter().map(|n| format!("{}\n", n)).collect();
+    let out = git::git_bytes(root, &["cat-file", "--batch"], Some(&input)).unwrap_or_default();
+    let mut objects = Vec::with_capacity(names.len());
+    let mut at = 0;
+    while objects.len() < names.len() {
+        let Some(end) = out[at..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&out[at..at + end]).into_owned();
+        at += end + 1;
+        let parts: Vec<&str> = header.split(' ').collect();
+        match (
+            parts.as_slice(),
+            parts.get(2).and_then(|s| s.parse::<usize>().ok()),
+        ) {
+            ([id, _, _], Some(size)) => {
+                let body = out[at..(at + size).min(out.len())].to_vec();
+                at += size + 1;
+                objects.push(Some((id.to_string(), body)));
+            }
+            _ => objects.push(None),
+        }
+    }
+    objects.resize(names.len(), None);
+    objects
+}
+
+/// `(mode, name, id)` for each entry of a raw tree object whose ids are
+/// `width` bytes.
+fn tree_entries(data: &[u8], width: usize) -> Option<Vec<(String, String, String)>> {
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at < data.len() {
+        let space = at + data[at..].iter().position(|&b| b == b' ')?;
+        let nul = space + data[space..].iter().position(|&b| b == 0)?;
+        let id = data.get(nul + 1..nul + 1 + width)?;
+        let mode = std::str::from_utf8(&data[at..space]).ok()?;
+        if mode.is_empty() || !mode.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        entries.push((
+            mode.to_string(),
+            String::from_utf8_lossy(&data[space + 1..nul]).into_owned(),
+            id.iter().map(|b| format!("{:02x}", b)).collect(),
+        ));
+        at = nul + 1 + width;
+    }
+    Some(entries)
+}
+
+/// A line distinctive enough that finding it at the same path in two
+/// unrelated repositories would be a coincidence.
+fn substantive(line: &str) -> bool {
+    !attribution::is_weak(line) && line.trim().chars().count() >= 12
+}
+
+/// What a session's working directory says about where it worked.
+enum Place {
+    /// A worktree of this repository: the directory its paths are relative to.
+    Root(String),
+    /// Somewhere that may have been one of its worktrees and isn't any more:
+    /// the candidate roots, outermost first, and the live worktree it lay
+    /// inside, if any, to fall back on.
+    Gone(Vec<String>, Option<String>),
+    /// Another repository's checkout.
+    Elsewhere,
+}
+
+fn place(cwd: &str, repo: &Repo) -> Place {
+    let found = snapshot::workspace_root(cwd);
+    let checkout = snapshot::has_git_marker(&found).then_some(found);
+    let live = repo.worktree_holding(cwd).cloned();
+    if Path::new(cwd).is_dir() {
+        if let Some(checkout) = &checkout {
+            if repo.worktrees.contains(checkout) {
+                return Place::Root(checkout.clone());
+            }
+        }
+    }
+    // A checkout above a directory that is gone is the one it was in — unless
+    // it also encloses this repository, as a home directory under git does.
+    let floor = match (&checkout, &live) {
+        // A repository nested in a worktree (a submodule, a vendored clone)
+        // is its own project.
+        (Some(checkout), Some(live)) if inside(checkout, live).is_some() => {
+            return Place::Elsewhere
+        }
+        (_, Some(live)) => Some(live.clone()),
+        (Some(checkout), None) if inside(&repo.root, checkout).is_some() => Some(checkout.clone()),
+        (Some(_), None) => return Place::Elsewhere,
+        (None, None) => None,
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    for (i, c) in cwd.char_indices().skip(1) {
+        if c == '/' {
+            candidates.push(cwd[..i].to_string());
+        }
+    }
+    candidates.push(cwd.to_string());
+    candidates.retain(|c| match &floor {
+        Some(floor) if live.as_ref() == Some(floor) => c == floor || inside(c, floor).is_some(),
+        Some(floor) => inside(c, floor).is_some(),
+        None => true,
+    });
+    Place::Gone(candidates, live)
+}
+
+/// The root a directory that no longer exists was a worktree of this
+/// repository at, judged by the text the session wrote: the candidate under
+/// which the most of it is in this repository's files at the same relative
+/// paths. A tie, or too little, decides nothing.
+fn recognize(candidates: &[String], turns: &[Turn], repo: &mut Repo) -> Option<String> {
+    let edits: Vec<&(String, String)> = turns.iter().flat_map(|t| t.edits.iter()).collect();
+    let mut wanted: HashSet<String> = HashSet::new();
+    for candidate in candidates {
+        for (file, _) in &edits {
+            if let Some(blobs) = inside(file, candidate).and_then(|p| repo.tree.get(&p)) {
+                wanted.extend(blobs.iter().cloned());
+            }
+        }
+    }
+    repo.load(&wanted);
+    let mut scores: Vec<(usize, &String)> = Vec::new();
+    for candidate in candidates {
+        let mut found: HashSet<String> = HashSet::new();
+        for (file, text) in &edits {
+            let Some(blobs) = inside(file, candidate).and_then(|p| repo.tree.get(&p)) else {
+                continue;
+            };
+            for line in text.lines().filter(|l| substantive(l)) {
+                let hash = attribution::line_hash(line);
+                if blobs
+                    .iter()
+                    .any(|b| repo.blobs.get(b).is_some_and(|l| l.contains(&hash)))
+                {
+                    found.insert(hash);
+                }
+            }
+        }
+        scores.push((found.len(), candidate));
+    }
+    scores.sort_by(|a, b| b.0.cmp(&a.0));
+    match scores.as_slice() {
+        [(best, root), rest @ ..]
+            if *best >= EVIDENCE && rest.first().is_none_or(|r| r.0 < *best) =>
+        {
+            Some((*root).clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a session in directories that are gone edited any path this
+/// repository has under one of the candidate roots — read off the raw text,
+/// since most such sessions belong to other repositories and parsing every
+/// one of them whole is most of what backfill would cost. A path written
+/// with an escape is taken as a possible match, so this only ever skips.
+fn could_be_recognized(transcript: &str, places: &[Place], repo: &Repo) -> bool {
+    let Ok(raw) = fs::read_to_string(transcript) else {
+        return true;
+    };
+    let candidates: Vec<&String> = places
+        .iter()
+        .flat_map(|p| match p {
+            Place::Gone(candidates, _) => candidates.iter().collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let key = "\"file_path\":";
+    let mut rest = raw.as_str();
+    while let Some(at) = rest.find(key) {
+        rest = rest[at + key.len()..].trim_start_matches(' ');
+        let Some(value) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        let file = &value[..end];
+        if file.contains('\\') {
+            return true;
+        }
+        let known = candidates
+            .iter()
+            .any(|root| inside(file, root).is_some_and(|p| repo.tree.contains_key(&p)));
+        if known {
+            return true;
+        }
+        rest = &value[end..];
+    }
+    false
+}
+
+/// A session that worked in this repository, and the worktrees it worked in.
+struct Session {
+    id: String,
+    /// The worktree its records are filed under: where it ended up.
+    root: String,
+    roots: Vec<String>,
+    turns: Vec<Turn>,
+}
+
+/// The transcripts that hold this repository's history: every local session
+/// whose working directory was one of its worktrees — the checkout `root`,
+/// any other git still lists, or one since removed, which is recognized by
+/// what the session wrote there rather than by where it was. Worktrees live
+/// wherever their creator put them, so no layout is assumed.
+fn sessions_for(repo: &mut Repo) -> Vec<Session> {
     let mut found = Vec::new();
     let projects = claude::projects_dir(None);
     let Ok(dirs) = fs::read_dir(&projects) else {
         return found;
     };
+    let mut paths: Vec<String> = Vec::new();
     for dir in dirs.flatten() {
         let Ok(files) = fs::read_dir(dir.path()) else {
             continue;
         };
         for file in files.flatten() {
             let path = file.path().to_string_lossy().into_owned();
-            if !path.ends_with(".jsonl") {
-                continue;
-            }
-            let Some(meta) = claude::read_session_meta(&path) else {
-                continue;
-            };
-            let within = std::iter::once(&meta.cwd)
-                .chain(&meta.other_cwds)
-                .any(|cwd| cwd == root || inside(cwd, root).is_some());
-            if within {
-                found.push((meta.session_id, path));
+            if path.ends_with(".jsonl") {
+                paths.push(path);
             }
         }
     }
-    found.sort();
+    for path in paths {
+        let Some(meta) = claude::read_session_meta(&path) else {
+            continue;
+        };
+        let places: Vec<Place> = std::iter::once(&meta.cwd)
+            .chain(&meta.other_cwds)
+            .map(|cwd| place(cwd, repo))
+            .collect();
+        if places.iter().all(|p| matches!(p, Place::Elsewhere)) {
+            continue;
+        }
+        let only_gone = places
+            .iter()
+            .all(|p| matches!(p, Place::Elsewhere | Place::Gone(_, None)));
+        if only_gone && !could_be_recognized(&path, &places, repo) {
+            continue;
+        }
+        let turns = turns_of(&path);
+        let mut roots: Vec<String> = Vec::new();
+        for place in places {
+            let root = match place {
+                Place::Root(root) => Some(root),
+                Place::Gone(candidates, live) => recognize(&candidates, &turns, repo).or(live),
+                Place::Elsewhere => None,
+            };
+            if let Some(root) = root {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        if roots.is_empty() {
+            continue;
+        }
+        found.push(Session {
+            id: meta.session_id,
+            root: roots[0].clone(),
+            roots,
+            turns,
+        });
+    }
+    found.sort_by(|a, b| a.id.cmp(&b.id));
     found
+}
+
+/// `file` relative to the worktree it was written in: the most deeply nested
+/// of this session's and the repository's that holds it.
+fn relative_to(file: &str, roots: &[String], repo: &Repo) -> Option<String> {
+    roots
+        .iter()
+        .chain(&repo.worktrees)
+        .filter(|root| inside(file, root).is_some())
+        .max_by_key(|root| root.len())
+        .and_then(|root| inside(file, root))
 }
 
 #[derive(Default)]
 pub struct Backfilled {
     pub session: String,
+    /// The worktree the session worked in, which may no longer exist.
+    pub root: String,
     pub turns: usize,
     pub edit_lines: usize,
     pub commit_lines: usize,
@@ -373,14 +754,18 @@ pub fn backfill(cwd: &str, store: Option<&dyn Store>) -> Vec<Backfilled> {
     } else {
         HashMap::new()
     };
-    let sessions: Vec<(String, Vec<Turn>)> = transcripts_for(&root)
-        .into_iter()
-        .map(|(session, path)| (session, turns_of(&path)))
-        .collect();
+    let mut repo = Repo::open(&root);
+    let found = sessions_for(&mut repo);
+    let mut sessions: Vec<(String, Vec<Turn>)> = Vec::new();
+    let mut places: Vec<(String, Vec<String>)> = Vec::new();
+    for s in found {
+        sessions.push((s.id, s.turns));
+        places.push((s.root, s.roots));
+    }
     let credited = credit(&sessions, &history, &notes);
 
     let mut results = Vec::new();
-    for (session, turns) in sessions {
+    for ((session, turns), (session_root, roots)) in sessions.into_iter().zip(places) {
         // Every line a tool edit in this session wrote: a commit's share is
         // what these don't already explain.
         let tool_lines: HashSet<String> = turns
@@ -392,12 +777,13 @@ pub fn backfill(cwd: &str, store: Option<&dyn Store>) -> Vec<Backfilled> {
         let mut built = Vec::new();
         let mut result = Backfilled {
             session: session.clone(),
+            root: session_root.clone(),
             ..Backfilled::default()
         };
         for turn in turns {
             let mut files: Vec<FileChange> = Vec::new();
             for (file, text) in &turn.edits {
-                let Some(relative) = inside(file, &root) else {
+                let Some(relative) = relative_to(file, &roots, &repo) else {
                     continue;
                 };
                 let lines: Vec<String> = text.lines().map(attribution::line_hash).collect();
@@ -456,7 +842,7 @@ pub fn backfill(cwd: &str, store: Option<&dyn Store>) -> Vec<Backfilled> {
             agent: AGENT.into(),
             session: session.clone(),
             project: project.clone(),
-            root: root.clone(),
+            root: session_root.clone(),
             turns: Vec::new(),
         });
         // The hooks' own turns stand; an earlier backfill's are replaced.

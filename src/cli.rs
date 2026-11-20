@@ -1538,6 +1538,7 @@ pub fn command_backfill(argv: &[String]) -> Run {
             "turns" => turns,
             "sessions" => results.iter().map(|r| Value::Object(object! {
                 "session" => r.session.as_str(),
+                "root" => r.root.as_str(),
                 "turns" => r.turns,
                 "editLines" => r.edit_lines,
                 "commitLines" => r.commit_lines,

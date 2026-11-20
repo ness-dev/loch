@@ -250,3 +250,34 @@ fn a_bundle_whose_agent_is_not_claude_is_version_2() {
     bundle.agent = "codex".into();
     assert_eq!(bundle.required_version(), 2);
 }
+
+#[test]
+fn a_session_id_must_be_a_plain_file_name() {
+    use loch::agent::is_safe_session_id;
+    for good in [
+        "11111111-2222-4333-8444-555555555555",
+        "abc",
+        "old-id",
+        "a.b_c",
+    ] {
+        assert!(is_safe_session_id(good), "{}", good);
+    }
+    for bad in [
+        "",
+        "..",
+        ".hidden",
+        "../x",
+        "/etc/x",
+        "a/b",
+        "a\\b",
+        "x; rm -rf ~",
+        "a b",
+        "a\0b",
+    ] {
+        assert!(!is_safe_session_id(bad), "{:?}", bad);
+    }
+    let mut bundle = sample_bundle(None);
+    bundle.sessions[0].session_id = "../../x".into();
+    let packed = pack_bundle(&bundle).unwrap();
+    assert!(unpack_bundle(&packed).is_err());
+}

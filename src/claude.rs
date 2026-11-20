@@ -326,6 +326,10 @@ pub fn find_transcript(
     session_id: &str,
     store: Option<&dyn Store>,
 ) -> Result<Option<String>, StoreError> {
+    // The id comes from an edit record, which a shared store also supplies.
+    if !crate::agent::is_safe_session_id(session_id) {
+        return Ok(None);
+    }
     let root = projects_dir(None);
     if Path::new(&root).is_dir() {
         for project in list_dir(&root) {
@@ -353,6 +357,11 @@ pub fn find_transcript(
                 .next()
                 .unwrap_or("")
                 .to_string();
+            // A listed key is the store's to choose too: `..` would step out
+            // of the cache.
+            if project.is_empty() || project.starts_with('.') || project.contains('\\') {
+                continue;
+            }
             let data = match store.get(&key) {
                 Ok(data) => data,
                 Err(StoreError::Missing(_)) => return Ok(None),

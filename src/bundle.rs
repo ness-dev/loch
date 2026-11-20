@@ -259,8 +259,16 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
                 .ok_or_else(|| format!("'{}'", key))
         };
         let optional = |key: &str| session.get(key).and_then(Value::as_str).map(str::to_string);
+        let session_id = required("sessionId")?;
+        // Not echoed: it is whatever the bundle's author chose to put there.
+        if !crate::agent::is_safe_session_id(&session_id) {
+            return Err(format!(
+                "session {} has an id that isn't a safe file name",
+                sessions.len() + 1
+            ));
+        }
         sessions.push(BundleSession {
-            session_id: required("sessionId")?,
+            session_id,
             agent: optional("agent"),
             agent_version: optional("agentVersion"),
             cwd: required("cwd")?,

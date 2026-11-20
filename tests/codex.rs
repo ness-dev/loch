@@ -918,3 +918,97 @@ fn ask_on_a_turn_of_an_agent_this_build_lacks_is_unsupported() {
     assert_ne!(code, 0);
     assert_eq!(text(&document, "code"), "unsupported-agent");
 }
+
+// -- untrusted bundles ------------------------------------------------------------------
+
+/// A bundle that `restore` is handed came from a shared store, so its
+/// session ids are someone else's input: one shaped like a path must not
+/// decide where a transcript is written.
+fn crafted_bundle(world: &World, agent: &str, session_id: &str) -> String {
+    let repo = s(&world.repo);
+    let transcript = if agent == "codex" {
+        format!(
+            "{{\"timestamp\":\"x\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"timestamp\":\"2026-11-18T10:00:00.000Z\",\"cwd\":\"{}\"}}}}\n",
+            session_id, repo
+        )
+    } else {
+        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", repo)
+    };
+    let bundle = loch::bundle::Bundle {
+        version: 2,
+        agent: agent.into(),
+        created_at: "2026-11-18T10:00:00.000Z".into(),
+        origin: loch::bundle::BundleOrigin {
+            home: s(&world.home),
+            platform: "darwin".into(),
+            hostname: "elsewhere".into(),
+        },
+        sessions: vec![loch::bundle::BundleSession {
+            session_id: session_id.into(),
+            agent: None,
+            agent_version: None,
+            cwd: repo,
+            git_branch: None,
+            claude_version: None,
+            modified_at: "2026-11-18T10:00:00.000Z".into(),
+            transcript,
+        }],
+    };
+    let packed = loch::bundle::pack_bundle(&bundle).unwrap();
+    let reference = loch::bundle::bundle_ref(&packed);
+    let path = world.store.join(format!("bundles/{}.loch", reference));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, packed).unwrap();
+    reference
+}
+
+#[test]
+fn a_session_id_shaped_like_a_path_cannot_place_a_restore() {
+    let world = World::new();
+    let target = world.root.join("escaped");
+    for agent in ["claude-code", "codex"] {
+        for id in [
+            format!("../../../../../../../../../../..{}", s(&target)),
+            s(&target),
+            "a/b".to_string(),
+            "a\\b".to_string(),
+        ] {
+            let reference = crafted_bundle(&world, agent, &id);
+            let (document, code) = world.json(&["restore", &reference]);
+            assert_ne!(code, 0, "{} {}: {:?}", agent, id, document);
+            assert_eq!(
+                text(&document, "code"),
+                "bundle-unreadable",
+                "{} {}",
+                agent,
+                id
+            );
+            assert!(
+                !world.root.join("escaped.jsonl").exists(),
+                "{} {} wrote outside the sessions directory",
+                agent,
+                id
+            );
+            let mut stray = Vec::new();
+            collect_files(&world.root, &mut stray);
+            assert!(
+                stray.iter().all(|p| !s(p).ends_with(".jsonl")),
+                "{} {} wrote {:?}",
+                agent,
+                id,
+                stray
+            );
+        }
+    }
+}
+
+fn collect_files(dir: &Path, into: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, into);
+        } else {
+            into.push(path);
+        }
+    }
+}

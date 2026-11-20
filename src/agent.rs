@@ -38,6 +38,20 @@ pub struct SessionMeta {
     pub other_cwds: Vec<String>,
 }
 
+/// Whether a session id can be put into a file name, and a resume command,
+/// as it is. Every adapter files a transcript under a name built from its id,
+/// and a bundle's or a store's id is someone else's input: `../x` or `/x`
+/// would choose where `restore` writes, and `;` what a resume command runs.
+/// Both agents' ids are UUIDs, so an allowlist costs nothing real.
+pub fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// What the transcript says about a turn: the record that began it and the
 /// last record written. Each id is whatever the agent's transcript uses to
 /// name a position in itself — a record uuid for Claude Code, a turn id for

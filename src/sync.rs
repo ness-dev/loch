@@ -238,14 +238,10 @@ fn bundle_in_project(
     project: &str,
     projects: &mut HashMap<String, String>,
 ) -> Result<bool, StoreError> {
-    let packed = local.get(key)?;
-    let Ok(bundle) = crate::bundle::unpack_bundle(&packed) else {
-        return Ok(false);
-    };
-    for session in &bundle.sessions {
-        let id = projects.entry(session.cwd.clone()).or_insert_with(|| {
-            if std::path::Path::new(&session.cwd).is_dir() {
-                attribution::project_id(&snapshot::workspace_root(&session.cwd))
+    for cwd in bundle_cwds(local, key)? {
+        let id = projects.entry(cwd.clone()).or_insert_with(|| {
+            if std::path::Path::new(&cwd).is_dir() {
+                attribution::project_id(&snapshot::workspace_root(&cwd))
             } else {
                 String::new()
             }
@@ -255,6 +251,35 @@ fn bundle_in_project(
         }
     }
     Ok(false)
+}
+
+/// The cwds of a bundle's sessions. A ref is the hash of the bundle's bytes,
+/// so the answer never changes and is kept (`~/.loch/cache/bundle-cwds/<ref>`)
+/// rather than unpacking every bundle on every push.
+fn bundle_cwds(local: &dyn Store, key: &str) -> Result<Vec<String>, StoreError> {
+    let ref_ = index::ref_from_key(key);
+    let cached = snapshot::loch_home()
+        .join("cache/bundle-cwds")
+        .join(format!("{}.json", ref_));
+    if let Some(Value::Array(cwds)) = std::fs::read_to_string(&cached)
+        .ok()
+        .and_then(|text| json::loads(&text).ok())
+    {
+        return Ok(cwds
+            .iter()
+            .filter_map(|c| c.as_str().map(str::to_string))
+            .collect());
+    }
+    let packed = local.get(key)?;
+    let Ok(bundle) = crate::bundle::unpack_bundle(&packed) else {
+        return Ok(Vec::new());
+    };
+    let mut cwds: Vec<String> = bundle.sessions.iter().map(|s| s.cwd.clone()).collect();
+    cwds.sort();
+    cwds.dedup();
+    let body = Value::Array(cwds.iter().map(|c| Value::str(c.as_str())).collect());
+    let _ = snapshot::write_atomically(&cached, json::dumps(&body, json::DEFAULT).as_bytes());
+    Ok(cwds)
 }
 
 /// Everything a push would send, in the order it has to arrive: a bundle
@@ -555,10 +580,9 @@ fn merge_with_remote(
     if merged.turns == mine.turns {
         return Ok((data, hash));
     }
+    // The merge's file entries go after it, from the plan: the other copy's
+    // are on the remote already, and this one's are queued behind the record.
     attribution::publish(local, &merged)?;
-    for (entry, body) in attribution::file_entries(&merged) {
-        remote.put(&entry, &body)?;
-    }
     let body = local.get(key)?;
     let hash = snapshot::content_hash(&body);
     Ok((body, hash))

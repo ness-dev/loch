@@ -293,7 +293,11 @@ teammate's turns arrive by `pull`, never by a read that waits on the network.
   store's, `pull` merges into the local copy, and `push` merges the remote's
   copy in before it uploads and keeps the merge here. Two pushes of one session
   at the same moment can still drop one's new turns from the remote, until
-  that machine's record next changes and its push merges them back.
+  that machine's record next changes and its push merges them back. The
+  other side of merging: a turn removed on one machine (a `backfill` re-run
+  dropping a contested backfilled turn) comes back from any other copy, and
+  only a tombstone removes anything for good. That is the trade taken, since
+  a lost turn is silent and a resurrected one is visible.
   Transcripts are still one object per key, last writer wins. Claude's keys
   name the project directory, so a session resumed in another checkout gets
   its own key, but a Codex rollout's name doesn't change on restore.

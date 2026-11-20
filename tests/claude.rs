@@ -114,7 +114,7 @@ fn reads_metadata_from_a_transcript() {
     assert_eq!(meta.session_id, "abc");
     assert_eq!(meta.cwd, "/Users/mike/proj");
     assert_eq!(meta.git_branch.as_deref(), Some("main"));
-    assert_eq!(meta.claude_version.as_deref(), Some("1.0.99"));
+    assert_eq!(meta.version.as_deref(), Some("1.0.99"));
     assert_eq!(meta.summary.as_deref(), Some("do the thing"));
     assert!(meta.modified_at.ends_with('Z'));
 }

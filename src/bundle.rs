@@ -11,7 +11,16 @@ use crate::sys;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
+/// A bundle of Claude Code sessions alone: every bundle made before Codex,
+/// and every one since that holds only Claude sessions, keeps this, and its
+/// bytes.
 pub const BUNDLE_VERSION: i64 = 1;
+
+/// A bundle holding any other agent's session. A build that predates agents
+/// ignores `agent` and would restore a Codex session as a Claude transcript
+/// while reporting success; it refuses any version but 1, so this makes it
+/// fail loudly instead.
+pub const AGENTS_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct BundleOrigin {
@@ -20,14 +29,47 @@ pub struct BundleOrigin {
     pub hostname: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct BundleSession {
     pub session_id: String,
+    /// Set only where the session's agent differs from the bundle's, so a
+    /// bundle of one agent's sessions — every Claude bundle before Codex —
+    /// keeps its bytes, and its ref.
+    pub agent: Option<String>,
     pub cwd: String,
     pub git_branch: Option<String>,
     pub claude_version: Option<String>,
+    /// Any other agent's version: `claudeVersion` keeps meaning Claude's.
+    pub agent_version: Option<String>,
     pub modified_at: String,
     pub transcript: String,
+}
+
+impl BundleSession {
+    pub fn agent_of<'a>(&'a self, bundle: &'a Bundle) -> &'a str {
+        self.agent.as_deref().unwrap_or(&bundle.agent)
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.claude_version
+            .as_deref()
+            .or(self.agent_version.as_deref())
+    }
+}
+
+impl Bundle {
+    /// The version these sessions need: 1 unless any isn't Claude Code's.
+    pub fn required_version(&self) -> i64 {
+        let claude_only = self
+            .sessions
+            .iter()
+            .all(|s| s.agent_of(self) == crate::claude::AGENT);
+        if claude_only {
+            BUNDLE_VERSION
+        } else {
+            AGENTS_VERSION
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -40,14 +82,20 @@ pub struct Bundle {
 }
 
 fn session_json(session: &BundleSession) -> Value {
-    let mut record =
-        object! {"sessionId" => session.session_id.as_str(), "cwd" => session.cwd.as_str()};
+    let mut record = object! {"sessionId" => session.session_id.as_str()};
     // Omitted rather than null: the ref is a hash of these bytes.
+    if let Some(agent) = &session.agent {
+        record.insert("agent".into(), agent.as_str().into());
+    }
+    record.insert("cwd".into(), session.cwd.as_str().into());
     if let Some(branch) = &session.git_branch {
         record.insert("gitBranch".into(), branch.as_str().into());
     }
     if let Some(version) = &session.claude_version {
         record.insert("claudeVersion".into(), version.as_str().into());
+    }
+    if let Some(version) = &session.agent_version {
+        record.insert("agentVersion".into(), version.as_str().into());
     }
     record.insert("modifiedAt".into(), session.modified_at.as_str().into());
     record.insert("transcript".into(), session.transcript.as_str().into());
@@ -168,16 +216,21 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
     })?;
     let root = value.as_object().ok_or("the bundle is not a JSON object")?;
     let version = root.get("version");
-    let current = matches!(version, Some(Value::Int(d)) if d == "1")
+    let read = if matches!(version, Some(Value::Int(d)) if d == "1")
         || matches!(version, Some(Value::Bool(true)))
-        || matches!(version, Some(Value::Float(f)) if *f == 1.0);
-    if !current {
+        || matches!(version, Some(Value::Float(f)) if *f == 1.0)
+    {
+        BUNDLE_VERSION
+    } else if matches!(version, Some(Value::Int(d)) if d == "2") {
+        AGENTS_VERSION
+    } else {
         return Err(format!(
-            "unsupported bundle version {} (this build reads {})",
+            "unsupported bundle version {} (this build reads {} and {})",
             py_str(version),
-            BUNDLE_VERSION
+            BUNDLE_VERSION,
+            AGENTS_VERSION
         ));
-    }
+    };
     let empty = Map::new();
     let origin = match root.get("origin") {
         None => &empty,
@@ -205,8 +258,11 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
                 .map(str::to_string)
                 .ok_or_else(|| format!("'{}'", key))
         };
+        let optional = |key: &str| session.get(key).and_then(Value::as_str).map(str::to_string);
         sessions.push(BundleSession {
             session_id: required("sessionId")?,
+            agent: optional("agent"),
+            agent_version: optional("agentVersion"),
             cwd: required("cwd")?,
             git_branch: session
                 .get("gitBranch")
@@ -221,7 +277,7 @@ pub fn unpack_bundle(data: &[u8]) -> Result<Bundle, String> {
         });
     }
     Ok(Bundle {
-        version: BUNDLE_VERSION,
+        version: read,
         agent: text_of(root, "agent"),
         created_at: text_of(root, "createdAt"),
         origin: BundleOrigin {

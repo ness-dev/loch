@@ -73,6 +73,7 @@ const SCRUBBED: &[&str] = &[
     "LOCH_S3_ENDPOINT",
     "LOCH_S3_REGION",
     "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
     "SOURCE_DATE_EPOCH",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -325,7 +326,9 @@ fn test_list_reports_sessions() {
 fn test_list_reports_nothing_for_an_unknown_cwd() {
     let tmp = Tmp::new();
     let ran = invoke(&tmp, &tmp.join("home"), &["list", "--cwd", &s(tmp.path())]);
-    assert!(ran.out.starts_with("no claude-code sessions found for"));
+    assert!(ran
+        .out
+        .starts_with("no claude-code or codex sessions found for"));
 }
 
 #[test]
@@ -540,7 +543,7 @@ fn test_save_fails_when_nothing_matches() {
     );
     assert!(ran
         .err
-        .starts_with("loch: no claude-code sessions found for"));
+        .starts_with("loch: no claude-code or codex sessions found for"));
     assert_eq!(ran.code, 1);
 }
 
@@ -1253,7 +1256,7 @@ fn test_json_failure_is_still_one_parseable_document_on_stdout() {
     assert_eq!(at(&document, "ok"), &Value::Bool(false));
     assert_eq!(text(&document, "code"), "no-sessions");
     assert_eq!(code, 1);
-    assert!(text(&document, "error").starts_with("no claude-code sessions found for"));
+    assert!(text(&document, "error").starts_with("no claude-code or codex sessions found for"));
     assert_eq!(err, "");
 }
 

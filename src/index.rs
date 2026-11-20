@@ -26,6 +26,8 @@ pub struct IndexEntry {
     pub sessions: i64,
     pub cwd: String,
     pub claude_version: Option<String>,
+    /// The version of a non-Claude agent; `claudeVersion` keeps meaning Claude's.
+    pub agent_version: Option<String>,
 }
 
 pub struct ReindexResult {
@@ -119,6 +121,7 @@ fn entry_json(entry: &IndexEntry) -> Value {
         "sessions" => entry.sessions,
         "cwd" => entry.cwd.as_str(),
         "claudeVersion" => Value::opt_str(entry.claude_version.as_deref()),
+        "agentVersion" => Value::opt_str(entry.agent_version.as_deref()),
     })
 }
 
@@ -135,6 +138,7 @@ fn entry_from_json(raw: &Value) -> Option<IndexEntry> {
         sessions: number("sessions"),
         cwd: text("cwd").unwrap_or_default(),
         claude_version: text("claudeVersion"),
+        agent_version: text("agentVersion"),
     })
 }
 
@@ -161,7 +165,9 @@ pub fn entries_for(bundle: &Bundle, ref_: &str, size: usize) -> Vec<IndexEntry> 
             ref_: ref_.into(),
             dimension: BRANCH.into(),
             value: branch,
-            agent: bundle.agent.clone(),
+            // A bundle can hold several agents' sessions; each entry names
+            // its first session's.
+            agent: sessions[0].agent_of(bundle).to_string(),
             created_at: bundle.created_at.clone(),
             bytes: size as i64,
             sessions: sessions.len() as i64,
@@ -169,6 +175,9 @@ pub fn entries_for(bundle: &Bundle, ref_: &str, size: usize) -> Vec<IndexEntry> 
             claude_version: sessions
                 .iter()
                 .find_map(|s| s.claude_version.clone().filter(|v| !v.is_empty())),
+            agent_version: sessions
+                .iter()
+                .find_map(|s| s.agent_version.clone().filter(|v| !v.is_empty())),
         })
         .collect()
 }

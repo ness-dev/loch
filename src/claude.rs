@@ -1,31 +1,24 @@
-//! The Claude Code adapter: where sessions live, how
-//! their directory is named, and what a session's metadata is.
+//! The Claude Code adapter: where sessions live, how their directory is
+//! named, what a session's metadata is, how a turn reads in the transcript,
+//! and how a conversation is forked.
 
-use crate::json::{self, Value};
+pub use crate::agent::SessionMeta;
+use crate::agent::{Agent, HookEvent, TurnInfo};
+use crate::json::{self, Map, Value};
+use crate::object;
 use crate::py;
 use crate::redact;
+use crate::rewrite::{rewrite_transcript, RewriteSpec};
+use crate::store::{Store, StoreError};
 use crate::sys;
+use crate::trace::{self, content, records_of, Fork, ForkError, TraceError};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
 pub const AGENT: &str = "claude-code";
 
 pub const SUMMARY_LIMIT: usize = 120;
-
-#[derive(Clone, Debug)]
-pub struct SessionMeta {
-    pub session_id: String,
-    pub path: String,
-    pub cwd: String,
-    pub git_branch: Option<String>,
-    pub claude_version: Option<String>,
-    pub bytes: u64,
-    pub modified_at: String,
-    pub summary: Option<String>,
-    /// Directories the session also worked in before it moved. A restore has
-    /// one target cwd, so records naming these cannot be made correct on the
-    /// far side; surfacing them is the only honest option.
-    pub other_cwds: Vec<String>,
-}
 
 /// `Path.home()`: `HOME` on Unix, `USERPROFILE` on Windows.
 pub fn home_dir() -> String {
@@ -189,10 +182,11 @@ pub fn read_session_meta(path: &str) -> Option<SessionMeta> {
     let ordered: Vec<String> = counts.keys().cloned().collect();
     let cwd = cwd_for_directory(&ordered, &sys::basename(&sys::dirname(path)));
     Some(SessionMeta {
+        agent: AGENT,
         session_id,
         path: path.into(),
         git_branch: branches.get(&cwd).cloned(),
-        claude_version: versions
+        version: versions
             .get(&cwd)
             .or_else(|| versions.values().next())
             .cloned(),
@@ -238,4 +232,383 @@ pub fn list_sessions(
     // sorted(..., reverse=True) is stable, as sort_by is.
     metas.sort_by(|a, b| py::cmp(&b.modified_at, &a.modified_at));
     metas
+}
+
+// -- reading a turn --------------------------------------------------------------
+
+/// A record a person typed: a user message that is neither a tool's result
+/// nor Claude Code's own bookkeeping.
+pub fn is_human_prompt(record: &Map) -> bool {
+    if !record.get("type").is_some_and(|t| t.is_str("user")) {
+        return false;
+    }
+    if record.get("isMeta").is_some_and(Value::truthy)
+        || record.get("isCompactSummary").is_some_and(Value::truthy)
+    {
+        return false;
+    }
+    match record.get("message").and_then(|m| m.get("content")) {
+        Some(Value::Str(_)) => true,
+        Some(Value::Array(_)) => !content(record)
+            .iter()
+            .any(|b| b.get("type").is_some_and(|t| t.is_str("tool_result"))),
+        _ => false,
+    }
+}
+
+pub fn prompt_text(record: &Map) -> Option<String> {
+    match record.get("message")?.get("content")? {
+        Value::Str(text) => Some(text.clone()),
+        Value::Array(_) => content(record)
+            .iter()
+            .find_map(|block| match block.get("text") {
+                Some(Value::Str(text)) if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+/// The turn the transcript ends with. When the hook closing it belongs to the
+/// *next* prompt, that prompt may already be written; `excluding` names it,
+/// and it and everything after are left out.
+pub fn current_turn(transcript: &str, excluding: Option<&str>) -> TurnInfo {
+    let records: Vec<Map> = trace::read_records(transcript)
+        .into_iter()
+        .filter(|r| matches!(r.get("uuid"), Some(Value::Str(_))))
+        .collect();
+    let mut end = records.len();
+    if let Some(next) = excluding {
+        if let Some(at) = records.iter().rposition(is_human_prompt) {
+            if prompt_text(&records[at]).as_deref() == Some(next) {
+                end = at;
+            }
+        }
+    }
+    let mut info = TurnInfo::default();
+    for record in &records[..end] {
+        let uuid = record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let stamp = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if is_human_prompt(record) {
+            info.prompt_uuid = uuid.clone();
+            info.prompt = display_summary(prompt_text(record).as_deref());
+            info.started = stamp.clone();
+        }
+        info.end_uuid = uuid;
+        info.ended = stamp;
+    }
+    info
+}
+
+// -- finding a transcript ------------------------------------------------------------
+
+fn list_dir(path: &str) -> Vec<String> {
+    fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Claude's own copy if it still exists, else the store's snapshot, fetched
+/// into a cache laid out like Claude's project directory so the session's cwd
+/// is chosen the same way.
+pub fn find_transcript(
+    session_id: &str,
+    store: Option<&dyn Store>,
+) -> Result<Option<String>, StoreError> {
+    let root = projects_dir(None);
+    if Path::new(&root).is_dir() {
+        for project in list_dir(&root) {
+            let path = sys::join(
+                &sys::join(&root, &project),
+                &format!("{}.jsonl", session_id),
+            );
+            if Path::new(&path).exists() {
+                return Ok(Some(path));
+            }
+        }
+    }
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let prefix = trace::transcripts_prefix(AGENT);
+    let Ok(keys) = store.list(&prefix) else {
+        return Ok(None);
+    };
+    let suffix = format!("/{}.jsonl", session_id);
+    for key in keys {
+        if key.ends_with(&suffix) {
+            let project = key[prefix.len()..]
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let data = match store.get(&key) {
+                Ok(data) => data,
+                Err(StoreError::Missing(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let cache = sys::join(&trace::cache_dir(), &project);
+            let cached = sys::join(&cache, &format!("{}.jsonl", session_id));
+            let _ = fs::create_dir_all(&cache);
+            let _ = fs::write(&cached, data);
+            return Ok(Some(cached));
+        }
+    }
+    Ok(None)
+}
+
+// -- forking -------------------------------------------------------------------------
+
+fn parent(record: &Map) -> Option<String> {
+    let parent = match record.get("parentUuid") {
+        None | Some(Value::Null) => record.get("logicalParentUuid"),
+        other => other,
+    };
+    parent.and_then(Value::as_str).map(str::to_string)
+}
+
+fn uuid(record: &Map) -> &str {
+    record.get("uuid").and_then(Value::as_str).unwrap_or("")
+}
+
+/// A new Claude session holding the conversation, filed under `target_cwd`.
+/// With no `cut` it holds the conversation to its end — the last record
+/// written, which after a rewind is the branch the session was left on. With
+/// one, it ends at that record: the last of the turn being asked about.
+pub fn fork_session(
+    transcript: &str,
+    target_cwd: &str,
+    cut: Option<&str>,
+    title: Option<&str>,
+) -> Result<Fork, ForkError> {
+    let bytes =
+        fs::read(transcript).map_err(|e| ForkError::Internal(sys::os_error(&e, transcript)))?;
+    let raw = py::decode_surrogateescape(&bytes);
+    let records: Vec<Map> = records_of(&raw)
+        .into_iter()
+        .filter(|r| matches!(r.get("uuid"), Some(Value::Str(_))))
+        .collect();
+    if records.is_empty() {
+        return Err(ForkError::Trace(TraceError::new(
+            "turn-not-found",
+            "the transcript holds no records",
+        )));
+    }
+    let leaf = match cut {
+        None => records.len() - 1,
+        Some(cut) => match records.iter().rposition(|r| uuid(r) == cut) {
+            Some(leaf) => leaf,
+            None => {
+                return Err(ForkError::Trace(TraceError::new(
+                    "turn-not-found",
+                    format!("the transcript has no record {}", cut),
+                )))
+            }
+        },
+    };
+    write_fork(transcript, &raw, &records, leaf, target_cwd, title)
+}
+
+fn write_fork(
+    transcript: &str,
+    raw: &str,
+    records: &[Map],
+    leaf: usize,
+    target_cwd: &str,
+    title: Option<&str>,
+) -> Result<Fork, ForkError> {
+    let mut by_uuid: HashMap<&str, usize> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        by_uuid.insert(uuid(record), index);
+    }
+    let mut keep: HashSet<String> = HashSet::new();
+    let mut walker = Some(leaf);
+    while let Some(index) = walker {
+        let id = uuid(&records[index]).to_string();
+        if keep.contains(&id) {
+            break;
+        }
+        keep.insert(id);
+        walker = parent(&records[index]).and_then(|p| by_uuid.get(p.as_str()).copied());
+    }
+
+    let origin_cwd = match read_session_meta(transcript) {
+        Some(meta) => meta.cwd,
+        None => match transcript_cwds(raw).into_iter().next() {
+            Some((cwd, _)) => cwd,
+            None => return Err(ForkError::Internal("the transcript names no cwd".into())),
+        },
+    };
+    let file = sys::basename(transcript);
+    let origin_session = file[..file.len().saturating_sub(".jsonl".len())].to_string();
+    let new_id = sys::uuid4();
+
+    let mut kept: Vec<String> = records
+        .iter()
+        .filter(|r| keep.contains(uuid(r)))
+        .map(|r| json::dumps(&Value::Object(r.clone()), json::UNICODE))
+        .collect();
+    let default_title = format!("loch ask: {}", py::truncate(&origin_session, 8));
+    kept.push(json::dumps(
+        &Value::Object(object! {
+            "type" => "custom-title",
+            "customTitle" => title.filter(|t| !t.is_empty()).unwrap_or(&default_title),
+            "sessionId" => origin_session.as_str(),
+        }),
+        json::DEFAULT,
+    ));
+    let home = home_dir();
+    let spec = RewriteSpec {
+        origin_cwd,
+        origin_home: home.clone(),
+        target_cwd: target_cwd.into(),
+        target_home: home,
+        origin_session_id: Some(origin_session.clone()),
+        target_session_id: Some(new_id.clone()),
+    };
+    let text = rewrite_transcript(&format!("{}\n", kept.join("\n")), &spec);
+    let path = transcript_path_for(target_cwd, &new_id, None);
+    let parent_dir = sys::dirname(&path);
+    fs::create_dir_all(&parent_dir)
+        .map_err(|e| ForkError::Internal(sys::os_error(&e, &parent_dir)))?;
+    let bytes = py::encode_surrogateescape(&text)
+        .map_err(|_| ForkError::Internal("the fork holds an unencodable surrogate".into()))?;
+    fs::write(&path, bytes).map_err(|e| ForkError::Internal(sys::os_error(&e, &path)))?;
+    Ok(Fork {
+        session_id: new_id,
+        path,
+        cwd: target_cwd.into(),
+        records: keep.len(),
+        origin_session,
+    })
+}
+
+// -- the adapter -----------------------------------------------------------------------
+
+pub struct ClaudeCode;
+
+pub static CLAUDE_CODE: ClaudeCode = ClaudeCode;
+
+/// A turn's two moments, which is all attribution needs, and the session's
+/// end, which closes a turn a cancel left open.
+const HOOK_EVENTS: &[HookEvent] = &[
+    ("UserPromptSubmit", "prompt"),
+    ("Stop", "stop"),
+    ("SessionEnd", "end"),
+];
+
+impl Agent for ClaudeCode {
+    fn id(&self) -> &'static str {
+        AGENT
+    }
+
+    fn name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn hook_events(&self) -> &'static [HookEvent] {
+        HOOK_EVENTS
+    }
+
+    /// The project's settings file, or with `local` the uncommitted one, since
+    /// a `--local` command is a machine-specific path.
+    fn hooks_file(&self, root: &str, local: bool) -> String {
+        let name = if local {
+            "settings.local.json"
+        } else {
+            "settings.json"
+        };
+        sys::join(&sys::join(root, ".claude"), name)
+    }
+
+    fn install_note(&self) -> &'static str {
+        "restart Claude Code sessions here to pick them up"
+    }
+
+    fn current_turn(&self, transcript: &str, event: &Map, for_next: bool) -> TurnInfo {
+        let next = match event.get("prompt") {
+            Some(Value::Str(text)) if for_next => Some(text.as_str()),
+            _ => None,
+        };
+        current_turn(transcript, next)
+    }
+
+    /// Keyed by Claude's project directory, so a fetched copy can be filed
+    /// back under it and its cwd chosen the same way.
+    fn transcript_key(&self, path: &str, session_id: &str) -> Option<String> {
+        let project = sys::basename(&sys::dirname(path));
+        Some(format!(
+            "{}{}/{}.jsonl",
+            trace::transcripts_prefix(AGENT),
+            project,
+            session_id
+        ))
+    }
+
+    fn sessions_dir(&self) -> String {
+        projects_dir(None)
+    }
+
+    fn list_sessions(
+        &self,
+        cwd: &str,
+        branch: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Vec<SessionMeta> {
+        list_sessions(cwd, branch, session_id, None)
+    }
+
+    fn read_session_meta(&self, path: &str) -> Option<SessionMeta> {
+        read_session_meta(path)
+    }
+
+    fn transcript_cwds(&self, raw: &str) -> Vec<(String, usize)> {
+        transcript_cwds(raw)
+    }
+
+    fn can_restore(&self) -> bool {
+        true
+    }
+
+    fn restore_path(&self, _raw: &str, cwd: &str, session_id: &str) -> Option<String> {
+        Some(transcript_path_for(cwd, session_id, None))
+    }
+
+    fn existing_transcript(&self, cwd: &str, session_id: &str) -> Option<String> {
+        let path = transcript_path_for(cwd, session_id, None);
+        Path::new(&path).exists().then_some(path)
+    }
+
+    fn resume_command(&self, session_id: &str) -> Option<Vec<String>> {
+        Some(vec!["claude".into(), "--resume".into(), session_id.into()])
+    }
+
+    fn find_transcript(
+        &self,
+        session_id: &str,
+        store: Option<&dyn Store>,
+    ) -> Result<Option<String>, StoreError> {
+        find_transcript(session_id, store)
+    }
+
+    fn fork(
+        &self,
+        transcript: &str,
+        target_cwd: &str,
+        cut: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<Fork, ForkError> {
+        fork_session(transcript, target_cwd, cut, title)
+    }
 }

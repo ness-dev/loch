@@ -18,6 +18,8 @@ fn sample_bundle(git_branch: Option<&str>) -> Bundle {
         },
         sessions: vec![BundleSession {
             session_id: "abc".into(),
+            agent: None,
+            agent_version: None,
             cwd: "/home/mike/proj".into(),
             git_branch: git_branch.map(str::to_string),
             claude_version: Some("1.0.99".into()),
@@ -98,7 +100,7 @@ fn absent_metadata_stays_absent_rather_than_null() {
 #[test]
 fn rejects_an_unsupported_version() {
     let packed = pack_bundle(&Bundle {
-        version: 2,
+        version: 3,
         agent: "claude-code".into(),
         created_at: String::new(),
         origin: BundleOrigin {
@@ -110,9 +112,9 @@ fn rejects_an_unsupported_version() {
     })
     .unwrap();
     let Err(error) = unpack_bundle(&packed) else {
-        panic!("a version 2 bundle unpacked");
+        panic!("a version 3 bundle unpacked");
     };
-    assert!(error.contains("unsupported bundle version 2"), "{}", error);
+    assert!(error.contains("unsupported bundle version 3"), "{}", error);
 }
 
 #[test]
@@ -127,4 +129,124 @@ fn packing_matches_python_310_on_every_platform() {
     assert_eq!(header, "1f8b08000000000002ff");
     assert_eq!(&sha256_hex(&packed)[..16], "405552bff938ef58");
     assert_eq!(gunzip(&packed), data);
+}
+
+// -- format pins ----------------------------------------------------------------
+//
+// The ref is a hash of the packed bytes, so anything that changes them —
+// separators, key order, a null where a key was omitted, a field added to
+// every session — changes the identity of every bundle ever made. These pin
+// the bytes of today's format; a failure here means existing refs would no
+// longer reproduce, which needs a deliberate decision, not a test update.
+
+fn pinned_bundle() -> Bundle {
+    Bundle {
+        version: 1,
+        agent: "claude-code".into(),
+        created_at: "2026-08-14T13:27:07.373Z".into(),
+        origin: BundleOrigin {
+            home: "/home/mike".into(),
+            platform: "linux".into(),
+            hostname: "box".into(),
+        },
+        sessions: vec![
+            BundleSession {
+                session_id: "11111111-2222-4333-8444-555555555555".into(),
+                agent: None,
+                agent_version: None,
+                cwd: "/home/mike/proj".into(),
+                git_branch: Some("feature/é".into()),
+                claude_version: Some("1.0.99".into()),
+                modified_at: "2026-08-14T13:00:00.000Z".into(),
+                transcript: concat!(
+                    "{\"type\":\"user\",\"cwd\":\"/home/mike/proj\",\"message\":",
+                    "{\"content\":\"quote \\\" newline \\n tab \\t snowman ☃\"}}\n"
+                )
+                .into(),
+            },
+            BundleSession {
+                session_id: "66666666-7777-4888-9999-000000000000".into(),
+                agent: None,
+                agent_version: None,
+                cwd: "/home/mike/proj".into(),
+                git_branch: None,
+                claude_version: None,
+                modified_at: "2026-08-14T12:00:00.000Z".into(),
+                transcript: "{\"cwd\":\"/home/mike/proj\"}\n".into(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn the_packed_json_is_pinned() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    let json = String::from_utf8(gunzip(&packed)).unwrap();
+    assert_eq!(
+        json,
+        r##"{"version":1,"agent":"claude-code","createdAt":"2026-08-14T13:27:07.373Z","origin":{"home":"/home/mike","platform":"linux","hostname":"box"},"sessions":[{"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"/home/mike/proj","gitBranch":"feature/é","claudeVersion":"1.0.99","modifiedAt":"2026-08-14T13:00:00.000Z","transcript":"{\"type\":\"user\",\"cwd\":\"/home/mike/proj\",\"message\":{\"content\":\"quote \\\" newline \\n tab \\t snowman ☃\"}}\n"},{"sessionId":"66666666-7777-4888-9999-000000000000","cwd":"/home/mike/proj","modifiedAt":"2026-08-14T12:00:00.000Z","transcript":"{\"cwd\":\"/home/mike/proj\"}\n"}]}"##
+    );
+}
+
+#[test]
+fn the_ref_is_pinned() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    assert_eq!(
+        bundle_ref(&packed),
+        "3069348d032085727a057739310cef4cb14ab8dba1fe838f865e46bf90235dad"
+    );
+}
+
+#[test]
+fn repacking_an_unpacked_bundle_reproduces_its_bytes() {
+    let packed = pack_bundle(&pinned_bundle()).unwrap();
+    assert_eq!(
+        pack_bundle(&unpack_bundle(&packed).unwrap()).unwrap(),
+        packed
+    );
+}
+
+/// A bundle holding a Codex session: no ref predates it, so it carries the
+/// version a build that ignores `agent` refuses, rather than being restored
+/// there as a Claude transcript with `ok: true`.
+fn codex_bundle() -> Bundle {
+    let mut bundle = pinned_bundle();
+    bundle.sessions[1].agent = Some("codex".into());
+    bundle.sessions[1].agent_version = Some("0.166.0".into());
+    bundle.version = bundle.required_version();
+    bundle
+}
+
+#[test]
+fn claude_sessions_alone_stay_version_1() {
+    assert_eq!(pinned_bundle().required_version(), 1);
+}
+
+#[test]
+fn any_other_agents_session_makes_a_version_2_bundle() {
+    let bundle = codex_bundle();
+    assert_eq!(bundle.version, 2);
+    let packed = pack_bundle(&bundle).unwrap();
+    let json = String::from_utf8(gunzip(&packed)).unwrap();
+    // What v0.2.0 checks, and refuses as "unsupported bundle version 2".
+    assert!(json.starts_with("{\"version\":2,"), "{}", json);
+    assert!(json.contains(
+        "\"sessionId\":\"66666666-7777-4888-9999-000000000000\",\"agent\":\"codex\",\"cwd\""
+    ));
+    assert!(json.contains("\"agentVersion\":\"0.166.0\""));
+    assert_eq!(
+        bundle_ref(&packed),
+        "08f5c37e73bf5b24c31ee64aaadbbe831b076875ec8de781edf10461462a7654"
+    );
+    let back = unpack_bundle(&packed).unwrap();
+    assert_eq!(back.version, 2);
+    assert_eq!(back.sessions[1].agent.as_deref(), Some("codex"));
+    assert_eq!(pack_bundle(&back).unwrap(), packed);
+}
+
+#[test]
+fn a_bundle_whose_agent_is_not_claude_is_version_2() {
+    let mut bundle = pinned_bundle();
+    bundle.agent = "codex".into();
+    assert_eq!(bundle.required_version(), 2);
 }

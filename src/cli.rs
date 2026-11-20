@@ -1,13 +1,12 @@
 //! Every command: each builds one `Outcome` — payload
 //! and prose together — and `main` renders it.
 
+use crate::agent::{self, Agent};
 use crate::argparse::{Exit, Nargs, Parser};
 use crate::attribution::{self, EditRecord};
 use crate::blame_html;
 use crate::bundle::{self, Bundle, BundleOrigin, BundleSession, BUNDLE_VERSION};
-use crate::claude::{
-    self, home_dir, list_sessions, resolve_cwd, transcript_path_for, SessionMeta, AGENT,
-};
+use crate::claude::{self, home_dir, resolve_cwd, SessionMeta, AGENT};
 use crate::format;
 use crate::index::{self, IndexEntry, IndexError, BRANCH};
 use crate::ingest::{self, Origin};
@@ -167,8 +166,9 @@ fn describe_entry(entry: &IndexEntry) -> String {
         _ => "[no branch]".into(),
     };
     let when = py::truncate(&entry.created_at, 16).replace('T', " ");
-    let version = match &entry.claude_version {
-        Some(v) if !v.is_empty() => format!("  claude {}", v),
+    let version = match (&entry.claude_version, &entry.agent_version) {
+        (Some(v), _) if !v.is_empty() => format!("  claude {}", v),
+        (_, Some(v)) if !v.is_empty() => format!("  {} {}", entry.agent, v),
         _ => String::new(),
     };
     format!(
@@ -182,14 +182,31 @@ fn describe_entry(entry: &IndexEntry) -> String {
     )
 }
 
+/// Every selected agent's sessions for a cwd, newest first.
 fn collect(
+    agents: &[&dyn Agent],
     cwd: Option<&str>,
     branch: Option<&str>,
     session: Option<&str>,
 ) -> (String, Vec<SessionMeta>) {
     let resolved = resolve_cwd(&cwd.map(str::to_string).unwrap_or_else(sys::getcwd));
-    let sessions = list_sessions(&resolved, branch, session, None);
+    let mut sessions: Vec<SessionMeta> = agents
+        .iter()
+        .flat_map(|agent| agent.list_sessions(&resolved, branch, session))
+        .collect();
+    // Stable, so one agent's sessions keep their own order on a tie.
+    sessions.sort_by(|a, b| py::cmp(&b.modified_at, &a.modified_at));
     (resolved, sessions)
+}
+
+fn agents_arg(id: Option<&str>) -> std::result::Result<Vec<&'static dyn Agent>, Failure> {
+    agent::selected(id)
+        .map_err(|message| Failure::Error(CommandError::new("unknown-agent", message)))
+}
+
+fn none_found(agents: &[&dyn Agent], cwd: &str) -> String {
+    let ids: Vec<&str> = agents.iter().map(|a| a.id()).collect();
+    format!("no {} sessions found for {}", ids.join(" or "), cwd)
 }
 
 fn parser(command: &str) -> Parser {
@@ -203,11 +220,13 @@ fn strings(items: &[String]) -> Value {
 fn session_payload(meta: &SessionMeta) -> Value {
     Value::Object(object! {
         "sessionId" => meta.session_id.as_str(),
+        "agent" => meta.agent,
         "path" => meta.path.as_str(),
         "cwd" => meta.cwd.as_str(),
         "otherCwds" => strings(&meta.other_cwds),
         "branch" => Value::opt_str(meta.git_branch.as_deref()),
-        "claudeVersion" => Value::opt_str(meta.claude_version.as_deref()),
+        "claudeVersion" => Value::opt_str(meta.version.as_deref().filter(|_| meta.agent == AGENT)),
+        "agentVersion" => Value::opt_str(meta.version.as_deref()),
         "bytes" => meta.bytes as i64,
         "modifiedAt" => meta.modified_at.as_str(),
         "summary" => Value::opt_str(meta.summary.as_deref()),
@@ -227,6 +246,7 @@ fn entry_payload(entry: &IndexEntry) -> Value {
         "sessions" => entry.sessions,
         "cwd" => entry.cwd.as_str(),
         "claudeVersion" => Value::opt_str(entry.claude_version.as_deref()),
+        "agentVersion" => Value::opt_str(entry.claude_version.as_deref().or(entry.agent_version.as_deref())),
     })
 }
 
@@ -236,6 +256,7 @@ pub fn command_list(argv: &[String]) -> Run {
     let mut p = parser("list");
     p.option("--cwd")
         .option("--branch")
+        .option("--agent")
         .flag("--remote", None)
         .flag("--all", Some("every"))
         .option("--store");
@@ -244,9 +265,10 @@ pub fn command_list(argv: &[String]) -> Run {
     if args.flag("remote") || args.flag("every") || store.is_some() {
         return list_remote(cwd, branch, store, args.flag("every"));
     }
-    let (cwd, sessions) = collect(cwd.as_deref(), branch.as_deref(), None);
+    let agents = agents_arg(args.str("agent").as_deref())?;
+    let (cwd, sessions) = collect(&agents, cwd.as_deref(), branch.as_deref(), None);
     let text = if sessions.is_empty() {
-        format!("no {} sessions found for {}\n", AGENT, cwd)
+        format!("{}\n", none_found(&agents, &cwd))
     } else {
         let mut text = format!("{} session(s) for {}\n", sessions.len(), cwd);
         for meta in &sessions {
@@ -346,19 +368,22 @@ pub fn command_save(argv: &[String]) -> Run {
     p.option("--cwd")
         .option("--branch")
         .option("--session")
+        .option("--agent")
         .option("--store");
     let args = p.parse(argv)?;
+    let agents = agents_arg(args.str("agent").as_deref())?;
     let (cwd, sessions) = collect(
+        &agents,
         args.str("cwd").as_deref(),
         args.str("branch").as_deref(),
         args.str("session").as_deref(),
     );
     if sessions.is_empty() {
-        return err(
-            "no-sessions",
-            format!("no {} sessions found for {}", AGENT, cwd),
-        );
+        return err("no-sessions", none_found(&agents, &cwd));
     }
+    // The bundle is its first session's agent's; any other session names its
+    // own, so a bundle of one agent's sessions has the bytes it always had.
+    let bundle_agent = sessions[0].agent;
     let mut packed_sessions = Vec::new();
     let mut redactions = Vec::new();
     for meta in &sessions {
@@ -387,19 +412,22 @@ pub fn command_save(argv: &[String]) -> Run {
                 )
             }
         };
+        let is_claude = meta.agent == AGENT;
         packed_sessions.push(BundleSession {
             session_id: meta.session_id.clone(),
+            agent: (meta.agent != bundle_agent).then(|| meta.agent.to_string()),
             cwd: meta.cwd.clone(),
             git_branch: meta.git_branch.clone(),
-            claude_version: meta.claude_version.clone(),
+            claude_version: meta.version.clone().filter(|_| is_claude),
+            agent_version: meta.version.clone().filter(|_| !is_claude),
             modified_at: meta.modified_at.clone(),
             transcript: scrubbed.text,
         });
         redactions.push(scrubbed.counts);
     }
-    let bundle = Bundle {
+    let mut bundle = Bundle {
         version: BUNDLE_VERSION,
-        agent: AGENT.into(),
+        agent: bundle_agent.into(),
         created_at: sys::iso_timestamp(sys::creation_time()),
         origin: BundleOrigin {
             home: home_dir(),
@@ -408,6 +436,7 @@ pub fn command_save(argv: &[String]) -> Run {
         },
         sessions: packed_sessions,
     };
+    bundle.version = bundle.required_version();
     let packed = bundle::pack_bundle(&bundle).map_err(|e| Failure::Internal(e.0))?;
     let ref_ = bundle::bundle_ref(&packed);
     let store = open_store(args.str("store").as_deref())?;
@@ -471,9 +500,11 @@ pub fn command_save(argv: &[String]) -> Run {
             "redacted" => total,
             "sessions" => bundle.sessions.iter().zip(&redactions).map(|(s, counts)| Value::Object(object! {
                 "sessionId" => s.session_id.as_str(),
+                "agent" => s.agent_of(&bundle),
                 "branch" => Value::opt_str(s.git_branch.as_deref()),
                 "cwd" => s.cwd.as_str(),
                 "claudeVersion" => Value::opt_str(s.claude_version.as_deref()),
+                "agentVersion" => Value::opt_str(s.version()),
                 "modifiedAt" => s.modified_at.as_str(),
                 "redactions" => counts_value(counts),
             })).collect::<Vec<_>>(),
@@ -490,6 +521,7 @@ pub fn command_save(argv: &[String]) -> Run {
 // -- restore ------------------------------------------------------------------
 
 struct Restored {
+    agent: String,
     session_id: String,
     origin_session_id: String,
     branch: Option<String>,
@@ -503,6 +535,7 @@ struct Restored {
 fn restored_payload(session: &Restored) -> Value {
     Value::Object(object! {
         "sessionId" => session.session_id.as_str(),
+        "agent" => session.agent.as_str(),
         "originSessionId" => session.origin_session_id.as_str(),
         "branch" => Value::opt_str(session.branch.as_deref()),
         "status" => session.status,
@@ -543,6 +576,23 @@ pub fn command_restore(argv: &[String]) -> Run {
     let target_home = home_dir();
     let mut restored = Vec::new();
     for session in &bundle.sessions {
+        let agent_id = session.agent_of(&bundle).to_string();
+        // A bundle from a build that knows agents this one doesn't, or one
+        // whose adapter can't restore.
+        let Some(adapter) = agent::by_id(&agent_id).filter(|a| a.can_restore()) else {
+            restored.push(Restored {
+                agent: agent_id,
+                session_id: session.session_id.clone(),
+                origin_session_id: session.session_id.clone(),
+                branch: session.git_branch.clone(),
+                status: "unsupported",
+                path: String::new(),
+                residual: Vec::new(),
+                resume_command: None,
+                foreign: Vec::new(),
+            });
+            continue;
+        };
         let target_session_id = if args.flag("new_id") {
             sys::uuid4()
         } else {
@@ -557,37 +607,46 @@ pub fn command_restore(argv: &[String]) -> Run {
             target_session_id: Some(target_session_id.clone()),
         };
         let transcript = rewrite::rewrite_transcript(&session.transcript, &spec);
-        let destination = transcript_path_for(&target_cwd, &target_session_id, None);
-        if Path::new(&destination).exists() && !args.flag("force") {
+        let mut destination = adapter
+            .restore_path(&transcript, &target_cwd, &target_session_id)
+            .unwrap_or_default();
+        let existing = adapter.existing_transcript(&target_cwd, &target_session_id);
+        if existing.is_some() && !args.flag("force") {
             restored.push(Restored {
+                agent: agent_id.clone(),
                 session_id: target_session_id,
                 origin_session_id: session.session_id.clone(),
                 branch: session.git_branch.clone(),
                 status: "skipped",
-                path: destination,
+                path: existing.unwrap_or(destination),
                 residual: Vec::new(),
                 resume_command: None,
                 foreign: Vec::new(),
             });
             continue;
         }
+        // Overwriting in place: a second copy of one session id is a
+        // transcript the agent may pick either of.
+        if let Some(existing) = existing {
+            destination = existing;
+        }
         let parent = sys::dirname(&destination);
         fs::create_dir_all(&parent).map_err(|e| Failure::Internal(sys::os_error(&e, &parent)))?;
         fs::write(&destination, transcript.as_bytes())
             .map_err(|e| Failure::Internal(sys::os_error(&e, &destination)))?;
         restored.push(Restored {
+            agent: agent_id.clone(),
             session_id: target_session_id.clone(),
             origin_session_id: session.session_id.clone(),
             branch: session.git_branch.clone(),
             status: "restored",
             path: destination,
             residual: rewrite::residual_origin_paths(&transcript, &spec),
-            resume_command: Some(format!(
-                "cd {} && claude --resume {}",
-                target_cwd, target_session_id
-            )),
+            resume_command: adapter
+                .resume_command(&target_session_id)
+                .map(|argv| format!("cd {} && {}", target_cwd, argv.join(" "))),
             // Pre-rewrite: the origin path only exists losslessly here.
-            foreign: rewrite::foreign_cwds(&session.transcript, &spec),
+            foreign: rewrite::foreign_cwds_of(adapter.transcript_cwds(&session.transcript), &spec),
         });
     }
 
@@ -604,12 +663,19 @@ pub fn command_restore(argv: &[String]) -> Run {
     };
     let mut warnings: Vec<String> = restored
         .iter()
-        .filter(|s| s.status == "skipped")
+        .filter(|s| s.status != "restored")
         .map(|s| {
-            format!(
-                "  skipped {} (already exists; --force to overwrite)\n",
-                s.session_id
-            )
+            if s.status == "unsupported" {
+                format!(
+                    "  skipped {} ({} sessions aren't supported by this build)\n",
+                    s.session_id, s.agent
+                )
+            } else {
+                format!(
+                    "  skipped {} (already exists; --force to overwrite)\n",
+                    s.session_id
+                )
+            }
         })
         .collect();
     for session in &restored {
@@ -777,16 +843,16 @@ pub fn command_ingest(argv: &[String]) -> Run {
             }
         }
     }
+    // The loch converter reads Claude Code's transcripts alone (SPEC.md §8).
+    let agents: Vec<&dyn Agent> = vec![&claude::CLAUDE_CODE];
     let (cwd, sessions) = collect(
+        &agents,
         args.str("cwd").as_deref(),
         args.str("branch").as_deref(),
         args.str("session").as_deref(),
     );
     if sessions.is_empty() {
-        return err(
-            "no-sessions",
-            format!("no {} sessions found for {}", AGENT, cwd),
-        );
+        return err("no-sessions", none_found(&agents, &cwd));
     }
     let out = args.str("out").unwrap_or_else(default_derived);
     fs::create_dir_all(&out).map_err(|e| Failure::Internal(sys::os_error(&e, &out)))?;
@@ -846,9 +912,17 @@ pub fn command_ingest(argv: &[String]) -> Run {
 pub fn command_hook(argv: &[String]) -> Run {
     use std::io::Read;
     let name = argv.first().map(String::as_str).unwrap_or("");
+    // `hook <name> [--agent <id>]`, read by hand: a hook must never fail on
+    // its arguments, and the lines earlier versions installed carry no flag.
+    let agent_id = argv
+        .iter()
+        .position(|a| a == "--agent")
+        .and_then(|i| argv.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or(AGENT);
     let mut stdin = Vec::new();
     if std::io::stdin().read_to_end(&mut stdin).is_ok() {
-        crate::hook::run(name, &stdin);
+        crate::hook::run(name, agent_id, &stdin);
     }
     Ok(Outcome::new("hook"))
 }
@@ -878,8 +952,15 @@ fn which(name: &str) -> Option<String> {
 
 pub fn command_install(argv: &[String]) -> Run {
     let mut p = parser("install");
-    p.option("--cwd").flag("--local", None).option("--command");
+    p.option("--cwd")
+        .flag("--local", None)
+        .option("--command")
+        .option("--agent");
     let args = p.parse(argv)?;
+    // Claude Code's alone unless asked: an install that also wrote Codex's
+    // hooks would, with --local, put loch in every Codex project on the
+    // machine, and without it drop a .codex/ into repos that never use Codex.
+    let agents = agents_arg(Some(args.str("agent").as_deref().unwrap_or(AGENT)))?;
     let cwd = args
         .str("cwd")
         .filter(|c| !c.is_empty())
@@ -893,40 +974,64 @@ pub fn command_install(argv: &[String]) -> Run {
             .unwrap_or_else(|| sys::abspath(&std::env::args().next().unwrap_or_default())),
         None => "loch".into(),
     };
-    let name = if args.flag("local") {
-        "settings.local.json"
-    } else {
-        "settings.json"
-    };
-    let settings = sys::join(&sys::join(&root, ".claude"), name);
-    let installed = trace::install_hooks(&settings, &command)
-        .map_err(|trace::InstallError::Internal(m)| Failure::Internal(m))?;
-    let mut text = if installed.added.is_empty() {
-        format!("loch hooks already installed in {}\n", settings)
-    } else {
-        format!(
-            "installed loch hooks ({}) in {}\n",
-            installed.added.join(", "),
-            settings
-        )
-    };
-    if !installed.removed.is_empty() {
-        text.push_str(&format!(
-            "removed the old per-command hooks ({})\n",
-            installed.removed.join(", ")
+    let mut text = String::new();
+    let mut results = Vec::new();
+    for adapter in &agents {
+        let settings = adapter.hooks_file(&root, args.flag("local"));
+        let installed = trace::install_hooks(&settings, &command, *adapter)
+            .map_err(|trace::InstallError::Internal(m)| Failure::Internal(m))?;
+        if installed.added.is_empty() {
+            text.push_str(&format!("loch hooks already installed in {}\n", settings));
+        } else {
+            text.push_str(&format!(
+                "installed loch hooks ({}) in {}\n",
+                installed.added.join(", "),
+                settings
+            ));
+        }
+        if !installed.removed.is_empty() {
+            text.push_str(&format!(
+                "removed the old per-command hooks ({})\n",
+                installed.removed.join(", ")
+            ));
+        }
+        text.push_str(&format!("{}\n", adapter.install_note()));
+        results.push((
+            adapter.id(),
+            settings,
+            installed,
+            adapter.hooks_need_review(),
         ));
     }
-    text.push_str("restart Claude Code sessions here to pick them up\n");
-    Ok(Outcome::with(
-        "install",
-        object! {
-            "settings" => settings.as_str(),
-            "command" => command.as_str(),
-            "added" => strings(&installed.added),
-            "removed" => strings(&installed.removed),
-        },
-        text,
-    ))
+    // The first agent's at the top level, as before there were several.
+    let (_, settings, installed, _) = &results[0];
+    let mut payload = object! {
+        "settings" => settings.as_str(),
+        // Not `command`, which is the envelope's: the hooks' loch.
+        "hookCommand" => command.as_str(),
+        "added" => strings(&installed.added),
+        "removed" => strings(&installed.removed),
+    };
+    payload.insert(
+        "agents".into(),
+        Value::Array(
+            results
+                .iter()
+                .map(|(id, settings, installed, review)| {
+                    Value::Object(object! {
+                        "agent" => *id,
+                        "settings" => settings.as_str(),
+                        "added" => strings(&installed.added),
+                        "removed" => strings(&installed.removed),
+                        // The agent won't run a new hook until a person
+                        // approves it; loch never approves its own.
+                        "needsReview" => *review && !installed.added.is_empty(),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    Ok(Outcome::with("install", payload, text))
 }
 
 // -- blame / log / ask -------------------------------------------------------------
@@ -1389,13 +1494,22 @@ pub fn command_ask(argv: &[String]) -> Run {
         );
     };
     let link = blamed.links[owner].clone();
+    let Some(adapter) = agent::by_id(&link.agent) else {
+        return err(
+            "unsupported-agent",
+            format!(
+                "session {} wrote it, but this build doesn't know its agent, {}",
+                link.session_id, link.agent
+            ),
+        );
+    };
     let Some(transcript) = &link.transcript else {
         return err(
             "transcript-missing",
             format!(
                 "session {} wrote it, but its transcript is neither in {} nor in the store",
                 link.session_id,
-                claude::projects_dir(None)
+                adapter.sessions_dir()
             ),
         );
     };
@@ -1408,26 +1522,32 @@ pub fn command_ask(argv: &[String]) -> Run {
         .map(|r| r.root.clone())
         .filter(|root| Path::new(root).is_dir())
         .unwrap_or_else(sys::getcwd);
-    let fork = trace::fork_session(
-        transcript,
-        &cwd,
-        if at_turn {
-            link.end_uuid.as_deref()
-        } else {
-            None
-        },
-        Some(&format!("loch ask {}", target)),
-    )
-    .map_err(|e| match e {
-        trace::ForkError::Trace(t) => Failure::from(t),
-        trace::ForkError::Internal(m) => Failure::Internal(m),
-    })?;
+    let fork = adapter
+        .fork(
+            transcript,
+            &cwd,
+            if at_turn {
+                link.end_uuid.as_deref()
+            } else {
+                None
+            },
+            Some(&format!("loch ask {}", target)),
+        )
+        .map_err(|e| match e {
+            trace::ForkError::Trace(t) => Failure::from(t),
+            trace::ForkError::Internal(m) => Failure::Internal(m),
+            trace::ForkError::Unsupported(name) => Failure::Error(CommandError::new(
+                "unsupported-agent",
+                format!("{} conversations can't be forked", name),
+            )),
+        })?;
 
-    let mut command = vec![
-        "claude".to_string(),
-        "--resume".into(),
-        fork.session_id.clone(),
-    ];
+    let Some(mut command) = adapter.resume_command(&fork.session_id) else {
+        return err(
+            "unsupported-agent",
+            format!("{} sessions can't be resumed", adapter.name()),
+        );
+    };
     if let Some(question) = args.str("question").filter(|q| !q.is_empty()) {
         command.push(question);
     }
@@ -1468,11 +1588,11 @@ pub fn command_ask(argv: &[String]) -> Run {
         ));
     }
     eprint!("{}", text);
-    exec_claude(&fork.cwd, &command)
+    exec_agent(&fork.cwd, &command)
 }
 
 #[cfg(unix)]
-fn exec_claude(root: &str, command: &[String]) -> Run {
+fn exec_agent(root: &str, command: &[String]) -> Run {
     use std::os::unix::process::CommandExt;
     let _ = std::env::set_current_dir(root);
     let error = std::process::Command::new(&command[0])
@@ -1488,7 +1608,7 @@ fn exec_claude(root: &str, command: &[String]) -> Run {
 }
 
 #[cfg(not(unix))]
-fn exec_claude(root: &str, command: &[String]) -> Run {
+fn exec_agent(root: &str, command: &[String]) -> Run {
     let status = std::process::Command::new(&command[0])
         .args(&command[1..])
         .current_dir(root)

@@ -18,9 +18,9 @@ Usage:
   loch ask     <file>:<line> [<question>] [--at-turn] [--no-launch]
   loch backfill [--cwd <path>]
                                   attribute turns from before the hooks
-  loch push    [<remote>] [--all] [--cwd <path>] [--dry-run]
-                                  send this project's records, transcripts
-                                  and every saved bundle to a remote
+  loch push    [<remote>] [--all] [--cwd <path>] [--dry-run] [--force]
+                                  send this project's bundles, records and
+                                  transcripts to a remote
   loch pull    [<remote>] [--all] [--cwd <path>]
                                   fetch this project's records and transcripts
   loch remote  [list] | add <name> <uri> | remove <name>

@@ -128,13 +128,23 @@ fn close_turn(
     store: Option<&dyn Store>,
 ) -> Result<String, Stop> {
     let end = snapshot::snapshot(root)?;
-    let mut record = attribution::load_local(agent.id(), session).unwrap_or_else(|| EditRecord {
-        agent: agent.id().into(),
-        session: session.into(),
-        project: attribution::project_id(root),
-        root: root.into(),
-        turns: Vec::new(),
-    });
+    // The working copy, and whatever `pull` brought into the store for this
+    // session: a session restored under its own id is recorded on two
+    // machines, and starting from the working copy alone would write over the
+    // other machine's turns.
+    let working = attribution::load_local(agent.id(), session);
+    let stored = store.and_then(|store| attribution::load_stored(store, agent.id(), session));
+    let mut record = match (working, stored) {
+        (Some(working), Some(stored)) => working.merge(&stored),
+        (Some(one), None) | (None, Some(one)) => one,
+        (None, None) => EditRecord {
+            agent: agent.id().into(),
+            session: session.into(),
+            project: attribution::project_id(root),
+            root: root.into(),
+            turns: Vec::new(),
+        },
+    };
     // With no baseline at all, everything in the workspace would look new; the
     // turn is recorded with nothing attributed, as the baseline for the next.
     let files = match start {

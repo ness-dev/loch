@@ -1377,3 +1377,124 @@ fn an_identical_stop_after_the_duplicate_window_is_handled() {
         vec![some("two steps"); 2]
     );
 }
+
+fn turn_prompts(record: &Value) -> Vec<String> {
+    record
+        .get("turns")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.get("promptUuid").unwrap().as_str().unwrap().to_string())
+        .collect()
+}
+
+fn stored_record(store: &Path) -> Value {
+    let text =
+        fs::read_to_string(store.join(format!("edits/claude-code/{}.json", SESSION))).unwrap();
+    json::loads(&text).unwrap()
+}
+
+/// A machine that pulled a session and then recorded turns of it under the
+/// same id (a restore that kept the id) has the pulled record in its store and
+/// no working copy. Its next turn must add to that record, not replace it.
+#[test]
+fn a_turn_adds_to_a_pulled_record_rather_than_replacing_it() {
+    let mut w = calculator_world();
+    fs::remove_dir_all(w.home.join(".loch/edits")).unwrap();
+    w.prompt("p3", "after the pull");
+    w.sh("echo 'reviewer_line = 1' >> table.py");
+    w.stop("p3");
+    assert_eq!(
+        turn_prompts(&stored_record(&w.store)),
+        vec!["p1", "p2", "p3"]
+    );
+}
+
+/// Two machines recorded different turns of one session. A push merges the
+/// remote's copy in rather than writing over it, and keeps the merge here.
+#[test]
+fn diverged_records_merge_on_push_and_pull() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    w.json(&["push", &s(&remote)]);
+    // The other machine's copy: the first turn, and one this machine never saw.
+    let theirs = remote.join(format!("edits/claude-code/{}.json", SESSION));
+    let mut record = json::loads(&fs::read_to_string(&theirs).unwrap()).unwrap();
+    if let Value::Object(map) = &mut record {
+        let turns = map.get_mut("turns").unwrap();
+        if let Value::Array(list) = turns {
+            list.truncate(1);
+            let mut extra = list[0].clone();
+            if let Value::Object(turn) = &mut extra {
+                turn.insert("promptUuid".into(), Value::str("elsewhere"));
+                turn.insert("ended".into(), Value::str("2026-11-18T11:00:00.000000Z"));
+            }
+            list.push(extra);
+        }
+    }
+    fs::write(&theirs, json::dumps(&record, json::DEFAULT)).unwrap();
+    // And this machine recorded another turn since its last push.
+    let mut w = w;
+    w.prompt("p3", "one more here");
+    w.sh("echo 'here_line = 3' >> table.py");
+    w.stop("p3");
+
+    let push = w.json(&["push", &s(&remote)]);
+    assert!(push.get("ok").unwrap().truthy(), "{:?}", push);
+    let merged = vec!["p1", "p2", "p3", "elsewhere"];
+    assert_eq!(turn_prompts(&stored_record(&remote)), merged);
+    assert_eq!(turn_prompts(&stored_record(&w.store)), merged);
+
+    // A third machine that has only its own turn merges both in on pull.
+    let other_home = w.root.join("other-home");
+    let other_store = other_home.join(".loch/store");
+    fs::create_dir_all(other_store.join("edits/claude-code")).unwrap();
+    let mut solo = stored_record(&w.store);
+    if let Value::Object(map) = &mut solo {
+        if let Some(Value::Array(list)) = map.get_mut("turns") {
+            list.retain(|t| t.get("promptUuid").unwrap().is_str("p1"));
+            let mut mine = list[0].clone();
+            if let Value::Object(turn) = &mut mine {
+                turn.insert("promptUuid".into(), Value::str("third"));
+                turn.insert("ended".into(), Value::str("2026-11-18T12:00:00.000000Z"));
+            }
+            list.push(mine);
+        }
+    }
+    fs::write(
+        other_store.join(format!("edits/claude-code/{}.json", SESSION)),
+        json::dumps(&solo, json::DEFAULT),
+    )
+    .unwrap();
+    let pull = json_on(&w, &other_home, &w.repo, &["pull", &s(&remote)]);
+    assert_eq!(pull.get("records").unwrap().as_i64(), Some(1));
+    assert_eq!(
+        turn_prompts(&stored_record(&other_store)),
+        vec!["p1", "p2", "p3", "elsewhere", "third"]
+    );
+}
+
+#[test]
+fn push_force_resends_what_the_markers_claim_was_sent() {
+    let w = calculator_world();
+    let remote = w.root.join("remote");
+    w.json(&["push", &s(&remote)]);
+    fs::remove_dir_all(&remote).unwrap();
+    let stale = w.json(&["push", &s(&remote)]);
+    assert_eq!(stale.get("total").unwrap().as_i64(), Some(0));
+    let forced = w.json(&["push", &s(&remote), "--force"]);
+    assert_eq!(pushed(&forced, "records"), 1);
+    assert!(remote
+        .join(format!("edits/claude-code/{}.json", SESSION))
+        .is_file());
+}
+
+#[test]
+fn a_symlink_to_the_local_store_is_not_a_remote() {
+    let w = calculator_world();
+    let link = w.root.join("link-to-store");
+    std::os::unix::fs::symlink(&w.store, &link).unwrap();
+    let push = w.json(&["push", &s(&link)]);
+    assert!(push.get("code").unwrap().is_str("invalid-uri"));
+}

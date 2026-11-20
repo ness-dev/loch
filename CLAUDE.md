@@ -264,25 +264,48 @@ makes a half-failed `save` leave a recoverable store rather than a corrupt
 one. Nothing may end up knowable only from the index.
 
 **Push and pull, git style: `save` is `commit`.** The local store
-(`~/.loch/store`) is where everything is recorded first, bundles included. Named remotes (`loch remote`, kept in
-`~/.loch/config`) are where `push` sends and `pull` fetches from, as git's
+(`~/.loch/store`) is where everything is recorded first, bundles included.
+Named remotes (`loch remote`, kept in `~/.loch/config`) are where `push` sends and `pull` fetches from, as git's
 remotes are. `blame`, `log` and `ask` read only the local store, so a
 teammate's turns arrive by `pull`, never by a read that waits on the network.
-- **What moves.** `push` sends every bundle with its branch entries, and the
-  current project's edit records, file index and transcripts (`--all` for
-  every project's). Bundles were redacted by `save` and go as they are, so a
-  ref is the same everywhere. Transcripts are kept verbatim locally and
-  redacted on the way out, and a surviving match fails the push as
-  `redaction-failed`. Edit records hold line hashes, and their `prompt` was
-  redacted when recorded. `pull` fetches records that know more turns than
-  this machine's copy, with their transcripts. Bundles are not pulled.
+- **What moves.** `push` sends the current project's bundles with their
+  branch entries, and its sessions' edit records, file index and transcripts
+  (`--all` for every project's). A bundle belongs to a project if any session
+  in it ran there: sending every bundle on the machine, as the first cut did,
+  put one client's transcripts on another's remote. A bundle whose sessions'
+  directories are gone from this machine can't be placed and goes only with
+  `--all`. Bundles were redacted by `save` and go as they are, so a ref is the
+  same everywhere. Transcripts are kept verbatim locally and redacted on the
+  way out. One in which a secret survives redaction is skipped and named in
+  `redactionFailed`, the rest still goes, and the push ends `redaction-failed`.
+  Redaction is deterministic, so failing the whole push would block every
+  later one. Edit records hold line hashes, and their `prompt` was redacted
+  when recorded. `pull` fetches records with their transcripts, scoped through
+  the remote's file index, so a session whose turns edited no file isn't
+  pulled; it has nothing to blame anyway. Bundles are not pulled.
+- **Edit records merge, they are never replaced.** A session restored under
+  its own id and resumed is recorded by two machines, and a record is one
+  mutable object per session. Writing it whole erased the other machine's
+  turns, locally (the hook started from its working copy alone, which `pull`
+  never fills) and on the remote (the next push). So `EditRecord::merge`
+  takes both copies' turns, a turn known by its prompt's id (else by when it
+  ran), the later stop winning. The hook merges the working copy with the
+  store's, `pull` merges into the local copy, and `push` merges the remote's
+  copy in before it uploads and keeps the merge here. Two pushes of one session
+  at the same moment can still drop one's new turns from the remote, until
+  that machine's record next changes and its push merges them back.
+  Transcripts are still one object per key, last writer wins. Claude's keys
+  name the project directory, so a session resumed in another checkout gets
+  its own key, but a Codex rollout's name doesn't change on restore.
 - **What has been sent is remembered here, not there.** `~/.loch/pushed/<uri
   hash>.json` maps each key to the hash of the local bytes last sent, so the
   remote stays a set of independent objects (no manifest, per "No single
   index object") and a second push sends only what changed. Losing that file
-  only re-sends. Push sends a bundle before its entries and a record before
-  its file index, the order `save` and the hooks keep, so a push cut short
-  leaves what `reindex` can repair.
+  only re-sends. A stale one is the silent case: a remote emptied or replaced
+  by anything but `delete --remote` makes every push say it is up to date.
+  `push --force` ignores the markers. Push sends a bundle before its entries
+  and a record before its file index, the order `save` and the hooks keep, so
+  a push cut short leaves what `reindex` can repair.
 - **A delete on a remote stays deleted.** A tombstone (`tombstones/bundle/
   <ref>`, `tombstones/session/<agent>/<id>`) is one new key per delete and
   holds no content. Every push reads them first and sends nothing they cover,
@@ -328,7 +351,7 @@ teammate's turns arrive by `pull`, never by a read that waits on the network.
   URI scheme the store doesn't know is `invalid-uri`: `create_store` reads
   anything else as a relative path, so `ssh://host` would have become a
   local directory a push succeeded into. The local store itself is refused
-  as a remote.
+  as a remote, compared resolved, so a symlink to it is refused too.
 
 ## Empirical findings about Claude Code's storage
 

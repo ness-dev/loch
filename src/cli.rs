@@ -2136,8 +2136,15 @@ fn sync_error(remote: &Remote, error: SyncError) -> Failure {
 fn open_remote(asked: Option<&str>) -> std::result::Result<(Remote, Box<dyn Store>), Failure> {
     let remote = remote::resolve(asked).map_err(remote_error)?;
     let opened = remote.open().map_err(remote_error)?;
-    if sys::abspath(remote.uri.trim_start_matches("file://"))
-        == sys::abspath(&crate::store::default_store())
+    // Resolved, so a symlink to the local store is caught too.
+    let resolved = |path: &str| {
+        fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| sys::abspath(path))
+    };
+    if !remote.uri.starts_with("s3://")
+        && resolved(remote.uri.trim_start_matches("file://"))
+            == resolved(&crate::store::default_store())
     {
         return err(
             "invalid-uri",
@@ -2173,12 +2180,14 @@ pub fn command_push(argv: &[String]) -> Run {
     p.positional("remote", Nargs::Optional)
         .option("--cwd")
         .flag("--all", None)
-        .flag("--dry-run", None);
+        .flag("--dry-run", None)
+        .flag("--force", None);
     let args = p.parse(argv)?;
     let (remote, opened) = open_remote(args.str("remote").as_deref())?;
     let project = sync_scope(&args);
     let local = crate::store::local_store();
     let mut report = sync::PushReport::new(args.flag("dry_run"));
+    report.force = args.flag("force");
     let scope = match &project {
         Some(project) => sync::Scope::Project(project),
         None => sync::Scope::All,

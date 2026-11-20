@@ -260,6 +260,33 @@ impl EditRecord {
         })
     }
 
+    /// Both copies' turns, each once, oldest first. A session restored under its
+    /// own id and resumed elsewhere is recorded by two machines, so neither copy
+    /// may replace the other: a whole-record write would erase the turns only the
+    /// other copy has. A turn is known by its prompt's id, else by when it ran;
+    /// where both copies hold one, the one that ended later wins, since Claude
+    /// Code can stop twice for one prompt and the second stop's record is the
+    /// whole turn.
+    pub fn merge(&self, other: &EditRecord) -> EditRecord {
+        let identity = |turn: &TurnRecord| match &turn.prompt_uuid {
+            Some(id) => (Some(id.clone()), None, None),
+            None => (None, turn.started.clone(), Some(turn.ended.clone())),
+        };
+        let mut turns: Vec<TurnRecord> = Vec::new();
+        for turn in self.turns.iter().chain(other.turns.iter()) {
+            match turns.iter_mut().find(|t| identity(t) == identity(turn)) {
+                Some(have) if have.ended < turn.ended => *have = turn.clone(),
+                Some(_) => {}
+                None => turns.push(turn.clone()),
+            }
+        }
+        turns.sort_by(|a, b| a.ended.cmp(&b.ended));
+        EditRecord {
+            turns,
+            ..self.clone()
+        }
+    }
+
     /// Every path any turn changed, each once.
     pub fn paths(&self) -> Vec<String> {
         let mut paths: Vec<String> = self
@@ -314,6 +341,12 @@ fn local_path(agent: &str, session: &str) -> std::path::PathBuf {
 pub fn load_local(agent: &str, session: &str) -> Option<EditRecord> {
     let text = fs::read_to_string(local_path(agent, session)).ok()?;
     EditRecord::from_json(&json::loads(&text).ok()?)
+}
+
+/// The record as `store` holds it.
+pub fn load_stored(store: &dyn Store, agent: &str, session: &str) -> Option<EditRecord> {
+    let data = store.get(&edits_key(agent, session)).ok()?;
+    EditRecord::from_json(&json::loads(&String::from_utf8(data).ok()?).ok()?)
 }
 
 pub fn save_local(record: &EditRecord) -> std::io::Result<()> {
@@ -632,5 +665,31 @@ mod tests {
     fn reindentation_keeps_the_link() {
         let records = vec![record(vec![("1", vec!["return compute(x)"])])];
         assert!(attribute("        return compute(x)\n", &["f.py".into()], &records)[0].is_some());
+    }
+
+    #[test]
+    fn merging_keeps_each_turn_once_and_the_later_stop_of_one_prompt() {
+        let turn = |id: &str, ended: &str| TurnRecord {
+            prompt_uuid: Some(id.into()),
+            end_uuid: None,
+            started: None,
+            ended: ended.into(),
+            prompt: None,
+            interrupted: false,
+            backfilled: false,
+            files: Vec::new(),
+        };
+        let mut mine = record(vec![]);
+        mine.turns = vec![turn("a", "1"), turn("b", "2")];
+        let mut theirs = record(vec![]);
+        theirs.turns = vec![turn("a", "1"), turn("b", "3"), turn("c", "4")];
+        let merged = mine.merge(&theirs);
+        let ended: Vec<(&str, &str)> = merged
+            .turns
+            .iter()
+            .map(|t| (t.prompt_uuid.as_deref().unwrap(), t.ended.as_str()))
+            .collect();
+        assert_eq!(ended, vec![("a", "1"), ("b", "3"), ("c", "4")]);
+        assert_eq!(theirs.merge(&mine).turns, merged.turns, "either way round");
     }
 }

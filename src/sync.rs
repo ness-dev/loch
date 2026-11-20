@@ -5,7 +5,9 @@
 //! **No manifest on the remote.** What a push has sent is remembered on this
 //! machine (`~/.loch/pushed/<uri hash>.json`, key → hash of the local bytes),
 //! so the remote stays a set of independent objects, each written whole by one
-//! PUT. Two machines pushing at once commute, as `save`s always have.
+//! PUT. Bundles and index entries commute, as `save`s always have. Edit records
+//! don't, being one mutable object per session, so they are merged by turn on
+//! every push, pull and hook rather than replaced.
 //!
 //! **A delete on a remote stays deleted.** `delete --remote` leaves a
 //! tombstone there (`tombstones/bundle/<ref>`, `tombstones/session/<agent>/
@@ -27,7 +29,7 @@ use crate::store::{self, FileStore, Store, StoreError};
 use crate::sys;
 use crate::trace;
 use indexmap::IndexMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const TOMBSTONES_PREFIX: &str = "tombstones/";
 const TRANSCRIPTS_PREFIX: &str = "transcripts/";
@@ -149,7 +151,7 @@ fn counts_payload(counts: &BTreeMap<&'static str, usize>) -> Value {
 /// What a push sends.
 #[derive(Clone, Copy)]
 pub enum Scope<'a> {
-    /// Every bundle, and this project's sessions.
+    /// This project's bundles and sessions.
     Project(&'a str),
     /// Every bundle, and every session.
     All,
@@ -226,19 +228,54 @@ fn local_sessions(local: &dyn Store) -> Result<Vec<(String, String, EditRecord)>
     Ok(sessions)
 }
 
+/// Whether any session a bundle holds ran in `project`. A project-scoped push
+/// must not send a bundle saved in another repository: that would publish one
+/// client's transcripts to another's remote. A session whose directory is gone
+/// from this machine can't be placed, and is only sent by `--all`.
+fn bundle_in_project(
+    local: &dyn Store,
+    key: &str,
+    project: &str,
+    projects: &mut HashMap<String, String>,
+) -> Result<bool, StoreError> {
+    let packed = local.get(key)?;
+    let Ok(bundle) = crate::bundle::unpack_bundle(&packed) else {
+        return Ok(false);
+    };
+    for session in &bundle.sessions {
+        let id = projects.entry(session.cwd.clone()).or_insert_with(|| {
+            if std::path::Path::new(&session.cwd).is_dir() {
+                attribution::project_id(&snapshot::workspace_root(&session.cwd))
+            } else {
+                String::new()
+            }
+        });
+        if id == project {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Everything a push would send, in the order it has to arrive: a bundle
 /// before its index entries and a record before its file index, as `save` and
 /// the hooks have always written them, so a push cut short leaves objects
 /// `reindex` can re-derive entries from rather than entries naming nothing.
 fn plan(local: &dyn Store, scope: Scope) -> Result<Vec<Item>, StoreError> {
     let mut items = Vec::new();
+    let mut projects = HashMap::new();
     let branch_entries = local.list(&index::dimension_prefix(BRANCH))?;
     for key in local.list(BUNDLES_PREFIX)? {
         if !key.ends_with(".loch") {
             continue;
         }
         let ref_ = index::ref_from_key(&key);
-        if matches!(scope, Scope::Bundle(only) if only != ref_) {
+        let wanted = match scope {
+            Scope::Bundle(only) => only == ref_,
+            Scope::All => true,
+            Scope::Project(project) => bundle_in_project(local, &key, project, &mut projects)?,
+        };
+        if !wanted {
             continue;
         }
         items.push(Item {
@@ -344,6 +381,10 @@ fn save_markers(uri: &str, markers: &BTreeMap<String, String>) {
 #[derive(Default)]
 pub struct PushReport {
     pub dry_run: bool,
+    /// Send everything in scope, whatever the markers say: the remote was
+    /// emptied or replaced by something other than `delete --remote`, so the
+    /// markers claim objects it no longer holds.
+    pub force: bool,
     sent: BTreeMap<&'static str, usize>,
     pub up_to_date: usize,
     /// Left unsent because a tombstone covers it.
@@ -352,6 +393,9 @@ pub struct PushReport {
     pub withdrawn: usize,
     /// Transcripts that aren't UTF-8 and so can't be redacted; never sent.
     pub unreadable: Vec<String>,
+    /// Transcripts in which a secret survived redaction; never sent, and the
+    /// push fails as `redaction-failed` once everything else has gone.
+    pub redaction_failed: Vec<String>,
     pub redactions: IndexMap<String, usize>,
 }
 
@@ -380,6 +424,7 @@ impl PushReport {
             "tombstoned" => self.tombstoned,
             "withdrawn" => self.withdrawn,
             "unreadable" => self.unreadable.iter().map(|k| Value::str(k.as_str())).collect::<Vec<_>>(),
+            "redactionFailed" => self.redaction_failed.iter().map(|k| Value::str(k.as_str())).collect::<Vec<_>>(),
             "redactions" => Value::Object(redactions),
             "redacted" => self.redactions.values().sum::<usize>(),
         }
@@ -455,7 +500,7 @@ pub fn push(
     }
     result?;
     if report.dry_run || sent.is_empty() {
-        return Ok(());
+        return redaction_verdict(report);
     }
     let after = Dead::from_keys(&remote.list(TOMBSTONES_PREFIX)?);
     for (key, owner) in &sent {
@@ -468,7 +513,55 @@ pub fn push(
     if report.withdrawn > 0 {
         save_markers(uri, &markers);
     }
-    Ok(())
+    redaction_verdict(report)
+}
+
+fn redaction_verdict(report: &PushReport) -> Result<(), SyncError> {
+    if report.redaction_failed.is_empty() {
+        return Ok(());
+    }
+    Err(SyncError::Redaction(format!(
+        "{} transcript(s) not sent: a secret still matched after redaction",
+        report.redaction_failed.len()
+    )))
+}
+
+/// A record is sent merged with the remote's copy, and the merge is kept here
+/// too, so a push never writes over turns another machine recorded for the
+/// same session. Two pushes of one session at the same moment can still drop
+/// the turns one of them added from the remote, until that machine's record
+/// next changes and its push merges them back in.
+fn merge_with_remote(
+    local: &dyn Store,
+    remote: &dyn Store,
+    key: &str,
+    data: Vec<u8>,
+    hash: String,
+) -> Result<(Vec<u8>, String), SyncError> {
+    let Some(mine) = parse_record(&data) else {
+        return Ok((data, hash));
+    };
+    let theirs = match remote.get(key) {
+        Ok(bytes) => {
+            parse_record(&bytes).filter(|r| r.agent == mine.agent && r.session == mine.session)
+        }
+        Err(StoreError::Missing(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let Some(theirs) = theirs else {
+        return Ok((data, hash));
+    };
+    let merged = mine.merge(&theirs);
+    if merged.turns == mine.turns {
+        return Ok((data, hash));
+    }
+    attribution::publish(local, &merged)?;
+    for (entry, body) in attribution::file_entries(&merged) {
+        remote.put(&entry, &body)?;
+    }
+    let body = local.get(key)?;
+    let hash = snapshot::content_hash(&body);
+    Ok((body, hash))
 }
 
 fn send(
@@ -494,16 +587,26 @@ fn send(
             },
         };
         let hash = snapshot::content_hash(&data);
-        if markers.get(&item.key) == Some(&hash) {
+        if !report.force && markers.get(&item.key) == Some(&hash) {
             report.up_to_date += 1;
             continue;
         }
+        let (data, hash) = if item.kind == Kind::Record && !report.dry_run {
+            merge_with_remote(local, remote, &item.key, data, hash)?
+        } else {
+            (data, hash)
+        };
         let body = if item.kind == Kind::Transcript {
             let Ok(text) = std::str::from_utf8(&data) else {
                 report.unreadable.push(item.key);
                 continue;
             };
-            let scrubbed = redact::redact(text).map_err(|e| SyncError::Redaction(e.0))?;
+            // Redaction is deterministic, so this transcript would fail every
+            // push; it is skipped and named, and the rest still goes.
+            let Ok(scrubbed) = redact::redact(text) else {
+                report.redaction_failed.push(item.key);
+                continue;
+            };
             for (rule, count) in scrubbed.counts {
                 *report.redactions.entry(rule).or_insert(0) += count;
             }
@@ -685,10 +788,16 @@ pub fn pull(
             report.refused += 1;
             continue;
         };
-        let have = local.get(&key).ok().and_then(|d| parse_record(&d));
-        let newer = have.is_none_or(|have| record.turns.len() > have.turns.len());
+        // Merged, never replaced: this machine may have recorded turns of the
+        // same session (a restore that kept its id) that the remote lacks.
+        let have = attribution::load_stored(local, &agent, &session);
+        let merged = match &have {
+            Some(have) => have.merge(&record),
+            None => record,
+        };
+        let newer = have.is_none_or(|have| merged.turns != have.turns);
         if newer {
-            attribution::publish(local, &record)?;
+            attribution::publish(local, &merged)?;
             report.records += 1;
         } else {
             report.up_to_date += 1;

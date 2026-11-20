@@ -1435,3 +1435,43 @@ fn a_push_that_fails_after_save_keeps_the_bundle_and_names_it() {
     assert!(world.local_bundle(&reference).is_file());
     assert!(text(&document, "error").starts_with(&format!("saved {} on this machine", reference)));
 }
+
+#[test]
+fn a_push_sends_only_this_project_s_bundles_unless_asked_for_all() {
+    let world = World::new();
+    world.one_saved_session();
+    let here = text(&world.ok(&["save"]), "ref").to_string();
+    // A second repository, with its own root commit and its own session.
+    let client = world.root.join("client");
+    fs::create_dir_all(&client).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["commit", "-q", "--allow-empty", "-m", "client root"],
+    ] {
+        let out = world.command("git", &client).args(&args).output().unwrap();
+        assert!(out.status.success());
+    }
+    let other = "01a1f570-0000-7000-8000-00000000c11e";
+    world.meta(other, &s(&client), "main");
+    world.begin(other, TURN_B, &s(&client), 3, "client work");
+    world.finish(other, TURN_B, 3);
+    let theirs = text(&world.ok(&["save", "--cwd", &s(&client)]), "ref").to_string();
+    assert_ne!(here, theirs);
+
+    let push = world.ok(&["push"]);
+    assert_eq!(at(at(&push, "pushed"), "bundles").as_i64(), Some(1));
+    assert!(world.store.join(format!("bundles/{}.loch", here)).is_file());
+    assert!(
+        !world
+            .store
+            .join(format!("bundles/{}.loch", theirs))
+            .exists(),
+        "the client's transcripts stay off this project's remote"
+    );
+    let all = world.ok(&["push", "--all"]);
+    assert_eq!(at(at(&all, "pushed"), "bundles").as_i64(), Some(1));
+    assert!(world
+        .store
+        .join(format!("bundles/{}.loch", theirs))
+        .is_file());
+}
